@@ -23,12 +23,26 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode.app
+        run: |
+          # LLMkit (a transitive SPM dependency) requires Swift tools 6.2+, which the
+          # macos-15 runner's default Xcode (16.4) does not ship. Pick the newest
+          # available Xcode 26.x instead.
+          xcode_app="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)"
+          if [ -z "$xcode_app" ]; then
+            echo "error: no Xcode 26.x found on this runner" >&2
+            ls /Applications | grep -i Xcode >&2
+            exit 1
+          fi
+          echo "Selecting $xcode_app"
+          sudo xcode-select -s "$xcode_app"
 
       - name: Show toolchain versions
+        id: toolchain
         run: |
           xcodebuild -version
           swift --version
+          build="$(xcodebuild -version | awk '/^Build version/{print $3}')"
+          echo "xcode_build=$build" >> "$GITHUB_OUTPUT"
 
       - name: Resolve whisper.cpp ref
         id: whisper_ref
@@ -45,7 +59,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/VoiceInk-Dependencies
-          key: whisper-deps-${{ runner.os }}-${{ steps.whisper_ref.outputs.sha }}
+          key: whisper-deps-${{ runner.os }}-xcode${{ steps.toolchain.outputs.xcode_build }}-${{ steps.whisper_ref.outputs.sha }}
 
       - name: Build whisper.xcframework (cache miss)
         if: steps.whisper_cache.outputs.cache-hit != 'true'

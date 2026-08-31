@@ -36,6 +36,9 @@ jobs:
           echo "Selecting $xcode_app"
           sudo xcode-select -s "$xcode_app"
 
+      - name: Trust SPM macro/plugin fingerprints for non-interactive CI
+        run: defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidatation -bool YES
+
       - name: Show toolchain versions
         id: toolchain
         run: |

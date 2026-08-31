@@ -198,14 +198,35 @@ that makes the fork buildable without a human clicking through Xcode dialogs:
   `$(LOCAL_XCODEBUILD_FLAGS)` to the `local` target's `xcodebuild` invocation, so CI/scripted
   callers can inject the two flags above without duplicating the whole recipe. No effect on
   `make local`'s default (interactive) behavior.
-- `actions/cache@v4`'s `save-always: true` on the whisper.xcframework cache: without it, the
-  action's post-job save step is silently **skipped** whenever any later step in the same job
-  fails — discovered the hard way after two CI runs each spent ~10 minutes rebuilding
-  whisper.xcframework from scratch (verified via the GitHub Actions Jobs API: `Post Cache
-  whisper.xcframework` showed `conclusion: skipped` on both failed runs, and
-  `GET .../actions/caches` listed zero caches). `save-always: true` makes the (expensive,
-  build-outcome-independent) whisper.xcframework get cached regardless of whether the later
-  app build/test steps pass.
+- Whisper.xcframework caching: `actions/cache@v4`'s combined step silently **skips its save**
+  whenever any later step in the same job fails — discovered the hard way after two CI runs
+  each spent ~10 minutes rebuilding whisper.xcframework from scratch (verified via the GitHub
+  Actions Jobs API: `Post Cache whisper.xcframework` showed `conclusion: skipped` on both failed
+  runs, and `GET .../actions/caches` listed zero caches). First fix was `save-always: true`, but
+  GitHub's own deprecation notice on that input says it "does not work as intended and will be
+  removed" — so the workflow now uses the documented replacement instead: separate
+  `actions/cache/restore@v4` + `actions/cache/save@v4` steps, with the save placed immediately
+  after the whisper build (before any step that could fail), rather than relying on a combined
+  action's post-job hook.
+- **`-onlyUsePackageVersionsFromResolvedFile`** (added to both `xcodebuild` invocations,
+  including via `LOCAL_XCODEBUILD_FLAGS`): CI's from-scratch SPM resolution (no prior
+  `.local-build/SourcePackages` cache — every CI run starts from a clean checkout) was resolving
+  the transitive `mlx-swift` dependency to **0.31.4** — the floor of `mlx-swift-lm`'s own
+  `.upToNextMinor(from: "0.31.4")` requirement — instead of **0.31.6**, the version actually
+  pinned in the committed `Package.resolved`. 0.31.4 is missing the `MLXArray.maskFill`/
+  `DType.greatestFiniteMagnitudeArray` APIs that `mlx-swift-lm`'s pinned revision
+  (`cd1ab3dd98ceb…`, 2026-07-31) calls, so the build failed with `type 'MLXArray' has no member
+  'maskFill'`. Confirmed by diffing: `git show 0.31.4:Source/MLX/MLXArray+maskFill.swift` in a
+  from-scratch checkout of `mlx-swift` fails ("exists on disk, but not in '0.31.4'"); the file
+  was added later, before 0.31.6. This is a pre-existing upstream `Package.resolved`/manifest
+  inconsistency (mlx-swift-lm's pinned revision needs an mlx-swift newer than its own manifest's
+  floor guarantees) — not something this fork introduced, and not something Phase 0 should "fix"
+  by bumping a pin (out of scope; Phase 0 is hygiene, not dependency maintenance).
+  `-onlyUsePackageVersionsFromResolvedFile` makes `xcodebuild` treat the committed lock as
+  authoritative instead of re-resolving, which is the correct fix regardless of the underlying
+  manifest looseness. Phase 1+ should consider whether to bump `mlx-swift-lm`'s pin (or add an
+  explicit `mlx-swift` pin) to make the manifest itself consistent, so a *local* build with no
+  existing lock also doesn't hit this.
 
 ## Architecture budget note
 

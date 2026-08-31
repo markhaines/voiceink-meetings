@@ -163,14 +163,24 @@ builds it via the same `LOCAL_BUILD`-flagged path upstream already built for exa
 Not a change to an upstream *file's behavior*, but recorded here because it's the mechanism
 that makes the fork buildable without a human clicking through Xcode dialogs:
 
-- **Xcode version**: pinned to a specific Xcode 26.x on the runner (the newest `Xcode_26*.app`
-  present under `/Applications`), not the runner image's default (Xcode 16.4). Reason: one of
-  the transitive SPM dependencies (`mlx-swift-lm` → `LLMkit`) declares `// swift-tools-version:
-  6.2`, which Xcode 16.4's Swift 6.1 toolchain rejects outright (`package 'llmkit' … is using
-  Swift tools version 6.2.0 but the installed version is 6.1.0`). Local dev on this Mac now
-  also runs Xcode 26.6 (build 17F113, Swift 6.3.3) for the same reason, so CI and local are
-  intentionally on the same major toolchain generation (26.x) — not byte-identical builds, but
-  no longer chasing two incompatible compilers.
+- **Runner image and Xcode version**: `runs-on: macos-26` (not the `macos-15` this workflow
+  started on), with a "Select Xcode" step that additionally picks the newest `Xcode_26*.app`
+  present under `/Applications` (belt-and-braces over relying on the image's default). Two
+  compounding reasons, found by iterating against real CI failures rather than guessed up
+  front:
+  1. One transitive SPM dependency (`mlx-swift-lm` → `LLMkit`) declares
+     `// swift-tools-version: 6.2`, which `macos-15`'s *default* Xcode (16.4, Swift 6.1) rejects
+     outright (`package 'llmkit' … is using Swift tools version 6.2.0 but the installed version
+     is 6.1.0`) — this is why an Xcode-selection step exists at all.
+  2. `macos-15`'s *newest available* Xcode is 26.3 (Swift tools 6.2.4) — still not enough.
+     `mlx-swift` at the version actually locked in `Package.resolved` (0.31.6) declares
+     `// swift-tools-version: 6.3`, and CI said so plainly: `package 'mlx-swift' @ 0.31.6 is
+     using Swift tools version 6.3.0 but the installed version is 6.2.4`. No Xcode on
+     `macos-15` can build this dependency graph at all.
+  `macos-26` (GitHub Actions runner image, arm64) ships Xcode 26.6 (build 17F113) as its
+  **default** — which happens to be the exact same build this Mac's local toolchain now runs
+  (also 26.6/17F113, Swift 6.3.3), confirmed by comparing `xcodebuild -version` output on both.
+  So CI and local aren't just "same major generation" any more, they're the same Xcode build.
 - **`-skipPackagePluginValidation -skipMacroValidation`** (passed to every `xcodebuild`
   invocation, and to `make local` via the new `LOCAL_XCODEBUILD_FLAGS` Makefile variable):
   **this is a genuine, considered trust decision, not a workaround for something else.**

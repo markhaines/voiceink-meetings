@@ -16,7 +16,12 @@ env:
 
 jobs:
   build-and-test:
-    runs-on: macos-15
+    # macos-15's newest available Xcode (26.3) ships Swift tools 6.2.4, which is too old for
+    # mlx-swift 0.31.6 (needs 6.3.0+, the version actually locked in Package.resolved) --
+    # confirmed by CI itself: "package 'mlx-swift' @ 0.31.6 is using Swift tools version 6.3.0
+    # but the installed version is 6.2.4". macos-26 ships Xcode 26.6 (build 17F113) as its
+    # default, which matches this Mac's local toolchain exactly. See FORK-PATCHES.md.
+    runs-on: macos-26
     timeout-minutes: 60
     steps:
       - name: Checkout

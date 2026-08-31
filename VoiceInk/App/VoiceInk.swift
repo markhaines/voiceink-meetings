@@ -21,7 +21,6 @@ struct VoiceInkApp: App {
     @StateObject private var mainWindowNavigation = MainWindowNavigation.shared
     @StateObject private var aiService = AIService()
     @StateObject private var enhancementService: AIEnhancementService
-    @StateObject private var licenseViewModel = LicenseViewModel.shared
     @StateObject private var activeWindowService = ActiveWindowService.shared
     @AppStorage("hasCompletedOnboardingV2") private var hasCompletedOnboardingV2 = false
     @AppStorage("enableAnnouncements") private var enableAnnouncements = true
@@ -46,7 +45,7 @@ struct VoiceInkApp: App {
         AppAppearancePreference.applyStored()
         OnboardingV2Migration.prepareIfNeeded()
 
-        let logger = Logger(subsystem: "com.prakashjoshipax.voiceink", category: "Initialization")
+        let logger = Logger(subsystem: "com.hainesy.voiceinkmeetings", category: "Initialization")
         // Keep existing model order stable; append new models after synced entities.
         let schema = Schema([
             Transcription.self,
@@ -104,7 +103,7 @@ struct VoiceInkApp: App {
 
         // 1. Create modelsDirectory URL
         let appSupportDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("com.prakashjoshipax.VoiceInk")
+            .appendingPathComponent("com.hainesy.VoiceInkMeetings")
         let modelsDirectory = appSupportDirectory.appendingPathComponent("WhisperModels")
 
         // 2. Create model managers
@@ -212,7 +211,7 @@ struct VoiceInkApp: App {
 
     private static func createPersistentContainer(schema: Schema, logger: Logger) throws -> ModelContainer {
         let appSupportURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("com.prakashjoshipax.VoiceInk", isDirectory: true)
+            .appendingPathComponent("com.hainesy.VoiceInkMeetings", isDirectory: true)
 
         try? FileManager.default.createDirectory(at: appSupportURL, withIntermediateDirectories: true)
 
@@ -229,13 +228,9 @@ struct VoiceInkApp: App {
         )
 
         let dictionarySchema = Schema([VocabularyWord.self, WordReplacement.self])
-        // Dev shares the local stores but must never connect to CloudKit.
-        #if DEBUG || LOCAL_BUILD
-            let dictionaryCloudKit: ModelConfiguration.CloudKitDatabase = .none
-        #else
-            let dictionaryCloudKit: ModelConfiguration.CloudKitDatabase = .private(
-                "iCloud.com.prakashjoshipax.VoiceInk")
-        #endif
+        // Fork has no iCloud container / Developer Team yet (Phase 5); dictionary.store is
+        // local-only until then. See FORK-PATCHES.md.
+        let dictionaryCloudKit: ModelConfiguration.CloudKitDatabase = .none
         let dictionaryConfig = ModelConfiguration(
             "dictionary",
             schema: dictionarySchema,
@@ -353,14 +348,6 @@ struct VoiceInkApp: App {
                                 WindowManager.shared.configureWindow(window)
                             })
                 }
-            }
-            .confettiCelebrationPresenter()
-            .onReceive(
-                LifecycleObserver.shared.publisher(
-                    for: [.applicationDidBecomeActive, .systemDidWake]
-                )
-            ) { _ in
-                licenseViewModel.refreshLicenseState()
             }
         }
         .windowStyle(.hiddenTitleBar)

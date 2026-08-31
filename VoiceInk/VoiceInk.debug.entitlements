@@ -18,7 +18,7 @@
 	<true/>
 	<key>keychain-access-groups</key>
 	<array>
-		<string>$(AppIdentifierPrefix)com.prakashjoshipax.VoiceInk</string>
+		<string>$(AppIdentifierPrefix)com.hainesy.VoiceInkMeetings</string>
 	</array>
 </dict>
 </plist>

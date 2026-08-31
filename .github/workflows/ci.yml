@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  EXPECTED_BUNDLE_ID: com.hainesy.VoiceInkMeetings
+  FORBIDDEN_SPARKLE_FEED_URL: https://beingpax.github.io/VoiceInk/appcast.xml
+
+jobs:
+  build-and-test:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Show toolchain versions
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Resolve whisper.cpp ref
+        id: whisper_ref
+        run: |
+          sha="$(git ls-remote https://github.com/ggerganov/whisper.cpp.git HEAD | cut -f1)"
+          if [ -z "$sha" ]; then
+            echo "error: could not resolve whisper.cpp HEAD sha" >&2
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Cache whisper.xcframework
+        id: whisper_cache
+        uses: actions/cache@v4
+        with:
+          path: ~/VoiceInk-Dependencies
+          key: whisper-deps-${{ runner.os }}-${{ steps.whisper_ref.outputs.sha }}
+
+      - name: Build whisper.xcframework (cache miss)
+        if: steps.whisper_cache.outputs.cache-hit != 'true'
+        run: make setup
+
+      - name: Verify whisper.xcframework is present
+        run: test -d "$HOME/VoiceInk-Dependencies/whisper.cpp/build-apple/whisper.xcframework"
+
+      - name: Build VoiceInk (unsigned local build)
+        run: make local
+
+      - name: Locate built app
+        id: app
+        run: |
+          app_path="$HOME/Downloads/VoiceInk.app"
+          test -d "$app_path" || { echo "error: $app_path not found after make local" >&2; exit 1; }
+          echo "path=$app_path" >> "$GITHUB_OUTPUT"
+
+      - name: Assert fork identity (bundle id + Sparkle feed URL)
+        run: |
+          info_plist="${{ steps.app.outputs.path }}/Contents/Info.plist"
+          bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$info_plist")"
+          echo "Built bundle id: $bundle_id"
+          if [ "$bundle_id" != "$EXPECTED_BUNDLE_ID" ]; then
+            echo "error: built app bundle id '$bundle_id' does not match expected '$EXPECTED_BUNDLE_ID'" >&2
+            exit 1
+          fi
+
+          feed_url="$(/usr/libexec/PlistBuddy -c 'Print :SUFeedURL' "$info_plist" 2>/dev/null || true)"
+          echo "Built Sparkle feed URL: ${feed_url:-<none>}"
+          if [ "$feed_url" = "$FORBIDDEN_SPARKLE_FEED_URL" ]; then
+            echo "error: built app still points at upstream's Sparkle feed URL" >&2
+            exit 1
+          fi
+
+      - name: Run test targets
+        run: |
+          xcodebuild test \
+            -project VoiceInk.xcodeproj \
+            -scheme VoiceInk \
+            -destination 'platform=macOS' \
+            -derivedDataPath .ci-test-build \
+            -xcconfig LocalBuild.xcconfig \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=YES \
+            DEVELOPMENT_TEAM="" \
+            CODE_SIGN_ENTITLEMENTS="$(pwd)/VoiceInk/VoiceInk.local.entitlements" \
+            SWIFT_ACTIVE_COMPILATION_CONDITIONS='$(inherited) LOCAL_BUILD'
+
+      - name: Zip built app artifact
+        run: |
+          mkdir -p artifact
+          ditto -c -k --keepParent "${{ steps.app.outputs.path }}" artifact/VoiceInk.zip
+
+      - name: Upload app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VoiceInk-app
+          path: artifact/VoiceInk.zip
+          retention-days: 14

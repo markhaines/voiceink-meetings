@@ -5,6 +5,9 @@ FRAMEWORK_PATH := $(WHISPER_CPP_DIR)/build-apple/whisper.xcframework
 LOCAL_DERIVED_DATA := $(CURDIR)/.local-build
 LOCAL_CODESIGN_IDENTITY ?=
 RUN_APP_NAME ?= VoiceInk
+# Extra xcodebuild flags for `make local`, e.g. non-interactive CI passing
+# -skipPackagePluginValidation -skipMacroValidation (no GUI to click "Trust & Enable" on).
+LOCAL_XCODEBUILD_FLAGS ?=
 
 .PHONY: all clean whisper setup build local check healthcheck help dev run release release-setup
 
@@ -78,6 +81,7 @@ local: check setup
 		DEVELOPMENT_TEAM="" \
 		CODE_SIGN_ENTITLEMENTS="$(CURDIR)/VoiceInk/VoiceInk.local.entitlements" \
 		SWIFT_ACTIVE_COMPILATION_CONDITIONS='$$(inherited) LOCAL_BUILD' \
+		$(LOCAL_XCODEBUILD_FLAGS) \
 		build
 	@APP_PATH="$(LOCAL_DERIVED_DATA)/Build/Products/Release/VoiceInk.app" && \
 	if [ -d "$$APP_PATH" ]; then \

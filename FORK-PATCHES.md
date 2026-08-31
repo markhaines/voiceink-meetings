@@ -158,6 +158,55 @@ for team-less builds). Since this fork has no Developer Team for the foreseeable
 builds it via the same `LOCAL_BUILD`-flagged path upstream already built for exactly this case
 (see the CI workflow).
 
+### 6. CI (`.github/workflows/ci.yml`) and `Makefile`
+
+Not a change to an upstream *file's behavior*, but recorded here because it's the mechanism
+that makes the fork buildable without a human clicking through Xcode dialogs:
+
+- **Xcode version**: pinned to a specific Xcode 26.x on the runner (the newest `Xcode_26*.app`
+  present under `/Applications`), not the runner image's default (Xcode 16.4). Reason: one of
+  the transitive SPM dependencies (`mlx-swift-lm` → `LLMkit`) declares `// swift-tools-version:
+  6.2`, which Xcode 16.4's Swift 6.1 toolchain rejects outright (`package 'llmkit' … is using
+  Swift tools version 6.2.0 but the installed version is 6.1.0`). Local dev on this Mac now
+  also runs Xcode 26.6 (build 17F113, Swift 6.3.3) for the same reason, so CI and local are
+  intentionally on the same major toolchain generation (26.x) — not byte-identical builds, but
+  no longer chasing two incompatible compilers.
+- **`-skipPackagePluginValidation -skipMacroValidation`** (passed to every `xcodebuild`
+  invocation, and to `make local` via the new `LOCAL_XCODEBUILD_FLAGS` Makefile variable):
+  **this is a genuine, considered trust decision, not a workaround for something else.**
+  Diagnosis: `xcodebuild` failed with `Macro "MLXHuggingFaceMacros" from package "mlx-swift-lm"
+  must be enabled before it can be used` — confirmed reproducible both in CI and in a from-
+  scratch local build on this Mac under Xcode 26.6. This is Xcode's standard one-time "Trust &
+  Enable" prompt for any SPM package that ships a macro or build-tool plugin (first introduced
+  Xcode 14.3); it normally shows once as a GUI dialog and Xcode remembers the choice per-user
+  thereafter. Neither CI's headless runner nor a `Terminal`/`xcodebuild`-only invocation (no
+  Xcode.app UI in the loop) has any way to answer that dialog, so the build hangs/fails forever
+  without an explicit bypass. An earlier attempt at a workaround — setting the undocumented
+  `defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidatation -bool YES` —
+  did **not** work (same failure on the next CI run) and has been removed. The two flags used
+  instead are Apple's own first-class, documented `xcodebuild -help` flags for exactly this
+  case; their own help text is explicit about the tradeoff (*"this can be a security risk if
+  they are not from trusted sources"*). The judgement call: every macro/plugin-shipping package
+  in this build (`mlx-swift-lm`, `swift-syntax`, etc.) is a transitive dependency pulled in by
+  upstream VoiceInk's own `Package.resolved`, not something this fork's CI introduces — the
+  fork is not adding new trust surface, only removing the human click-through step that a
+  build machine can't perform. This applies to CI and to any future non-interactive/scripted
+  build (e.g. a Phase 5 release box); Mark's own interactive `make local` still works exactly
+  as before if `LOCAL_XCODEBUILD_FLAGS` is left empty (default) — Xcode will show the one-time
+  GUI prompt there as normal.
+- `Makefile`: added `LOCAL_XCODEBUILD_FLAGS ?=` (empty by default) and appended
+  `$(LOCAL_XCODEBUILD_FLAGS)` to the `local` target's `xcodebuild` invocation, so CI/scripted
+  callers can inject the two flags above without duplicating the whole recipe. No effect on
+  `make local`'s default (interactive) behavior.
+- `actions/cache@v4`'s `save-always: true` on the whisper.xcframework cache: without it, the
+  action's post-job save step is silently **skipped** whenever any later step in the same job
+  fails — discovered the hard way after two CI runs each spent ~10 minutes rebuilding
+  whisper.xcframework from scratch (verified via the GitHub Actions Jobs API: `Post Cache
+  whisper.xcframework` showed `conclusion: skipped` on both failed runs, and
+  `GET .../actions/caches` listed zero caches). `save-always: true` makes the (expensive,
+  build-outcome-independent) whisper.xcframework get cached regardless of whether the later
+  app build/test steps pass.
+
 ## Architecture budget note
 
 The instruction for this project caps ongoing upstream touchpoints (outside the new

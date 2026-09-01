@@ -704,11 +704,9 @@ off, corrected after reading the real donor code) shared types in `Models/`:
   construction. Both read and confirmed directly, not assumed.
 
 `MeetingPromptStateMachine.swift` was in scope but is NOT ported — see the dedicated section
-below. Full narrative detail (every donor use-site read, exact commands run for each gate) is
-additionally in the task report at `.tandem/884f6ef6905c4e2aa4e2ca28c34ea629/phase1-foundation.md`,
-but that path is orchestration state, not part of this repository, so nothing above depends on
-it being reachable. This entry covers the one upstream-file touch, against the ~6-touchpoint
-budget the note below sets for Phase 1+.
+below. Every fact needed to understand this stage's changes is above, in this document; this
+entry covers the one upstream-file touch, against the ~6-touchpoint budget the note below sets
+for Phase 1+.
 
 ### 1. `project.pbxproj`: `SWIFT_OBJC_BRIDGING_HEADER` added (VoiceInk target, Debug + Release)
 
@@ -754,14 +752,20 @@ the same change, under the same non-negotiable porting rules (every comment, eve
 This stage's port (`MeetingMicRecording`, `StreamingMicRecorder`, `AudioRouteController`,
 `MeetingMicHealthTracker`, `MeetingMicRecoveryCoordinator`, `AudioQueueInputRecorder`,
 `FallbackStreamingDictationRecorder`, verbatim, plus their donor tests) is itself hardware-free
-by construction — see `.tandem/884f6ef6905c4e2aa4e2ca28c34ea629/mic-route.md`. Landing it,
-however, added enough concurrent test load to a shared xctest bundle to reliably expose a
-pre-existing hazard in Stage 0's `AudioGraphExceptionBridgeTests.swift`: its two tests each
-construct a real `AVAudioEngine` and touch `engine.inputNode`, which blocks for ~600s
-negotiating against GitHub Actions' specific CoreAudio device inventory (verified empirically
-across three CI runs — 33555297407, 33561167080, 33565271509 — not assumed; a device-count
-guard and a plain `GITHUB_ACTIONS`/`CI` environment-variable guard were both tried first and
-both disproven by direct experiment before this fix, full narrative in the report above).
+by construction: none of it constructs a real `AVAudioEngine`, `AudioQueueRef`, or performs
+live CoreAudio device enumeration — every test doubles as a fake (`FakeMeetingMicRecorder`,
+`FakeCoreAudioDeviceInspector`, `FakeFallbackStreamingRecorder`). Landing it, however, added
+enough concurrent test load to a shared xctest bundle to reliably expose a pre-existing hazard
+in Stage 0's `AudioGraphExceptionBridgeTests.swift`: its two tests each construct a real
+`AVAudioEngine` and touch `engine.inputNode`, which blocks for ~600s negotiating against GitHub
+Actions' specific CoreAudio device inventory. Verified empirically across three CI runs —
+33555297407, 33561167080, 33565271509 — not assumed: a device-count guard
+(`CoreAudioDeviceInspector().availableInputDevices()` non-empty) was tried first and disproven
+when it evaluated true on the runner (which does enumerate at least one input-capable object,
+contradicting "no audio hardware at all") while the calls still hung; a plain
+`GITHUB_ACTIONS`/`CI` environment-variable guard was tried next and disproven locally, before
+ever reaching CI, when setting either variable on the invoking `xcodebuild` process had no
+effect on the value read inside the actual test run.
 
 The fix needed a way for a test body to tell "GitHub Actions' runner" apart from "a developer
 Mac" from *inside* the actual xctest host process, which does not inherit the invoking shell's

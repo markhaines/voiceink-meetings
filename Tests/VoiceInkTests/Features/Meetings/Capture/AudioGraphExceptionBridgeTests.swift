@@ -31,8 +31,9 @@
 // test targets" step for why this specific mechanism, and not a plain `GITHUB_ACTIONS` check,
 // is required to reach this test process). They run for real -- and pass -- on a developer Mac,
 // including via Xcode's own Test Navigator, which does not go through that CI script and so
-// never sets this variable. Full diagnosis, both discarded guard attempts, and CI run ids:
-// .tandem/884f6ef6905c4e2aa4e2ca28c34ea629/mic-route.md ("CI failure, diagnosis, and fix").
+// never sets this variable. Full diagnosis, both discarded guard attempts (a device-count
+// check, then a plain `GITHUB_ACTIONS` check), and the CI run ids that proved each wrong:
+// FORK-PATCHES.md, "phase-1-mic-route" section.
 //
 // MIT License
 //

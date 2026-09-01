@@ -310,9 +310,9 @@ jobs:
       # not a process environment variable) -- it must be a real environment variable on the
       # process that invokes xcodebuild, which `env:` below provides. This is how
       # AudioGraphExceptionBridgeTests.swift tells this runner apart from a developer Mac to
-      # skip the two/three tests in it that hang for ~600s against this runner's CoreAudio
-      # device inventory, without skipping them everywhere. See that file and
-      # .tandem/884f6ef6905c4e2aa4e2ca28c34ea629/mic-route.md for the full diagnosis.
+      # skip the three tests in it that hang for ~600s against this runner's CoreAudio device
+      # inventory, without skipping them everywhere. See that file's header and
+      # FORK-PATCHES.md's "phase-1-mic-route" section for the full diagnosis.
       - name: Run test targets
         env:
           TEST_RUNNER_VOICEINK_CI: 1

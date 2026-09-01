@@ -3,53 +3,56 @@
 Known gaps deliberately left open, with the reasoning, so they are decisions rather than
 accidents. See each entry for the evidence.
 
-## `AudioGraphExceptionBridgeTests`: two tests disabled unconditionally on CI
+## `AudioGraphExceptionBridgeTests`: three tests skip on CI, run for real on a developer Mac
 
-`inputStateReadIsContained` and `invalidInputRouteIsContained`
-(`Tests/VoiceInkTests/Features/Meetings/Capture/AudioGraphExceptionBridgeTests.swift`) are
-`.disabled(if: true, ...)` and do not run in CI. Both construct a real `AVAudioEngine()` and
-touch its input node, which behaves unreliably against GitHub Actions' macOS runner's CoreAudio
-device inventory: sometimes a ~600s hang (`phase-1-mic-route` / PR #3, CI run 33555297407, and
-again at run 33561167080 after a device-presence guard was proven not to change the outcome),
-sometimes an immediate crash of the shared xctest host process (`phase-1-capture-core` / PR #4,
-CI run 33560960456 — all four in-flight tests, including two unrelated
-`CoreAudioSystemRecorderTests` cases, failed at exactly 0.000s within ~1.5ms of each other at
-the tail of the run). Two independent branches hit the same underlying test pair by two
-different routes (mic-route added concurrency-heavy suites alongside it; capture-core changed
-only `FORK-PATCHES.md` in the commit that first showed the failure — the flakiness pre-existed,
-it was just not yet triggered).
+`inputStateReadIsContained`, `invalidInputRouteIsContained` and `installTapExceptionIsContained`
+(`Tests/VoiceInkTests/Features/Meetings/Capture/AudioGraphExceptionBridgeTests.swift`) construct
+a real `AVAudioEngine()` and touch `.inputNode`, which is unreliable against GitHub Actions'
+macOS runner's specific CoreAudio device inventory. Two independent branches hit this:
 
-Two guard strategies were tried and disproved by direct CI evidence before landing on an
-unconditional disable (full account: PR #3 commits `acf438c` then `2f822a4`, and this file's own
-header comment):
+- `phase-1-mic-route` (PR #3): a ~600s hang (CI run 33555297407), then again at run 33561167080
+  after a device-presence guard was proven not to change the outcome (the runner DOES enumerate
+  an input-capable CoreAudio object, so that guard evaluated true and the real calls still ran).
+- `phase-1-capture-core` (PR #4): a different manifestation of the same cause — an immediate
+  crash of the shared xctest host process (CI run 33560960456; all four in-flight tests,
+  including two unrelated `CoreAudioSystemRecorderTests` cases, failed at exactly 0.000s within
+  ~1.5ms of each other at the tail of the run — collateral damage, not a defect in
+  `CoreAudioSystemRecorderTests` itself, confirmed by that file's own header stating none of its
+  tests touch real hardware).
 
-1. **Device-presence guard** (`CoreAudioDeviceInspector().availableInputDevices()` non-empty) —
-   assumed the runner has zero CoreAudio input devices. Wrong: CI run 33561167080 showed the
-   runner *does* enumerate an input-capable object, so the guard evaluated true, the real calls
-   ran anyway, and each test then hung for its own independently-measured ~600.8s.
-2. **`GITHUB_ACTIONS` environment-variable guard** — wrong for a structural reason:
-   `xcodebuild test` launches the actual xctest host through a LaunchServices-mediated path that
-   does not inherit the invoking shell's environment, so a variable set on the `xcodebuild`
-   invocation never reaches the test binary. Reaching it would need a `TEST_RUNNER_`-prefixed
-   build setting on the CI workflow's own `xcodebuild test` invocation, or a shared
-   `.xctestplan` — both changes to `.github/workflows/ci.yml` / shared scheme configuration,
-   out of scope for a single feature branch to make unilaterally.
+One shared root cause, two timing-dependent manifestations, not two separate bugs, and not a
+production defect — real Macs have an addressable input device, so this is specific to the
+runner's virtualized/absent audio hardware.
 
-No signal reachable from inside the test target can currently distinguish "GitHub Actions
-runner" from "developer Mac", so there is no way to make this conditional and honest. It is
-disabled outright, not weakened or deleted: both tests still compile, still exist, and still
-pass in well under a second each when run for real on a Mac (temporarily remove the `.disabled`
-trait, or run them individually via Xcode's Test Navigator, which bypasses the `xcodebuild test`
-CLI recipe entirely).
+**Adopted fix** (from `phase-1-mic-route` commit `8ecc2d1`, copied verbatim onto this branch so
+both branches carry byte-identical `.github/workflows/ci.yml` and
+`AudioGraphExceptionBridgeTests.swift` for a clean merge): `.github/workflows/ci.yml`'s "Run
+test targets" step sets `env: TEST_RUNNER_VOICEINK_CI: 1`; `xcodebuild` forwards any
+`TEST_RUNNER_`-prefixed environment variable into the LaunchServices-launched xctest host with
+the prefix stripped, which a plain `GITHUB_ACTIONS`/`CI` check cannot reach (verified: that
+shell-level variable never propagates to the test process). The three tests gate on
+`ProcessInfo.processInfo.environment["VOICEINK_CI"] != nil` via `.disabled(if: isRunningInCI,
+...)`, so they SKIP on CI and RUN FOR REAL on a developer Mac (including Xcode's own Test
+Navigator, which doesn't go through this CI script). This was chosen over an earlier
+unconditional `.disabled(if: true, ...)` version specifically because that left the ObjC
+exception-containment boundary with zero automated coverage anywhere — cross-vendor review
+correctly rejected that as an unacceptable endpoint.
 
-**To re-enable:** add a `TEST_RUNNER_`-prefixed environment/build setting to
-`.github/workflows/ci.yml`'s `xcodebuild test` invocation (or introduce a shared `.xctestplan`
-that can carry one), then replace `disabledOnThisCI`'s literal `true` with a check against it.
-That is a CI-workflow change, not a test-target change, which is why it wasn't done here.
+An earlier device-presence guard attempt on this exact file/branch is superseded and no longer
+described in the file header — see PR #3's `acf438c`/`2f822a4` history for that dead end if it
+resurfaces as a suggestion.
 
-The two `CoreAudioSystemRecorderTests` failures seen alongside this on PR #4 (`run 33560960456`)
-are not a defect of their own: that file's own header states no test in it touches real CoreAudio
-hardware, and PR #3 independently saw a *different* set of unrelated tests
-(`RouteAwareMeetingMicRecorderTests`) dragged down the same way when the exception-bridge tests
-misbehaved. Both are collateral damage from a shared xctest host process, not a bug in the
-watchdog/rebuild state machine.
+## `.xcresult` not recoverable from a failed CI run
+
+When "Run test targets" fails, nothing in `.github/workflows/ci.yml` uploads the `.xcresult`
+bundle (or a crash report) as a workflow artifact — it only exists on the ephemeral runner
+filesystem, which is gone once the job ends or the run is re-triggered. This meant the CI
+run 33560960456 investigation above had to work entirely from the raw step log's text output
+(test names, pass/fail, per-test duration) rather than the structured result bundle or an actual
+crash report, and any `.xcresult`-level detail (symbolicated stack, signal, thread state) for
+that specific failure is permanently lost. Worth fixing at the workflow level: add an
+`actions/upload-artifact` step, gated on `if: failure()`, that uploads
+`.ci-test-build/Logs/Test/*.xcresult` (see the path xcodebuild already prints under "Test
+session results, code coverage, and logs:") so a future flaky-test investigation has the real
+bundle instead of reconstructing evidence from log text. Not done here — out of scope for this
+branch's immediate test-reliability fix.

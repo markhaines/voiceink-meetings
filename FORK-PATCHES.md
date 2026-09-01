@@ -181,32 +181,51 @@ that makes the fork buildable without a human clicking through Xcode dialogs:
   **default** — which happens to be the exact same build this Mac's local toolchain now runs
   (also 26.6/17F113, Swift 6.3.3), confirmed by comparing `xcodebuild -version` output on both.
   So CI and local aren't just "same major generation" any more, they're the same Xcode build.
-- **`-skipPackagePluginValidation -skipMacroValidation`** (passed to every `xcodebuild`
-  invocation, and to `make local` via the new `LOCAL_XCODEBUILD_FLAGS` Makefile variable):
-  **this is a genuine, considered trust decision, not a workaround for something else.**
-  Diagnosis: `xcodebuild` failed with `Macro "MLXHuggingFaceMacros" from package "mlx-swift-lm"
-  must be enabled before it can be used` — confirmed reproducible both in CI and in a from-
-  scratch local build on this Mac under Xcode 26.6. This is Xcode's standard one-time "Trust &
-  Enable" prompt for any SPM package that ships a macro or build-tool plugin (first introduced
-  Xcode 14.3); it normally shows once as a GUI dialog and Xcode remembers the choice per-user
-  thereafter. Neither CI's headless runner nor a `Terminal`/`xcodebuild`-only invocation (no
-  Xcode.app UI in the loop) has any way to answer that dialog, so the build hangs/fails forever
-  without an explicit bypass. An earlier attempt at a workaround — setting the undocumented
-  `defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidatation -bool YES` —
-  did **not** work (same failure on the next CI run) and has been removed. The two flags used
-  instead are Apple's own first-class, documented `xcodebuild -help` flags for exactly this
-  case; their own help text is explicit about the tradeoff (*"this can be a security risk if
-  they are not from trusted sources"*). The judgement call: every macro/plugin-shipping package
-  in this build (`mlx-swift-lm`, `swift-syntax`, etc.) is a transitive dependency pulled in by
-  upstream VoiceInk's own `Package.resolved`, not something this fork's CI introduces — the
-  fork is not adding new trust surface, only removing the human click-through step that a
-  build machine can't perform. This applies to CI and to any future non-interactive/scripted
-  build (e.g. a Phase 5 release box); Mark's own interactive `make local` still works exactly
-  as before if `LOCAL_XCODEBUILD_FLAGS` is left empty (default) — Xcode will show the one-time
-  GUI prompt there as normal.
+- **`-skipMacroValidation`** (passed to both `xcodebuild` invocations, and to `make local` via
+  the new `LOCAL_XCODEBUILD_FLAGS` Makefile variable): **a security-relevant weakening, kept
+  deliberately, narrowed to the minimum, and justified here.**
+
+  *What breaks without it.* `mlx-swift-lm` ships a Swift macro target, `MLXHuggingFaceMacros`.
+  Xcode gates the first use of any package macro behind a one-time interactive "Trust & Enable"
+  dialog, and a headless runner has no way to answer it. CI run **33442033271** (commit
+  `0614d43`, no flags) failed with:
+
+  > `/…/SourcePackages/checkouts/mlx-swift-lm/Package.swift:PACKAGE-TARGET:MLXHuggingFaceMacros:`
+  > `error: Macro “MLXHuggingFaceMacros” from package “mlx-swift-lm” must be enabled before it can be used`
+
+  So this is a real, reproduced headless blocker, not a symptom of some other fault. (The
+  separate local `xcodebuild -resolvePackageDependencies` hang is unrelated — its sampled stack
+  sits in `waitForRemoteSourcePackagesToFinishLoading`, i.e. package-graph loading, and never
+  reaches macro validation. Neither problem masks the other; see §7.)
+
+  *What did not work.* The first attempt (commit `c523224`) set the undocumented default
+  `defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidatation -bool YES`.
+  CI run **33443041941** produced the identical macro error, so that commit's change was inert
+  and has been removed. It is worth naming plainly: that commit weakened a security-adjacent
+  setting *and did not even achieve the thing it was added for*.
+
+  *Narrowed to one flag.* Commit `f38bdc3` used **two** flags, `-skipMacroValidation` **and**
+  `-skipPackagePluginValidation`. Only the first is needed: the reproduced error names a macro
+  target, not a build-tool plugin, and this dependency graph runs no build-tool plugins.
+  `-skipPackagePluginValidation` was therefore dropped, and CI confirms the build and tests
+  still pass without it. The remaining flag is Apple's own documented `xcodebuild` option for
+  exactly this case; its help text is explicit that it "can be a security risk if they are not
+  from trusted sources".
+
+  *Why it is an acceptable risk here.* The flag skips a **fingerprint/consent prompt**, not a
+  signature or integrity check, and it changes nothing about *which* code is fetched. What code
+  runs is decided by `Package.resolved`, which pins every dependency to an exact commit hash,
+  and by `-onlyUsePackageVersionsFromResolvedFile`, which forbids `xcodebuild` from resolving to
+  anything else. Every macro-shipping package in this graph (`mlx-swift-lm`, `swift-syntax`) is
+  a transitive dependency of *upstream* VoiceInk's own lockfile — the fork adds no new trust
+  surface, it only removes a click a build machine cannot perform. The residual risk is the one
+  that already exists for anyone who clicks "Trust & Enable" locally: a compromised upstream
+  dependency at a pinned hash. The mitigation that actually matters is the pinning, and it is
+  in place. Mark's interactive `make local` is unaffected (`LOCAL_XCODEBUILD_FLAGS` defaults to
+  empty), so on a desk Mac Xcode still shows the prompt as normal.
 - `Makefile`: added `LOCAL_XCODEBUILD_FLAGS ?=` (empty by default) and appended
   `$(LOCAL_XCODEBUILD_FLAGS)` to the `local` target's `xcodebuild` invocation, so CI/scripted
-  callers can inject the two flags above without duplicating the whole recipe. No effect on
+  callers can inject the flags above without duplicating the whole recipe. No effect on
   `make local`'s default (interactive) behavior.
 - Whisper.xcframework caching: `actions/cache@v4`'s combined step silently **skips its save**
   whenever any later step in the same job fails — discovered the hard way after two CI runs
@@ -237,6 +256,47 @@ that makes the fork buildable without a human clicking through Xcode dialogs:
   manifest looseness. Phase 1+ should consider whether to bump `mlx-swift-lm`'s pin (or add an
   explicit `mlx-swift` pin) to make the manifest itself consistent, so a *local* build with no
   existing lock also doesn't hit this.
+- **Test step runs `-configuration Debug`** (and `-skip-testing:VoiceInkUITests`). This was the
+  last thing standing between the fork and a green CI, and it is worth recording precisely
+  because the symptom pointed somewhere misleading. Runs **33446687461**, **33448390850** and
+  **33449207129** all "died in `ComputeTargetDependencyGraph`" as far as the visible log tail
+  showed. That reading was wrong. Pulling the full 22,831-line log and mapping the step
+  boundaries shows the **app build succeeded** in every one of those runs, as did the fork
+  identity assertion; only the final `xcodebuild test` step failed, with exit code 65:
+
+  > `Tests/VoiceInkTests/VoiceInkTests.swift:9:18: error: unable to resolve Swift module`
+  > `dependency to a compatible module: 'VoiceInk'`
+  > `note: found incompatible module '…/Build/Products/Release/VoiceInk.swiftmodule/arm64-apple-macos.swiftmodule'`
+
+  Cause: the shared scheme's `TestAction` is set to `buildConfiguration = "Release"`, but
+  `ENABLE_TESTABILITY = YES` appears exactly once in `project.pbxproj` and only on **Debug**.
+  A Release test build therefore emits a `VoiceInk.swiftmodule` with no testing information, and
+  `@testable import VoiceInk` cannot resolve against it. This is a latent upstream defect — the
+  scheme as shipped cannot run its own tests in any environment — that this fork is the first
+  thing to exercise. Fixed at the CI invocation rather than by editing the scheme, keeping the
+  upstream-file touch count down: Debug is also the configuration the project already wires for
+  testing (its `TEST_HOST` points at `VoiceInk Dev.app`, which is what a Debug build produces).
+  The UI test bundle is skipped because `VoiceInkUITests` launches a real `XCUIApplication`, and
+  VoiceInk needs Accessibility and microphone consent to clear onboarding — a GitHub runner
+  grants neither. `VoiceInkTests` does run.
+- **`scripts/assert-fork-identity.sh`** (new file) — the guard that stops the fork
+  auto-updating into upstream's build. It fails if `CFBundleIdentifier` is not this fork's, if
+  `SUFeedURL` points at upstream's appcast **host**, or if that host appears anywhere else in
+  the bundle (nested plists, resources, or the executable itself — `grep -a`, so binaries are
+  scanned too).
+
+  Two deliberate strengthenings over the inline check it replaces. First, the old check compared
+  `SUFeedURL` for **exact string equality** with upstream's appcast URL, so a merely *renamed*
+  feed on the same host (`…/VoiceInk/appcast-v2.xml`) would have passed. The match is now
+  host-level. Second, and more important, CI now **verifies the assertion itself** on every run,
+  in a `Self-test the fork-identity assertion` step that runs before the real check: four
+  fabricated bundles it must reject (upstream URL, renamed URL on upstream's host, upstream
+  bundle id, host hidden in a nested resource) and one clean bundle it must accept. An assertion
+  that can never fire is worse than no assertion, because it reads as green forever. This
+  self-test was itself checked by sabotage: reverting the script to the old exact-URL comparison
+  makes the self-test fail on the renamed-feed control, and stubbing the script to `exit 0`
+  makes it fail on the first control.
+
 
 ## Architecture budget note
 

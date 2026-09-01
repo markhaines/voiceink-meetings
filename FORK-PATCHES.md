@@ -747,6 +747,58 @@ Recommendation for whichever Stage-1 cluster owns Detection: port
 `MeetingPromptStateMachine.swift` and `MeetingCandidateResolver.swift` together, verbatim, in
 the same change, under the same non-negotiable porting rules (every comment, every branch).
 
+## phase-1-mic-route (Stage 1: mic capture and audio route control)
+
+### 1. `.github/workflows/ci.yml`: `TEST_RUNNER_VOICEINK_CI` added to the "Run test targets" step
+
+This stage's port (`MeetingMicRecording`, `StreamingMicRecorder`, `AudioRouteController`,
+`MeetingMicHealthTracker`, `MeetingMicRecoveryCoordinator`, `AudioQueueInputRecorder`,
+`FallbackStreamingDictationRecorder`, verbatim, plus their donor tests) is itself hardware-free
+by construction — see `.tandem/884f6ef6905c4e2aa4e2ca28c34ea629/mic-route.md`. Landing it,
+however, added enough concurrent test load to a shared xctest bundle to reliably expose a
+pre-existing hazard in Stage 0's `AudioGraphExceptionBridgeTests.swift`: its two tests each
+construct a real `AVAudioEngine` and touch `engine.inputNode`, which blocks for ~600s
+negotiating against GitHub Actions' specific CoreAudio device inventory (verified empirically
+across three CI runs — 33555297407, 33561167080, 33565271509 — not assumed; a device-count
+guard and a plain `GITHUB_ACTIONS`/`CI` environment-variable guard were both tried first and
+both disproven by direct experiment before this fix, full narrative in the report above).
+
+The fix needed a way for a test body to tell "GitHub Actions' runner" apart from "a developer
+Mac" from *inside* the actual xctest host process, which does not inherit the invoking shell's
+environment (`xcodebuild test` launches it via a LaunchServices-mediated path — see the
+`CodeSign`/`RegisterExecutionPolicyException` steps around it in any CI log). Xcode's
+documented mechanism for exactly this — any environment variable on the process that invokes
+`xcodebuild` prefixed `TEST_RUNNER_` is forwarded into the launched test host with the prefix
+stripped — was verified empirically before landing, not assumed: `env
+TEST_RUNNER_VOICEINK_CI=1 xcodebuild test ...` locally flips
+`ProcessInfo.processInfo.environment["VOICEINK_CI"]` from absent to `"1"` inside the actual
+test run (confirmed both directions: present → the three gated tests report `skipped`, 0.000s;
+absent → they execute for real and `pass`, ~0.05-2s). Passing `TEST_RUNNER_VOICEINK_CI=1` as a
+trailing `xcodebuild` argument instead (a build-setting override, not a process environment
+variable) does **not** work — confirmed by the same experiment failing until moved to a real
+`env:`.
+
+The change is a step-level `env:` block, additive only, touching no other step and no other
+job:
+
+```yaml
+- name: Run test targets
+  env:
+    TEST_RUNNER_VOICEINK_CI: 1
+  run: |
+    xcodebuild test \
+      ...
+```
+
+This is the only change to `.github/workflows/ci.yml` in this stage, authorised specifically
+for this fix by the reviewer of PR #3's first CI-failure round (change request logged in the
+PR; not a general license to edit CI). `AudioGraphExceptionBridgeTests.swift`'s guard reads
+`VOICEINK_CI` (the `TEST_RUNNER_` prefix already stripped) via
+`ProcessInfo.processInfo.environment["VOICEINK_CI"] != nil`, gating all three of its tests
+(the two donor tests plus the previously-reverted `installTapExceptionIsContained`, restored
+under the same guard in this same change). None of this stage's own 7 ported source files or 6
+ported test files needed any change to reach this fix.
+
 ## Architecture budget note
 
 The instruction for this project caps ongoing upstream touchpoints (outside the new

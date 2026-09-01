@@ -670,14 +670,45 @@ These changed what the app does. Read the reason before merging upstream changes
 
 ## phase-1-foundation (Stage 0: Meetings slice foundation)
 
-Ported from Muesli-HQ/muesli into the new `VoiceInk/Features/Meetings/` slice: `Capture/`
-(`PCMChunkRecorder.swift`, `MeetingChunkTimingTracker.swift`, `AudioSampleStats.swift`
-extracted from `MeetingSessionDiagnostics.swift`, `WavWriter.swift`, and the
-`AudioGraphExceptionBridge` ObjC pair) plus two fork-owned shared types in `Models/`
-(`MeetingRuntimePaths.swift`, `SpeechSegment.swift`). Full detail, including which donor
-files were read to confirm each design decision, is in the task report at
-`.tandem/884f6ef6905c4e2aa4e2ca28c34ea629/phase1-foundation.md`. This entry covers only the
-one upstream-file touch, against the ~6-touchpoint budget the note below sets for Phase 1+.
+Ported from Muesli-HQ/muesli into the new `VoiceInk/Features/Meetings/` slice, verbatim
+(comments, branches and constants unchanged, MIT header + minimal import trims only):
+`Capture/PCMChunkRecorder.swift` (donor 101 lines), `Capture/MeetingChunkTimingTracker.swift`
+(58), `Capture/WavWriter.swift` (donor's full `WavWriter.swift`, pulled in unscoped because
+`PCMChunkRecorder` calls it directly and every Stage-1 capture cluster needs it too),
+`Capture/AudioSampleStats.swift` (extracted from `MeetingSessionDiagnostics.swift` lines 5-52,
+along with `AudioSampleStatsSnapshot` since `.snapshot()` returns one), and the
+`AudioGraphExceptionBridge` ObjC pair (`.h`/`.m`, ported from the donor's separate SwiftPM
+target of the same name — see section 1 below for why that needed a bridging header).
+
+Two fork-owned (not verbatim — the task descriptions of the donor equivalents were slightly
+off, corrected after reading the real donor code) shared types in `Models/`:
+- **`SpeechSegment.swift`**: three fields (`start: Double`, `end: Double`, `text: String`),
+  `Sendable`. Donor's real type lives at `MuesliNativeApp/TranscriptionRuntime.swift:5`, not in
+  the `MuesliCore` library target as the task brief assumed. Confirmed against all 11 donor
+  construction sites — every one uses exactly this shape, nothing else.
+- **`MeetingRuntimePaths.swift`**: donor's `RuntimePaths.swift` is actually about app-bundle
+  resource resolution (icons), unrelated to meeting audio — not ported. What Stage-1 capture
+  code needs instead comes from `MeetingSession.swift` (chunk-scratch directory names) and
+  `MeetingRecordingWriter.swift` (permanent recording directory). The permanent directory is
+  `~/Library/Application Support/<Bundle.main.bundleIdentifier>/MeetingRecordings/` — a
+  sibling of VoiceInkEngine's own `Recordings/`, scoped by the running build's actual bundle
+  identifier (not a hardcoded literal, so the Debug build — `com.hainesy.VoiceInkMeetings.dev`
+  — and the Release build — `com.hainesy.VoiceInkMeetings`, both confirmed in this file's own
+  `PRODUCT_BUNDLE_IDENTIFIER` settings — never share a meeting-audio directory). It is
+  structurally exempt from BOTH of VoiceInk's existing audio-cleanup mechanisms: (1)
+  `AudioCleanupManager` only ever deletes paths it reads from `Transcription.audioFileURL` in
+  SwiftData, never scans a directory; (2)
+  `TranscriptionAutoCleanupService.cleanupOrphanAudioFiles()` — the second, easy-to-miss
+  mechanism, which also deletes files with no matching `Transcription` record — only lists its
+  own hardcoded `Recordings/` directory, so a sibling directory is outside its scan by
+  construction. Both read and confirmed directly, not assumed.
+
+`MeetingPromptStateMachine.swift` was in scope but is NOT ported — see the dedicated section
+below. Full narrative detail (every donor use-site read, exact commands run for each gate) is
+additionally in the task report at `.tandem/884f6ef6905c4e2aa4e2ca28c34ea629/phase1-foundation.md`,
+but that path is orchestration state, not part of this repository, so nothing above depends on
+it being reachable. This entry covers the one upstream-file touch, against the ~6-touchpoint
+budget the note below sets for Phase 1+.
 
 ### 1. `project.pbxproj`: `SWIFT_OBJC_BRIDGING_HEADER` added (VoiceInk target, Debug + Release)
 

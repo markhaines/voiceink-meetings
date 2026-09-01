@@ -755,3 +755,42 @@ top of a clean base — it does not describe Phase 0 itself, whose entire job is
 upstream-owned files (identity, signing, Sparkle, delicensing) exactly once, up front, so later
 phases don't have to. This entry is long because Phase 0 is supposed to be long; Phase 1 onward
 should look nothing like this.
+
+## phase-1-capture-core (Stage 1: system audio capture core)
+
+### 1. `VoiceInk/Info.plist`: `NSAudioCaptureUsageDescription` added
+
+The CoreAudio process-tap path (`CoreAudioSystemRecorder.swift`) triggers the system "would
+like to record audio from other applications" dialog only if `NSAudioCaptureUsageDescription`
+is present in `Info.plist` — otherwise the tap creation call fails outright rather than
+prompting. Key was not already present (`NSMicrophoneUsageDescription`,
+`NSAppleEventsUsageDescription` and `NSScreenCaptureUsageDescription` were; this one wasn't).
+Added, matching the existing string style:
+
+```
+<key>NSAudioCaptureUsageDescription</key>
+<string>VoiceInk captures system audio from other applications during meeting recordings.</string>
+```
+
+This is the ~2nd of the ~6-touchpoint Phase 1+ budget the note above sets. Confirmed against
+the donor's own `scripts/build_native_app.sh` (which injects the same key at build time with
+`$APP_DISPLAY_NAME captures system audio from other applications during meeting recordings.`)
+and `REVIEW.md` ("System audio capture through the CoreAudio tap path uses audio-capture TCC
+(`kTCCServiceAudioCapture`) and does not require Screen Recording") — the permission this key
+gates is `kTCCServiceAudioCapture`, a distinct TCC service from `NSScreenCaptureUsageDescription`
+(Screen Recording), which the app already requests for a different feature (screen context).
+
+### Note: new fork-only file not from the donor
+
+`VoiceInk/Features/Meetings/Capture/SystemAudioCaptureDiagnostics.swift` is new, not upstream —
+no entry needed under the rule at the top of this file ("New code that lives entirely under
+`Features/Meetings/` ... does not need an entry here"). Logged anyway for visibility: it
+extracts `SystemAudioCaptureDiagnosticsSnapshot` and `SystemAudioDiagnosticsProviding` verbatim
+from the donor's `MeetingSessionDiagnostics.swift` (lines 54-70), the same donor file
+`AudioSampleStats.swift` was already extracted from in Stage 0. Both `CoreAudioSystemRecorder.swift`
+and `SystemAudioRecorder.swift` conform to `SystemAudioDiagnosticsProviding` and cannot compile
+without it; the rest of `MeetingSessionDiagnostics.swift` (AEC delay estimation, diarization
+counts, chunk health, the `MeetingSessionDiagnostics` class itself) is NOT ported and remains
+Stage-2/MeetingSession-owned. See `.tandem/884f6ef6905c4e2aa4e2ca28c34ea629/capture-core.md`
+for the full reasoning on why this extraction was judged in-scope rather than a "Known gap"
+(the Stage 0 precedent for `MeetingPromptStateMachine.swift`).

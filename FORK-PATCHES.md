@@ -791,6 +791,10 @@ from the donor's `MeetingSessionDiagnostics.swift` (lines 54-70), the same donor
 and `SystemAudioRecorder.swift` conform to `SystemAudioDiagnosticsProviding` and cannot compile
 without it; the rest of `MeetingSessionDiagnostics.swift` (AEC delay estimation, diarization
 counts, chunk health, the `MeetingSessionDiagnostics` class itself) is NOT ported and remains
-Stage-2/MeetingSession-owned. See `.tandem/884f6ef6905c4e2aa4e2ca28c34ea629/capture-core.md`
-for the full reasoning on why this extraction was judged in-scope rather than a "Known gap"
-(the Stage 0 precedent for `MeetingPromptStateMachine.swift`).
+Stage-2/MeetingSession-owned. The extraction was judged in-scope, rather than logged as a
+"Known gap", because those 17 lines are pure declarations (one snapshot value type and one
+protocol) that two ported files cannot compile without, and because Stage 0 set exactly this
+precedent by extracting `AudioSampleStats.swift` from the same donor file. It is distinct from
+the Stage 0 decision NOT to port `MeetingPromptStateMachine.swift`: that would have required
+inventing a placeholder for `MeetingCandidate`, a type belonging to a detection subsystem that
+has not been designed yet, which is a different act from lifting declarations verbatim.

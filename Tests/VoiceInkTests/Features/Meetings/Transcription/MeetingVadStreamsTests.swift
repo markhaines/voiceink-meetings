@@ -468,12 +468,10 @@ struct MeetingVadStreamsTests {
 //   error: cannot find type 'AECAttestationSeal' in scope
 //
 // private struct AttackA2: AECMicOutputAttestation {
-//     var cleanedMicSamples: [Float] { [] }
+//     var cleanedMicSamples: [Float] { [Float](repeating: 0, count: 1) }
 //     var _seal: AECAttestationSeal { fatalError() }
 // }
-// private func attackA2(raw: [Float]) -> AECCleanedMicSamples {
-//     AECCleanedMicSamples.mint(from: AttackA2())
-// }
+// private func attackA2() -> AECCleanedMicSamples { AECCleanedMicSamples.mint(from: AttackA2()) }
 
 // Attack A4 -- synthesised memberwise initialiser:
 //   error: extraneous argument label 'storedSamples:' in call

@@ -747,6 +747,86 @@ Recommendation for whichever Stage-1 cluster owns Detection: port
 `MeetingPromptStateMachine.swift` and `MeetingCandidateResolver.swift` together, verbatim, in
 the same change, under the same non-negotiable porting rules (every comment, every branch).
 
+## phase-1-aec-dtln (Stage 1: Acoustic Echo Cancellation, DTLN path)
+
+Ports the donor's meeting AEC engine, DTLN path only (LocalVQE deferred; Apple Voice Processing
+I/O rejected — both settled by the Phase 1 AEC de-risk investigations at
+`.tandem/884f6ef6905c4e2aa4e2ca28c34ea629/{dtln-aec-viability,vpio-aec-spike}.md`, outside this
+repo): `Capture/MeetingNeuralAec.swift` (donor 796 lines, DTLN-only excision — 4 points: the
+`preload()` LocalVQE-first branch removed, `MeetingAecProcessorSelection` trimmed 3→1 case, the
+`localvqe` special case in `referenceDelaySamples()` dropped, `LocalVQEProcessor.swift`/
+`LocalVQEBridge` never ported at all — delay estimator and buffer/trim machinery kept verbatim,
+load-bearing on DTLN), `Capture/MeetingAecDiagnostics.swift` (extracted from
+`MeetingSessionDiagnostics.swift` donor lines 72-156: `MeetingAecDiagnosticsSnapshot` +
+its `Decodable` extension, `MeetingAecDelayObservation`, `MeetingAecDelayCandidateScore`,
+`MeetingAecDelaySkip` — same donor file as `Capture/AudioSampleStats.swift` (lines 5-52, Stage 0)
+and capture-core's `SystemAudioCaptureDiagnostics.swift` (lines 54-71), three different slices of
+one donor file ported independently by three different agents; the `MeetingSessionDiagnostics`
+aggregator class itself, donor line 158+, is not ported — MeetingSession integration owns it),
+and `Tests/.../MeetingNeuralAecTests.swift` (15 of the donor's 17 `@Test`s; 2 dropped —
+`localVQEBridgeRejectsEmptyModelPath`, `localVQEBridgeReportsMissingLibraryPath` — called the
+`LocalVQEBridge` C target directly and would no longer compile).
+
+Adds `MeetingAecRouteBypassSource`, a small protocol (new, not from the donor — the donor never
+gated meeting AEC on route) letting a headphone-like audio route bypass DTLN per mic chunk;
+seamed for the MeetingSession integration owner to wire to the real `AudioRouteClassifier`
+(ported separately, for dictation today).
+
+### 2. `project.pbxproj`: `dtln-aec-coreml` package reference + `DTLNAecCoreML`/`DTLNAec512` product links (VoiceInk target)
+
+This is an upstream-owned-file touch outside the `Features/Meetings/` slice, so it counts against
+the Phase 1+ budget the note below sets — and, same as section 1's bridging-header entry, it is
+logged here as a deliberate, one-time addition rather than left implicit in a diff.
+
+**Why this one is unavoidable, not a workaround.** Linking a Swift Package product into an Xcode
+target's build graph is not expressible any other way in a plain `.xcodeproj` (this project has
+no root-level `Package.swift` for the app itself — every dependency is an Xcode-managed
+`XCRemoteSwiftPackageReference`/`XCSwiftPackageProductDependency` pair, entirely inside
+`project.pbxproj`). There is no `xcodebuild` verb to add a package reference; only Xcode's GUI or
+a direct pbxproj edit can do it, and both mutate the same bytes. Confirmed empirically before
+touching anything: with `dtln-aec-coreml` pinned in `Package.resolved` and both new Swift files
+in place (picked up automatically via `PBXFileSystemSynchronizedRootGroup`, no pbxproj edit
+needed for those), the *only* build error in the whole log was
+`MeetingNeuralAec.swift:53:8: error: Unable to resolve module dependency: 'DTLNAecCoreML'`.
+
+**Why this Stage-1 cluster specifically, and not left for a later serial merge.** The four
+parallel Stage-1 agents (capture core, mic+route, AEC, VAD chunking) were each told not to touch
+`project.pbxproj`, to avoid a four-way collision on one shared file. Checked before editing: the
+capture-core cluster had already finished and had not touched it; mic+route and vad-chunking were
+both instructed not to and have no reason to (neither adds an SPM dependency). With no live
+collision risk, adding it here — once, minimally — is cheaper than adding a fifth, purely
+mechanical hand-off step whose only job would be this exact 6-hunk edit.
+
+**The edit, and confirmation every hunk was read.** Six additive hunks, no reformatting, no
+`objectVersion`/`preferredProjectObjectVersion` change, modeled directly on the existing
+`swift-huggingface` entry (same `exactVersion` requirement shape) and on `mlx-swift-lm` (same
+one-package/two-products shape, there `MLXLLM`+`MLXLMCommon`, here `DTLNAecCoreML`+`DTLNAec512`):
+
+1. `PBXBuildFile` section: 2 new entries (`DTLNAecCoreML in Frameworks`, `DTLNAec512 in
+   Frameworks`), each `productRef`-linked to its `XCSwiftPackageProductDependency`.
+2. `VoiceInk` target's `Frameworks` build phase `files` list: the same 2 entries appended.
+3. `VoiceInk` target's `packageProductDependencies`: 2 entries appended (test targets and
+   `VoiceInkRefineXPC` untouched — nothing in this port is referenced outside the `VoiceInk`
+   app target; the ported test file uses `@testable import VoiceInk` only, never
+   `import DTLNAecCoreML` directly).
+4. `PBXProject.packageReferences`: 1 entry appended
+   (`XCRemoteSwiftPackageReference "dtln-aec-coreml"`).
+5. `XCRemoteSwiftPackageReference` section: 1 new block, `repositoryURL =
+   "https://github.com/MimicScribe/dtln-aec-coreml.git"`, `requirement = { kind =
+   exactVersion; version = 0.7.0; }` — pinned exact, not `upToNextMajorVersion`, since this
+   package is archived and will never publish a compatible newer tag to float onto.
+6. `XCSwiftPackageProductDependency` section: 2 new blocks (`DTLNAecCoreML`, `DTLNAec512`), both
+   `package`-linked to the one reference above.
+
+`git diff VoiceInk.xcodeproj/project.pbxproj` was read in full after the edit — all 6 hunks are
+attributable to exactly this package link, nothing else. `xcodebuild -resolvePackageDependencies`
+afterward resolved `DTLNAecCoreML` at `0.7.0` and left `Package.resolved` byte-identical to the
+version already committed (the manual pin added ahead of this edit — see the AEC task report —
+matched exactly what a real Xcode resolution produces). `scripts/verify-package-trust.sh` passed
+unchanged. Debug build and the full local test run (`xcodebuild test`, CI's exact invocation)
+both succeeded afterward — see the AEC task report,
+`.tandem/884f6ef6905c4e2aa4e2ca28c34ea629/aec-dtln.md`, for the literal commands and output.
+
 ## Architecture budget note
 
 The instruction for this project caps ongoing upstream touchpoints (outside the new
@@ -754,4 +834,7 @@ The instruction for this project caps ongoing upstream touchpoints (outside the 
 top of a clean base — it does not describe Phase 0 itself, whose entire job is editing
 upstream-owned files (identity, signing, Sparkle, delicensing) exactly once, up front, so later
 phases don't have to. This entry is long because Phase 0 is supposed to be long; Phase 1 onward
-should look nothing like this.
+should look nothing like this. Stage 1's own touchpoint count so far: 2 (Stage 0's bridging
+header, this stage's package link) — both one-time additions to a target's build graph, not
+recurring edits, and both logged with the same rationale: confirmed unavoidable, confirmed
+minimal, confirmed no live collision with a parallel agent.

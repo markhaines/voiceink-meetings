@@ -6,9 +6,22 @@
 // - SystemVadStream.process only accepts RawSystemSamples and actually reaches the wrapped
 //   StreamingVadController.
 // - Both forward onChunkBoundary and start/stop correctly.
-// - A cheap, deterministic static scan (processAudioCallSitesAreFacadeOnly) catches any new
-//   production call site that bypasses this facade by calling StreamingVadController.processAudio
-//   directly.
+// - Two cheap, deterministic static scans catch the two ways production code could bypass the
+//   compile-time boundary entirely:
+//   - processAudioCallSitesAreFacadeOnly: a direct StreamingVadController.processAudio(_:) call
+//     site anywhere under VoiceInk/ outside MeetingVadStreams.swift.
+//   - unsafeTestOnlyMintIsNeverUsedInProduction: a call to
+//     AECCleanedMicSamples.unsafeUnattestedForTestsOnly(_:) -- the DEBUG-only test escape hatch
+//     -- anywhere under VoiceInk/ outside MeetingVadStreams.swift. THIRD ROUND fix: this closes
+//     the gap where the escape hatch, being `#if DEBUG`-gated rather than sealed, compiles
+//     cleanly in exactly the Debug configuration the next integrator will actually be working
+//     in, and would otherwise hand raw mic straight into the mic VAD there with no error.
+//
+// Both scans are plain substring text scans, not real parsers: neither catches a call reached
+// only through a stored/partially-applied method reference (e.g.
+// `let fn = AECCleanedMicSamples.unsafeUnattestedForTestsOnly; fn(x)`), which does not contain
+// the literal substring being searched for. Accepted, disclosed limit -- not something either
+// scan tries to close.
 //
 // What this file does NOT and CANNOT test with a normal @Test: that certain lines fail to
 // compile. Swift Testing has no "assert this does not compile" facility, and this project has no
@@ -53,7 +66,7 @@ struct MeetingVadStreamsTests {
         let micStream = MicVadStream(controller: controller)
 
         micStream.start()
-        micStream.process(.forTesting([Float](repeating: 0, count: VadManager.chunkSize)))
+        micStream.process(.unsafeUnattestedForTestsOnly([Float](repeating: 0, count: VadManager.chunkSize)))
 
         let deadline = ContinuousClock.now + .seconds(2)
         while await probe.recordedCounts.isEmpty, ContinuousClock.now < deadline {
@@ -100,7 +113,7 @@ struct MeetingVadStreamsTests {
 
         // Negative control 1, mirrored (see file header): crossing the wrappers the other way
         // must fail to build, not fail at runtime.
-        // systemStream.process(AECCleanedMicSamples.forTesting([Float](repeating: 0, count: VadManager.chunkSize)))
+        // systemStream.process(AECCleanedMicSamples.unsafeUnattestedForTestsOnly([Float](repeating: 0, count: VadManager.chunkSize)))
     }
 
     @Test("MicVadStream forwards onChunkBoundary from the wrapped controller")
@@ -122,7 +135,7 @@ struct MeetingVadStreamsTests {
         micStream.onChunkBoundary = { boundaryProbe.boundaryTriggered() }
 
         micStream.start()
-        micStream.process(.forTesting([Float](repeating: 0, count: VadManager.chunkSize)))
+        micStream.process(.unsafeUnattestedForTestsOnly([Float](repeating: 0, count: VadManager.chunkSize)))
 
         let deadline = ContinuousClock.now + .seconds(3)
         while boundaryProbe.count < 1, ContinuousClock.now < deadline {
@@ -136,6 +149,48 @@ struct MeetingVadStreamsTests {
 
     @Test("no production call site drives StreamingVadController.processAudio directly, bypassing the facade")
     func processAudioCallSitesAreFacadeOnly() throws {
+        let offenders = try Self.scanProductionSourceForOffendingSubstring(".processAudio(")
+
+        #expect(
+            offenders.isEmpty,
+            """
+            Found direct StreamingVadController.processAudio(_:) call site(s) outside \
+            MeetingVadStreams.swift -- this bypasses the AEC-boundary facade \
+            (MicVadStream/SystemVadStream) entirely:
+            \(offenders.joined(separator: "\n"))
+            """
+        )
+    }
+
+    // THIRD ROUND fix: AECCleanedMicSamples.unsafeUnattestedForTestsOnly(_:) is only `#if DEBUG`
+    // gated, not sealed -- so it compiles cleanly, and hands raw mic straight into the mic VAD
+    // with no error, in exactly the Debug configuration the next integrator (whoever writes the
+    // real meeting-engine glue code) will actually be developing against. This test closes that
+    // gap the same way processAudioCallSitesAreFacadeOnly closes the direct-processAudio gap: a
+    // static scan for the one substring that identifies the escape hatch, everywhere under
+    // VoiceInk/ except its own definition.
+    @Test("no production call site drives AECCleanedMicSamples.unsafeUnattestedForTestsOnly, bypassing attestation")
+    func unsafeTestOnlyMintIsNeverUsedInProduction() throws {
+        let offenders = try Self.scanProductionSourceForOffendingSubstring("unsafeUnattestedForTestsOnly(")
+
+        #expect(
+            offenders.isEmpty,
+            """
+            Found AECCleanedMicSamples.unsafeUnattestedForTestsOnly(_:) call site(s) outside \
+            MeetingVadStreams.swift -- this is a DEBUG-only test escape hatch that hands back \
+            samples with NO attestation they passed through AEC. Production glue code must \
+            mint AECCleanedMicSamples from a real AECMicOutputAttestation instead (see \
+            MeetingVadStreams.swift's AECCleanedMicSamples.mint(from:) and its header comment):
+            \(offenders.joined(separator: "\n"))
+            """
+        )
+    }
+
+    /// Shared by both static-scan tests above. Scans every `.swift` file under `VoiceInk/`
+    /// (production code only, not `Tests/`) except `MeetingVadStreams.swift` itself for
+    /// `needle`, returning the paths of any file that contains it. A plain substring scan, not a
+    /// real parser -- see this file's header comment for what that does and does not catch.
+    private static func scanProductionSourceForOffendingSubstring(_ needle: String) throws -> [String] {
         // Resolve the repo root from this test file's own path, so this works regardless of
         // where the repo is checked out (a local Mac vs. a CI runner).
         let thisFile = URL(fileURLWithPath: #filePath)
@@ -150,7 +205,7 @@ struct MeetingVadStreamsTests {
 
         guard FileManager.default.fileExists(atPath: productionRoot.path) else {
             Issue.record("could not resolve VoiceInk/ from #filePath -- repo layout may have changed")
-            return
+            return []
         }
 
         let allowedFileName = "MeetingVadStreams.swift"
@@ -164,20 +219,12 @@ struct MeetingVadStreamsTests {
         while let url = enumerator?.nextObject() as? URL {
             guard url.pathExtension == "swift", url.lastPathComponent != allowedFileName else { continue }
             guard let contents = try? String(contentsOf: url, encoding: .utf8) else { continue }
-            if contents.contains(".processAudio(") {
+            if contents.contains(needle) {
                 offenders.append(url.path(percentEncoded: false))
             }
         }
 
-        #expect(
-            offenders.isEmpty,
-            """
-            Found direct StreamingVadController.processAudio(_:) call site(s) outside \
-            MeetingVadStreams.swift -- this bypasses the AEC-boundary facade \
-            (MicVadStream/SystemVadStream) entirely:
-            \(offenders.joined(separator: "\n"))
-            """
-        )
+        return offenders
     }
 }
 

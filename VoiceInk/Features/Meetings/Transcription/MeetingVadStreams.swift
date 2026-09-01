@@ -68,11 +68,20 @@
 // of a real module boundary. A separate SPM module (where `internal` would mean something) would
 // close that residual gap too, but that touches project configuration and the package-trust
 // file, which is out of scope for this stage and this agent's call — see ADAPTER-HANDOVER.md.
-// One more concrete narrowing of the hole, disclosed precisely: `AECCleanedMicSamples.forTesting(_:)`
-// (below, `#if DEBUG`-gated) exists so the test target can construct instances without a real
-// AEC attestation. It does not exist in Release builds, so production misuse would fail Release
-// compilation outright — but within a Debug build, any file could still call it. This is the
-// same class of residual gap as the rest of this section, scoped narrowly to test support.
+// One more concrete narrowing of the hole, disclosed precisely: `AECCleanedMicSamples
+// .unsafeUnattestedForTestsOnly(_:)` (below, `#if DEBUG`-gated) exists so the test target can
+// construct instances without a real AEC attestation. It does not exist in Release builds, so
+// production misuse would fail Release compilation outright. But CI and the local Debug build
+// (`VoiceInk Dev.app`) both build Debug — and Debug is exactly the configuration the NEXT
+// integrator (the agent that writes the real MeetingEngine/MeetingSession-equivalent glue code)
+// will be working in. A `#if DEBUG` gate alone is not narrow there: it compiles cleanly and
+// hands raw mic straight into the mic VAD with no error, in precisely the build that matters.
+// THIRD ROUND fix: `processAudioCallSitesAreFacadeOnly` in `MeetingVadStreamsTests.swift` was
+// extended (see that test) to also fail if `unsafeUnattestedForTestsOnly(` appears anywhere
+// under `VoiceInk/` outside this file's own definition — closing exactly that gap with the same
+// cheap static-scan mechanism already used for the `processAudio` bypass, not a new mechanism.
+// The renamed, harder-to-mistake-for-legitimate name is a second, independent mitigation on top
+// of that scan, not a replacement for it.
 //
 // SEPARATELY, `StreamingVadController.processAudio(_:)` itself remains directly callable with a
 // bare `[Float]` by ANYONE who imports it and skips this facade entirely — nothing about
@@ -83,12 +92,20 @@
 // Bypassing this facade: calling `StreamingVadController.processAudio(_:)` directly — on either
 // the mic or the system controller — instead of going through `MicVadStream.process(_:)` /
 // `SystemVadStream.process(_:)` is PROHIBITED for the mic path and bypasses every guarantee this
-// file provides. There is no compile-time way to prevent it (the ported controller is
-// intentionally left able to be constructed and driven directly, e.g. for the tests that verify
-// its own port fidelity). `MeetingVadStreamsTests.swift` has a cheap, deterministic static test
-// (`processAudioCallSitesAreFacadeOnly`) that scans `VoiceInk/` (production code only, not
-// `Tests/`) for `.processAudio(` call sites outside this file and fails if it finds one — see
-// that test for exactly what it does and does not catch.
+// file provides. Likewise, calling `AECCleanedMicSamples.unsafeUnattestedForTestsOnly(_:)` from
+// anywhere other than `MeetingVadStreamsTests.swift` is PROHIBITED — its whole purpose is to let
+// tests construct an instance without a real AEC attestation, and using it in production glue
+// code reintroduces exactly the raw-mic-into-mic-VAD defect this file exists to prevent. Neither
+// is preventable at compile time (the ported controller is intentionally left constructible and
+// drivable directly, e.g. for the tests that verify its own port fidelity, and the DEBUG-only
+// test escape hatch has to be callable from SOME other file or it couldn't serve tests at all).
+// `MeetingVadStreamsTests.swift` has two cheap, deterministic static tests
+// (`processAudioCallSitesAreFacadeOnly`, `unsafeTestOnlyMintIsNeverUsedInProduction`) that scan
+// `VoiceInk/` (production code only, not `Tests/`) for each of those and fail if either is found
+// outside this file — see those tests for exactly what they do and do not catch. Both are
+// substring text scans, not real parsers: neither catches a call reached only through a
+// stored/partially-applied method reference (`let fn = controller.processAudio; fn(x)`), which
+// is an accepted, disclosed limit, not something either test tries to close.
 
 import FluidAudio
 import Foundation
@@ -139,15 +156,22 @@ extension AECCleanedMicSamples {
     /// attest to. `@testable import` does not unlock `fileprivate`/`private` access — only
     /// `internal` — so this file still has to hand the test target something.
     ///
+    /// Named `unsafeUnattestedForTestsOnly`, not `forTesting`, so a reader skimming a diff
+    /// cannot mistake this for a legitimate integration path — it hands back samples with NO
+    /// attestation that they ever passed through AEC. DO NOT CALL THIS OUTSIDE
+    /// `MeetingVadStreamsTests.swift`. Doing so from any other production file under `VoiceInk/`
+    /// is caught by `unsafeTestOnlyMintIsNeverUsedInProduction` in that test file — a static scan,
+    /// not a compile error (see below for why a compile-time guarantee isn't available here).
+    ///
     /// This symbol exists ONLY in `DEBUG` builds (VoiceInk's Debug configuration, which is what
     /// both CI and `VoiceInk Dev.app` build with — `SWIFT_ACTIVE_COMPILATION_CONDITIONS`
     /// includes `DEBUG` there and not in Release). It does not exist at all in a Release build,
     /// so calling it from production glue code would fail Release compilation outright, not
     /// silently ship. It does NOT, however, stop misuse from another file within a Debug build
-    /// — this is the same residual limit as the rest of this file's sealing: real closure needs
-    /// either nobody calling it outside tests (a convention, not a guarantee) or a real module
-    /// boundary. See this file's header "Residual limit" paragraph.
-    static func forTesting(_ samples: [Float]) -> AECCleanedMicSamples {
+    /// — including the Debug build the next integrator will actually be developing against —
+    /// which is exactly why the static scan above exists as a second layer. See this file's
+    /// header "Residual limit" paragraph.
+    static func unsafeUnattestedForTestsOnly(_ samples: [Float]) -> AECCleanedMicSamples {
         AECCleanedMicSamples(samples)
     }
 }

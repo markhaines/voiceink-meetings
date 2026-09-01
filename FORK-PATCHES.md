@@ -799,9 +799,11 @@ Added in the same review round, for a different finding: `StreamingVadController
 takes an untyped `[Float]`, so nothing in this cluster's own code enforced the donor's
 AEC-cleaned-mic-only / raw-system-only split (`MeetingSession.swift:1226-1233` and
 `:1257-1262`) once a later adapter stage started wiring real audio in. `MeetingVadStreams.swift`
-adds `MicVadStream`/`SystemVadStream`, a thin facade over the (unedited) ported
-`StreamingVadController`, with distinct nominal wrapper types (`AECCleanedMicSamples`,
-`RawSystemSamples`) so feeding the wrong stream to the wrong VAD is a compile error. See that
+adds `MicVadStream`/`SystemVadStream`, a facade over the (unedited) ported
+`StreamingVadController`, with distinct nominal wrapper types (`RawMicSamples`,
+`RawSystemSamples`) so feeding the wrong stream to the wrong VAD is a compile error. `MicVadStream`
+additionally owns the AEC call itself (`MicEchoCanceller`), so there is no API by which raw mic
+samples can reach the mic VAD un-cancelled. See that
 file's header comment for exactly what is and is not compile-enforced (stream-crossing: yes;
 proving the wrapped samples genuinely passed through AEC: no, documented as a disclosed limit).
 `ADAPTER-HANDOVER.md`, alongside it in the same directory, is the self-contained (in-repo, no

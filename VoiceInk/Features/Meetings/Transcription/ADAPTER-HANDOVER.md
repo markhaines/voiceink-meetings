@@ -34,29 +34,64 @@ only AEC-cleaned float samples — never raw mic. Donor `MeetingSession.swift`:
   source. Both call sites end up funneling through `appendCleanedMicSamplesOnQueue` /
   `vadController.processAudio`.
 
-**In this fork:** use `MicVadStream.process(_:)`, which only accepts `AECCleanedMicSamples`
-(see `MeetingVadStreams.swift`). As of the second fix round, `AECCleanedMicSamples` can no longer
-be constructed from bare `[Float]` outside `MeetingVadStreams.swift` at all — its initializer is
-`fileprivate`, and the only other path in, `AECCleanedMicSamples.mint(from:)`, requires an
-`AECMicOutputAttestation` that (deliberately) nothing outside that file can currently produce.
-**Wiring real AEC output in means editing `MeetingVadStreams.swift` itself** — adding a small,
-reviewable conformance or factory right there once the AEC branch (`phase-1-aec-dtln`, PR #6, not
-yet merged as of this writing) lands — not constructing the wrapper from wherever your glue code
-happens to live. See that file's header comment for the full mechanism, and its "Residual limit"
-paragraph for what this does and does not close (short version: it stops the careless mistake of
-wrapping a raw array; it cannot stop someone who deliberately edits that file to weaken the seal).
+**In this fork:** drive the mic VAD with `MicVadStream`, and note that the API shape CHANGED in
+the third fix round — earlier revisions of this document described a `process(_:)` that took an
+`AECCleanedMicSamples` you constructed yourself. It no longer does, and that type is no longer
+constructible outside `MeetingVadStreams.swift` at all. The facade now owns the AEC call:
 
-**Bypassing this facade entirely is prohibited for the mic path.** `StreamingVadController.processAudio(_:)`
-itself is still directly callable with any `[Float]` — `MicVadStream`/`SystemVadStream` wrap it,
-they do not seal it, and this port deliberately never modifies `StreamingVadController.swift`.
-Driving the mic VAD through anything other than `MicVadStream.process(_:)` bypasses every
-guarantee above. `Tests/.../MeetingVadStreamsTests.swift` has a cheap, deterministic static test
-(`processAudioCallSitesAreFacadeOnly`) that scans `VoiceInk/` for `.processAudio(` call sites
-outside `MeetingVadStreams.swift` and fails the build if it finds one — it catches an accidental
-new call site added anywhere in production code, but it is a textual scan, not a real guarantee:
-it cannot catch, for example, a call reached only through a stored/partially-applied method
-reference (`let fn = controller.processAudio; fn(x)`), which does not contain the literal
-substring `.processAudio(`.
+```swift
+// Once, at setup. `MicEchoCanceller` is declared in MeetingVadStreams.swift; the AEC branch's
+// canceller conforms to it (two methods: processStreamingMic(_:) -> [Float],
+// feedSystemSamples(_:)). Nothing in this stage depends on that branch's concrete types.
+let micVad = MicVadStream(vadManager: vadManager, echoCanceller: neuralAec)
+let systemVad = SystemVadStream(vadManager: vadManager)
+
+// Per mic buffer (donor enqueueRealtimeMicSamples, lines 1212-1236). You hand it RAW mic; the
+// stream runs AEC itself and drives the VAD with the cleaned output only.
+let cleaned: AECCleanedMicSamples = micVad.process(RawMicSamples(rawMicFloats))
+// Feed THAT SAME receipt onward to the mic chunk recorder, so VAD and recorded audio can never
+// diverge (donor appendCleanedMicSamplesOnQueue, lines 1267-1278).
+micChunkRecorder.append(int16(from: cleaned.samples))
+
+// Per system buffer (donor enqueueRealtimeSystemSamples, lines 1238-1265). Two separate calls,
+// exactly as the donor does: the far-end reference feed (which may drain cleaned MIC output into
+// the MIC VAD, hence it living on MicVadStream), and the raw system VAD.
+let drained: AECCleanedMicSamples = micVad.processFarEndReference(RawSystemSamples(systemFloats))
+if !drained.isEmpty { micChunkRecorder.append(int16(from: drained.samples)) }
+systemVad.process(RawSystemSamples(systemFloats))
+```
+
+**You do not construct `AECCleanedMicSamples`; you receive one.** It is a receipt: its payload is
+a `private` stored property and its initializer is `fileprivate`, so no other file in the module
+can build one by any route — not directly, not via a memberwise initializer, not via an extension
+adding an initializer, not via a retro-conformed `Decodable`. Each of those was attacked from the
+test target and the verbatim compiler errors are recorded as the attack list in
+`MeetingVadStreamsTests.swift`. Possessing a value of that type therefore means it came out of
+`MicEchoCanceller.processStreamingMic` via the facade.
+
+**Wiring the real AEC in does NOT mean editing `MeetingVadStreams.swift`** (it did under the old
+design; that instruction is withdrawn). Conform your canceller to `MicEchoCanceller` in the AEC
+branch's own file and pass it to `MicVadStream.init`. That is the whole integration.
+
+**The two residual holes you can still open, stated plainly so you do not open them by accident:**
+
+1. **Passing a no-op canceller** — a `MicEchoCanceller` whose `processStreamingMic` returns its
+   input — puts raw mic straight into the mic VAD and reintroduces the false-`You` defect. This is
+   accepted as a visible, deliberate act rather than designed out; do not write one, including as
+   a "temporary" placeholder before the AEC branch merges. If you need the mic path running before
+   AEC exists, say so in review rather than stubbing it silently.
+2. **Bypassing the facade entirely.** `StreamingVadController.processAudio(_:)` is still directly
+   callable with any `[Float]` — `MicVadStream` wraps it, it does not seal it, and this port
+   deliberately never modifies `StreamingVadController.swift`. Driving the mic VAD through
+   anything other than `MicVadStream` is PROHIBITED.
+   `Tests/.../MeetingVadStreamsTests.swift` has two cheap, deterministic static scans over
+   `VoiceInk/` that fail the build on either mistake: `processAudioCallSitesAreFacadeOnly` (a
+   `.processAudio(` call site outside `MeetingVadStreams.swift`) and
+   `forgedCleanedSampleConstructionIsAbsentFromProduction` (production code constructing
+   `AECCleanedMicSamples`, `unsafeBitCast`ing to it, or reintroducing the deleted
+   `mint(from:)`/`AECMicOutputAttestation`/`unsafeUnattestedForTestsOnly` apparatus). Both are
+   substring text scans, not real parsers: neither catches a call reached only through a stored or
+   partially-applied method reference (`let fn = controller.processAudio; fn(x)`).
 
 Feed the same cleaned samples to whatever this fork's mic `PCMChunkRecorder` equivalent is, so
 the VAD and the recorded chunk audio never diverge, exactly as the donor does.
@@ -70,7 +105,12 @@ no cleaning: the system VAD is meant to see the system audio exactly as captured
 Int16 samples are separately appended to `systemChunkRecorder` (line 1248) and
 `systemChunkTimingTracker` (line 1249).
 
-**In this fork:** use `SystemVadStream.process(_:)`, which only accepts `RawSystemSamples`.
+**In this fork:** use `SystemVadStream.process(_:)`, which only accepts `RawSystemSamples` —
+handing it `RawMicSamples` is a compile error. `SystemVadStream` has no echo canceller and
+never touches one. Remember the far-end reference is a SEPARATE call on the mic side
+(`MicVadStream.processFarEndReference(_:)`, section 1): the same `RawSystemSamples` goes to
+both, exactly as the donor feeds `neuralAec.feedSystemSamples` and
+`systemVadController.processAudio` from the one buffer.
 
 ## 3. VAD boundary rotation, and the transcription inputs/outputs at each rotation
 

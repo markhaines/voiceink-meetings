@@ -1,89 +1,288 @@
 // Fork-owned (no donor equivalent). Not a port.
 //
-// Proves the intended wiring for MeetingVadStreams.swift's compile-time stream boundary:
-// - MicVadStream.process only accepts AECCleanedMicSamples and actually reaches the wrapped
-//   StreamingVadController.
-// - SystemVadStream.process only accepts RawSystemSamples and actually reaches the wrapped
-//   StreamingVadController.
-// - Both forward onChunkBoundary and start/stop correctly.
-// - Two cheap, deterministic static scans catch the two ways production code could bypass the
-//   compile-time boundary entirely:
-//   - processAudioCallSitesAreFacadeOnly: a direct StreamingVadController.processAudio(_:) call
-//     site anywhere under VoiceInk/ outside MeetingVadStreams.swift.
-//   - unsafeTestOnlyMintIsNeverUsedInProduction: a call to
-//     AECCleanedMicSamples.unsafeUnattestedForTestsOnly(_:) -- the DEBUG-only test escape hatch
-//     -- anywhere under VoiceInk/ outside MeetingVadStreams.swift. THIRD ROUND fix: this closes
-//     the gap where the escape hatch, being `#if DEBUG`-gated rather than sealed, compiles
-//     cleanly in exactly the Debug configuration the next integrator will actually be working
-//     in, and would otherwise hand raw mic straight into the mic VAD there with no error.
+// Proves MeetingVadStreams.swift's property: raw mic samples never reach the mic VAD; they pass
+// through acoustic echo cancellation first. See that file's header for the design and for why the
+// two previous attempts (a `fileprivate init`, then a sealed attestation protocol) were both
+// defeated.
 //
-// Both scans are plain substring text scans, not real parsers: neither catches a call reached
-// only through a stored/partially-applied method reference (e.g.
-// `let fn = AECCleanedMicSamples.unsafeUnattestedForTestsOnly; fn(x)`), which does not contain
-// the literal substring being searched for. Accepted, disclosed limit -- not something either
-// scan tries to close.
+// Positive tests here:
+// - MicVadStream.process runs the echo canceller and drives the wrapped StreamingVadController
+//   with the CANCELLER'S OUTPUT, not with what the caller passed in. This is the property itself,
+//   tested directly: the stub canceller returns a distinguishable buffer, and the test asserts the
+//   VAD saw that and not the raw input.
+// - MicVadStream.processFarEndReference feeds system audio to the canceller as the far-end
+//   reference and drains any cleaned mic output into the mic VAD (donor parity, see below).
+// - MicVadStream honours the donor's `!cleanedFloat.isEmpty` guard: an empty canceller result
+//   drives the VAD not at all.
+// - SystemVadStream.process only accepts RawSystemSamples and reaches its controller unmodified.
+// - Both forward onChunkBoundary and start/stop.
+// - Two cheap, deterministic static scans over production source catch the two textual ways
+//   production code could sidestep the facade (see the tests themselves for exactly what each
+//   does and does not catch).
 //
-// What this file does NOT and CANNOT test with a normal @Test: that certain lines fail to
-// compile. Swift Testing has no "assert this does not compile" facility, and this project has no
-// separate negative-compilation-test harness. Those claims are properties of the type system
-// (see MeetingVadStreams.swift's header for exactly what is and isn't enforced) — each is left
-// commented out below with the EXACT compiler error it produces, captured by hand: uncomment the
-// line, build (VoiceInkTests, Debug), read the error, then re-comment. Three such controls exist
-// in this file:
+// ===========================================================================================
+// NEGATIVE CONTROLS: THE ATTACK LIST
+// ===========================================================================================
 //
-// 1. Crossing the mic/system wrappers (`MeetingVadStreamsTests.swift`, this suite, inside
-//    `micStreamForwardsCleanedSamples`): `micStream.process(RawSystemSamples([...]))` fails with
-//    "cannot convert value of type 'RawSystemSamples' to expected argument type
-//    'AECCleanedMicSamples'" (and the mirror error for the system side).
-// 2. Constructing `AECCleanedMicSamples` directly from this file
-//    (`micStreamForwardsCleanedSamples`): `AECCleanedMicSamples([Float](repeating: 0, count: 1))`
-//    fails with "'AECCleanedMicSamples' initializer is inaccessible due to 'fileprivate'
-//    protection level" -- verbatim, captured by hand.
-// 3. Satisfying `AECMicOutputAttestation` from this file (`FakeAECAttestation` type, below,
-//    left as a negative control): the `_seal` requirement can be given the right TYPE, but not
-//    a VALUE of it -- `AECAttestationSeal()` fails with "'AECAttestationSeal' initializer is
-//    inaccessible due to 'fileprivate' protection level" -- verbatim, captured by hand.
+// Swift Testing has no "assert this does not compile" facility and this project has no negative
+// compilation harness, so each attack below was run by hand FROM THIS FILE (a separate file in
+// the app target, with `@testable import VoiceInk`, which unlocks `internal` but NOT
+// `fileprivate`/`private`), the compiler error captured verbatim, and the line left commented out
+// next to its error. To re-verify any of them: uncomment, build the VoiceInkTests target in
+// Debug, read the error, re-comment.
+//
+// Every attack below FAILS TO COMPILE except where explicitly marked ACCEPTED RESIDUAL. Each was
+// run through a FULL `xcodebuild build-for-testing` of this target, not `swiftc -typecheck`:
+// A6 below is rejected only by a definite-initialisation diagnostic, which type-checking alone
+// does not run, so a typecheck-only sweep would have reported it as compiling.
+//
+//  A1. Direct construction of the receipt type from [Float].
+//      `_ = AECCleanedMicSamples([Float](repeating: 0, count: 1))`
+//      -> error: 'AECCleanedMicSamples' initializer is inaccessible due to 'fileprivate'
+//         protection level
+//      (see `micStreamCancelsBeforeVad`)
+//
+//  A2. THE v2 DEFEAT: conform to the attestation protocol with a trapping witness, then mint.
+//      `struct Defeat: AECMicOutputAttestation { var _seal: AECAttestationSeal { fatalError() } }`
+//      -> error: cannot find type 'AECMicOutputAttestation' in scope
+//      -> error: cannot find type 'AECAttestationSeal' in scope
+//      (those two are all the compiler emits: the unresolved types short-circuit before it
+//      reaches the `AECCleanedMicSamples.mint(from:)` call, which is also gone)
+//      The protocol, the seal and `mint(from:)` are deleted outright: there is no inbound
+//      cleanliness claim left to make, so the defeat has nothing to attack.
+//      (see `AttackA2` at the bottom of this file)
+//
+//  A3. Conform with a witness returning a legitimately-obtained value instead of a trap.
+//      NOT APPLICABLE, and not merely unreachable: no such protocol exists any more (A2), and
+//      there is no value of any this-file-sealed type to obtain in the first place. Recorded so
+//      the next reviewer does not have to re-derive that this variant died with A2.
+//
+//  A4. Synthesised memberwise initialiser.
+//      `_ = AECCleanedMicSamples(storedSamples: [Float](repeating: 0, count: 1))`
+//      -> error: extraneous argument label 'storedSamples:' in call
+//      -> error: 'AECCleanedMicSamples' initializer is inaccessible due to 'fileprivate'
+//         protection level
+//      (declaring an explicit initializer suppresses the memberwise one; the payload is `private`
+//      besides, so even a synthesised one would be `private`)
+//      (see `AttackA4` at the bottom of this file)
+//
+//  A5. THE THIRD DEFEAT, found while attacking this design and not caught by either earlier
+//      review round. An extension in ANOTHER FILE of the same module adding a designated
+//      initializer that assigns the stored property directly. Against the OLD shape
+//      (`let samples: [Float]`, internal) this COMPILED AND LINKED CLEANLY, with no seal and no
+//      protocol conformance — it defeated v1 and v2 alike. Against the current shape:
+//      `extension AECCleanedMicSamples { init(raw: [Float]) { self.storedSamples = raw } }`
+//      -> error: 'storedSamples' is inaccessible due to 'private' protection level
+//      (see `AttackA5` at the bottom of this file)
+//
+//  A6. The A5 variant that initialises nothing at all, which type-checking alone lets through
+//      and only definite-initialisation rejects.
+//      `extension AECCleanedMicSamples { init(raw: [Float]) { } }`
+//      -> error: 'self.init' isn't called on all paths before returning from initializer
+//      (because the payload is `private`, the extension's file can see no stored property to
+//      initialise, so the initializer is required to DELEGATE -- and the only initializer it
+//      could delegate to is the `fileprivate` one it cannot reach. Note this is a definite-
+//      initialisation diagnostic, not a type-check one: `swiftc -typecheck` alone does NOT
+//      report it, which is why every attack here was run through a full build.)
+//      (see `AttackA6` at the bottom of this file)
+//
+//  A7. Codable/decoder-based construction, retro-conformed from another file.
+//      `extension AECCleanedMicSamples: Decodable {}`
+//      -> error: extension outside of file declaring struct 'AECCleanedMicSamples' prevents
+//         automatic synthesis of 'init(from:)' for protocol 'Decodable'
+//      (see `AttackA7` at the bottom of this file)
+//
+//  A8. Reflection. `Mirror` is read-only and Swift exposes no public runtime API to allocate an
+//      instance of a nominal type without calling one of its initializers. No construction route;
+//      nothing to compile.
+//
+//  A9. A generic constraint reaching the type. A generic function can only construct `T` through
+//      a protocol requirement it constrains `T` to (e.g. `T: Initializable`), and
+//      `AECCleanedMicSamples` conforms to nothing that vends an initializer — only `Sendable`,
+//      which has no requirements. Standard-library generic entry points that produce values
+//      (`Array.init(repeating:count:)`, `Optional`, …) all need an existing value first.
+//
+// A10. ACCEPTED RESIDUAL — `unsafeBitCast`.
+//      `unsafeBitCast([Float](repeating: 0, count: 1), to: AECCleanedMicSamples.self)`
+//      COMPILES AND WORKS: the struct is layout-compatible with its single payload. This is
+//      unpreventable in Swift for any type, the API name announces itself, and it is in the same
+//      visible-deliberate-act category as passing a no-op canceller. Not chased. It IS flagged by
+//      `forgedCleanedSampleConstructionIsAbsentFromProduction` below when it appears in
+//      production code that also names the type — belt-and-braces, not a guarantee.
+//
+// A11. ACCEPTED RESIDUAL — a no-op `MicEchoCanceller` (one whose `processStreamingMic` returns
+//      its input). Compiles by design: the abstraction has to be conformable or the AEC branch
+//      could not satisfy it. Visible and deliberate in review. See MeetingVadStreams.swift's
+//      "Residual holes" section.
+//
+// A12. Crossing the mic and system streams. Still a compile error, as before:
+//      `micStream.process(RawSystemSamples([...]))`
+//      -> error: cannot convert value of type 'RawSystemSamples' to expected argument type
+//         'RawMicSamples'
+//      `systemStream.process(RawMicSamples([...]))`
+//      -> error: cannot convert value of type 'RawMicSamples' to expected argument type
+//         'RawSystemSamples'
+//      (see `micStreamCancelsBeforeVad` and `systemStreamForwardsRawSamples`)
+//
+// A13. Building a MicVadStream with no canceller at all, via the internal test seam.
+//      `_ = MicVadStream(controller: someController)`
+//      -> error: missing argument for parameter 'echoCanceller' in call
+//      There is no controller-only initializer: every way to build a mic stream supplies a
+//      canceller.
+//      (see `AttackA13` at the bottom of this file)
 
 import FluidAudio
 import Foundation
 import Testing
 @testable import VoiceInk
 
+/// Stub echo canceller. Returns a buffer that is DISTINGUISHABLE from its input (a different
+/// sample count and a marker value), so a test can tell whether the VAD was driven with the
+/// canceller's output or with the raw input that was handed in. That distinction is the whole
+/// property under test.
+private final class StubEchoCanceller: MicEchoCanceller, @unchecked Sendable {
+    static let marker: Float = 0.5
+
+    private let lock = NSLock()
+    private var micCallCount = 0
+    private var systemFedSamples: [[Float]] = []
+    private let cleanedForMic: [Float]
+    private let cleanedForDrain: [Float]
+
+    /// - Parameters:
+    ///   - cleanedForMic: what `processStreamingMic` returns for a non-empty input.
+    ///   - cleanedForDrain: what it returns for the empty-input drain call that follows a
+    ///     far-end reference feed.
+    init(cleanedForMic: [Float], cleanedForDrain: [Float] = []) {
+        self.cleanedForMic = cleanedForMic
+        self.cleanedForDrain = cleanedForDrain
+    }
+
+    func processStreamingMic(_ rawMicSamples: [Float]) -> [Float] {
+        lock.withLock { micCallCount += 1 }
+        return rawMicSamples.isEmpty ? cleanedForDrain : cleanedForMic
+    }
+
+    func feedSystemSamples(_ systemSamples: [Float]) {
+        lock.withLock { systemFedSamples.append(systemSamples) }
+    }
+
+    var micCalls: Int { lock.withLock { micCallCount } }
+    var fedSystemBuffers: [[Float]] { lock.withLock { systemFedSamples } }
+}
+
 @Suite("MeetingVadStreams")
 struct MeetingVadStreamsTests {
-    @Test("MicVadStream forwards AECCleanedMicSamples to the wrapped controller")
-    func micStreamForwardsCleanedSamples() async throws {
+    /// The property itself: what reaches the VAD is the canceller's output, not the caller's
+    /// input. The stub returns a buffer of a different length carrying a marker value, so a
+    /// design that forwarded the raw input would fail on both counts.
+    @Test("MicVadStream runs AEC first and drives the VAD with the cleaned samples, not the raw ones")
+    func micStreamCancelsBeforeVad() async throws {
+        let cleaned = [Float](repeating: StubEchoCanceller.marker, count: VadManager.chunkSize)
+        let canceller = StubEchoCanceller(cleanedForMic: cleaned)
         let probe = VadStreamProbe()
         let controller = StreamingVadController(
             minChunkDuration: 0,
             maxChunkDuration: 3600,
             makeInitialState: { VadStreamState.initial() },
             processStreamChunk: { samples, state in
-                await probe.record(sampleCount: samples.count)
+                await probe.record(samples: samples)
                 return VadStreamResult(state: state, event: nil, probability: 0.0)
             }
         )
-        let micStream = MicVadStream(controller: controller)
+        let micStream = MicVadStream(controller: controller, echoCanceller: canceller)
 
         micStream.start()
-        micStream.process(.unsafeUnattestedForTestsOnly([Float](repeating: 0, count: VadManager.chunkSize)))
+        // Raw mic: twice the chunk size, all zeros. Nothing like what the canceller returns.
+        let receipt = micStream.process(RawMicSamples([Float](repeating: 0, count: VadManager.chunkSize * 2)))
 
         let deadline = ContinuousClock.now + .seconds(2)
-        while await probe.recordedCounts.isEmpty, ContinuousClock.now < deadline {
+        while await probe.recordedBuffers.isEmpty, ContinuousClock.now < deadline {
             try? await Task.sleep(for: .milliseconds(20))
         }
         micStream.stop()
 
-        #expect(await probe.recordedCounts == [VadManager.chunkSize])
+        let seen = await probe.recordedBuffers
+        #expect(seen.count == 1)
+        // The VAD saw the CLEANED buffer: right length, and carrying the canceller's marker.
+        #expect(seen.first?.count == VadManager.chunkSize)
+        #expect(seen.first?.allSatisfy { $0 == StubEchoCanceller.marker } == true)
+        #expect(canceller.micCalls == 1)
+        // The receipt handed back carries the same cleaned samples, for the chunk recorder.
+        #expect(receipt.samples == cleaned)
+        #expect(receipt.isEmpty == false)
 
-        // Negative control 1 (see file header): crossing the wrappers must fail to build, not
-        // fail at runtime.
+        // Attack A12 (see file header): crossing the wrappers must fail to build.
         // micStream.process(RawSystemSamples([Float](repeating: 0, count: VadManager.chunkSize)))
 
-        // Negative control 2 (see file header): constructing AECCleanedMicSamples directly, even
-        // from this file, must fail to build -- `init` is `fileprivate` to MeetingVadStreams.swift,
-        // not to this file.
+        // Attack A1 (see file header): constructing the receipt directly, even from this file,
+        // must fail to build -- `init` is `fileprivate` to MeetingVadStreams.swift.
         // _ = AECCleanedMicSamples([Float](repeating: 0, count: 1))
+
+        // Attack A10 (see file header): ACCEPTED RESIDUAL. This one COMPILES and works. Left
+        // commented out because it is a documented, accepted hole, not because it fails.
+        // _ = unsafeBitCast([Float](repeating: 0, count: 1), to: AECCleanedMicSamples.self)
+    }
+
+    /// Donor parity for the `!cleanedFloat.isEmpty` guard (MeetingSession.swift:1233): when AEC
+    /// yields nothing yet, the VAD must be driven not at all rather than with an empty buffer.
+    @Test("MicVadStream does not drive the VAD when AEC yields no samples")
+    func micStreamSkipsVadOnEmptyCancellerOutput() async throws {
+        let canceller = StubEchoCanceller(cleanedForMic: [])
+        let probe = VadStreamProbe()
+        let controller = StreamingVadController(
+            minChunkDuration: 0,
+            maxChunkDuration: 3600,
+            makeInitialState: { VadStreamState.initial() },
+            processStreamChunk: { samples, state in
+                await probe.record(samples: samples)
+                return VadStreamResult(state: state, event: nil, probability: 0.0)
+            }
+        )
+        let micStream = MicVadStream(controller: controller, echoCanceller: canceller)
+
+        micStream.start()
+        let receipt = micStream.process(RawMicSamples([Float](repeating: 0, count: VadManager.chunkSize)))
+        try? await Task.sleep(for: .milliseconds(200))
+        micStream.stop()
+
+        #expect(await probe.recordedBuffers.isEmpty)
+        #expect(canceller.micCalls == 1)
+        #expect(receipt.isEmpty)
+    }
+
+    /// Donor parity for `enqueueRealtimeSystemSamples` (MeetingSession.swift:1238-1265): system
+    /// audio is the AEC far-end reference, and the cleaned mic output it unblocks is drained into
+    /// the MIC VAD. This path can produce mic VAD input, which is why it lives on MicVadStream.
+    @Test("MicVadStream.processFarEndReference feeds AEC and drains cleaned mic output into the mic VAD")
+    func micStreamDrainsFarEndReference() async throws {
+        let drained = [Float](repeating: StubEchoCanceller.marker, count: VadManager.chunkSize)
+        let canceller = StubEchoCanceller(cleanedForMic: [], cleanedForDrain: drained)
+        let probe = VadStreamProbe()
+        let controller = StreamingVadController(
+            minChunkDuration: 0,
+            maxChunkDuration: 3600,
+            makeInitialState: { VadStreamState.initial() },
+            processStreamChunk: { samples, state in
+                await probe.record(samples: samples)
+                return VadStreamResult(state: state, event: nil, probability: 0.0)
+            }
+        )
+        let micStream = MicVadStream(controller: controller, echoCanceller: canceller)
+
+        let systemAudio = [Float](repeating: 0.25, count: VadManager.chunkSize)
+        micStream.start()
+        let receipt = micStream.processFarEndReference(RawSystemSamples(systemAudio))
+
+        let deadline = ContinuousClock.now + .seconds(2)
+        while await probe.recordedBuffers.isEmpty, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        micStream.stop()
+
+        #expect(canceller.fedSystemBuffers == [systemAudio])
+        #expect(await probe.recordedBuffers.first?.allSatisfy { $0 == StubEchoCanceller.marker } == true)
+        #expect(receipt.samples == drained)
     }
 
     @Test("SystemVadStream forwards RawSystemSamples to the wrapped controller")
@@ -94,7 +293,7 @@ struct MeetingVadStreamsTests {
             maxChunkDuration: 3600,
             makeInitialState: { VadStreamState.initial() },
             processStreamChunk: { samples, state in
-                await probe.record(sampleCount: samples.count)
+                await probe.record(samples: samples)
                 return VadStreamResult(state: state, event: nil, probability: 0.0)
             }
         )
@@ -104,21 +303,24 @@ struct MeetingVadStreamsTests {
         systemStream.process(RawSystemSamples([Float](repeating: 0, count: VadManager.chunkSize)))
 
         let deadline = ContinuousClock.now + .seconds(2)
-        while await probe.recordedCounts.isEmpty, ContinuousClock.now < deadline {
+        while await probe.recordedBuffers.isEmpty, ContinuousClock.now < deadline {
             try? await Task.sleep(for: .milliseconds(20))
         }
         systemStream.stop()
 
-        #expect(await probe.recordedCounts == [VadManager.chunkSize])
+        #expect(await probe.recordedBuffers.map(\.count) == [VadManager.chunkSize])
 
-        // Negative control 1, mirrored (see file header): crossing the wrappers the other way
-        // must fail to build, not fail at runtime.
-        // systemStream.process(AECCleanedMicSamples.unsafeUnattestedForTestsOnly([Float](repeating: 0, count: VadManager.chunkSize)))
+        // Attack A12 mirrored (see file header): crossing the wrappers the other way must fail
+        // to build.
+        // systemStream.process(RawMicSamples([Float](repeating: 0, count: VadManager.chunkSize)))
     }
 
     @Test("MicVadStream forwards onChunkBoundary from the wrapped controller")
     func micStreamForwardsChunkBoundary() async throws {
         let boundaryProbe = ChunkBoundaryProbe()
+        let canceller = StubEchoCanceller(
+            cleanedForMic: [Float](repeating: StubEchoCanceller.marker, count: VadManager.chunkSize)
+        )
         let controller = StreamingVadController(
             minChunkDuration: 0,
             maxChunkDuration: 3600,
@@ -131,11 +333,11 @@ struct MeetingVadStreamsTests {
                 )
             }
         )
-        let micStream = MicVadStream(controller: controller)
+        let micStream = MicVadStream(controller: controller, echoCanceller: canceller)
         micStream.onChunkBoundary = { boundaryProbe.boundaryTriggered() }
 
         micStream.start()
-        micStream.process(.unsafeUnattestedForTestsOnly([Float](repeating: 0, count: VadManager.chunkSize)))
+        micStream.process(RawMicSamples([Float](repeating: 0, count: VadManager.chunkSize)))
 
         let deadline = ContinuousClock.now + .seconds(3)
         while boundaryProbe.count < 1, ContinuousClock.now < deadline {
@@ -149,48 +351,78 @@ struct MeetingVadStreamsTests {
 
     @Test("no production call site drives StreamingVadController.processAudio directly, bypassing the facade")
     func processAudioCallSitesAreFacadeOnly() throws {
-        let offenders = try Self.scanProductionSourceForOffendingSubstring(".processAudio(")
+        let offenders = try Self.scanProductionSourceForOffendingSubstrings([".processAudio("])
 
         #expect(
             offenders.isEmpty,
             """
             Found direct StreamingVadController.processAudio(_:) call site(s) outside \
-            MeetingVadStreams.swift -- this bypasses the AEC-boundary facade \
-            (MicVadStream/SystemVadStream) entirely:
+            MeetingVadStreams.swift -- this bypasses the AEC facade (MicVadStream) entirely and \
+            can put raw mic samples into the mic VAD:
             \(offenders.joined(separator: "\n"))
             """
         )
     }
 
-    // THIRD ROUND fix: AECCleanedMicSamples.unsafeUnattestedForTestsOnly(_:) is only `#if DEBUG`
-    // gated, not sealed -- so it compiles cleanly, and hands raw mic straight into the mic VAD
-    // with no error, in exactly the Debug configuration the next integrator (whoever writes the
-    // real meeting-engine glue code) will actually be developing against. This test closes that
-    // gap the same way processAudioCallSitesAreFacadeOnly closes the direct-processAudio gap: a
-    // static scan for the one substring that identifies the escape hatch, everywhere under
-    // VoiceInk/ except its own definition.
-    @Test("no production call site drives AECCleanedMicSamples.unsafeUnattestedForTestsOnly, bypassing attestation")
-    func unsafeTestOnlyMintIsNeverUsedInProduction() throws {
-        let offenders = try Self.scanProductionSourceForOffendingSubstring("unsafeUnattestedForTestsOnly(")
+    /// Successor to the old `unsafeTestOnlyMintIsNeverUsedInProduction` scan, kept working across
+    /// the redesign rather than dropped. The DEBUG escape hatch it used to guard
+    /// (`unsafeUnattestedForTestsOnly`) and the defeated attestation apparatus (`mint(from:)`) are
+    /// both DELETED now, so this scan does two jobs: it fails if either is ever reintroduced into
+    /// production code, and it fails on the remaining textual forgery routes for the receipt type
+    /// -- a direct `AECCleanedMicSamples(` construction, or an `unsafeBitCast` in a file that
+    /// names the type (attack A10, the accepted residual).
+    ///
+    /// Like the scan above this is a plain substring text scan, not a parser. It does not catch a
+    /// call reached only through a stored or partially-applied reference, and `unsafeBitCast` is
+    /// only flagged when it shares a file with the type's name. Accepted, disclosed limits.
+    @Test("no production code forges AECCleanedMicSamples or reintroduces a construction escape hatch")
+    func forgedCleanedSampleConstructionIsAbsentFromProduction() throws {
+        // Direct construction and the two deleted escape hatches, unconditionally.
+        var offenders = try Self.scanProductionSourceForOffendingSubstrings([
+            "AECCleanedMicSamples(",
+            "unsafeUnattestedForTestsOnly",
+            "AECMicOutputAttestation",
+            "AECAttestationSeal",
+        ])
+
+        // unsafeBitCast only counts as an offence in a file that also names the receipt type;
+        // unrelated uses elsewhere in the app are none of this test's business.
+        offenders += try Self.scanProductionSourceForFilesContainingAll([
+            "unsafeBitCast",
+            "AECCleanedMicSamples",
+        ])
 
         #expect(
             offenders.isEmpty,
             """
-            Found AECCleanedMicSamples.unsafeUnattestedForTestsOnly(_:) call site(s) outside \
-            MeetingVadStreams.swift -- this is a DEBUG-only test escape hatch that hands back \
-            samples with NO attestation they passed through AEC. Production glue code must \
-            mint AECCleanedMicSamples from a real AECMicOutputAttestation instead (see \
-            MeetingVadStreams.swift's AECCleanedMicSamples.mint(from:) and its header comment):
+            Found production code outside MeetingVadStreams.swift that constructs or forges \
+            AECCleanedMicSamples, or reintroduces the deleted attestation/test escape hatch. \
+            AECCleanedMicSamples is a receipt handed back by MicVadStream.process(_:), never \
+            something production code builds for itself -- building one asserts samples passed \
+            through AEC when nothing checked that they did:
             \(offenders.joined(separator: "\n"))
             """
         )
     }
 
-    /// Shared by both static-scan tests above. Scans every `.swift` file under `VoiceInk/`
-    /// (production code only, not `Tests/`) except `MeetingVadStreams.swift` itself for
-    /// `needle`, returning the paths of any file that contains it. A plain substring scan, not a
-    /// real parser -- see this file's header comment for what that does and does not catch.
-    private static func scanProductionSourceForOffendingSubstring(_ needle: String) throws -> [String] {
+    /// Scans every `.swift` file under `VoiceInk/` (production code only, not `Tests/`) except
+    /// `MeetingVadStreams.swift` itself, returning `path: needle` for each needle found.
+    private static func scanProductionSourceForOffendingSubstrings(_ needles: [String]) throws -> [String] {
+        try scanProductionSource { path, contents in
+            needles.compactMap { contents.contains($0) ? "\(path): \($0)" : nil }
+        }
+    }
+
+    /// As above, but only reports a file when it contains EVERY needle.
+    private static func scanProductionSourceForFilesContainingAll(_ needles: [String]) throws -> [String] {
+        try scanProductionSource { path, contents in
+            needles.allSatisfy(contents.contains) ? ["\(path): \(needles.joined(separator: " + "))"] : []
+        }
+    }
+
+    private static func scanProductionSource(
+        _ inspect: (String, String) -> [String]
+    ) throws -> [String] {
         // Resolve the repo root from this test file's own path, so this works regardless of
         // where the repo is checked out (a local Mac vs. a CI runner).
         let thisFile = URL(fileURLWithPath: #filePath)
@@ -219,32 +451,73 @@ struct MeetingVadStreamsTests {
         while let url = enumerator?.nextObject() as? URL {
             guard url.pathExtension == "swift", url.lastPathComponent != allowedFileName else { continue }
             guard let contents = try? String(contentsOf: url, encoding: .utf8) else { continue }
-            if contents.contains(needle) {
-                offenders.append(url.path(percentEncoded: false))
-            }
+            offenders += inspect(url.path(percentEncoded: false), contents)
         }
 
         return offenders
     }
 }
 
-// Negative control 3 (see file header): a type in this file attempting to conform to
-// `AECMicOutputAttestation` must fail to build, because it cannot produce an `AECAttestationSeal`
-// -- `AECAttestationSeal.init()` is `fileprivate` to MeetingVadStreams.swift, not to this file.
-// Uncommenting this produces exactly:
-//   "'AECAttestationSeal' initializer is inaccessible due to 'fileprivate' protection level"
-// (verbatim, captured by hand; see file header item 3).
+// ===========================================================================================
+// Negative controls for attacks that need a top-level declaration. See this file's header for
+// each attack's verbatim compiler error. All are commented out; uncomment one, build, re-comment.
+// ===========================================================================================
+
+// Attack A2 -- the v2 defeat (trapping witness). The protocol and the seal no longer exist:
+//   error: cannot find type 'AECMicOutputAttestation' in scope
+//   error: cannot find type 'AECAttestationSeal' in scope
 //
-// private struct FakeAECAttestation: AECMicOutputAttestation {
+// private struct AttackA2: AECMicOutputAttestation {
 //     var cleanedMicSamples: [Float] { [] }
-//     var _seal: AECAttestationSeal { AECAttestationSeal() }
+//     var _seal: AECAttestationSeal { fatalError() }
+// }
+// private func attackA2(raw: [Float]) -> AECCleanedMicSamples {
+//     AECCleanedMicSamples.mint(from: AttackA2())
+// }
+
+// Attack A4 -- synthesised memberwise initialiser:
+//   error: extraneous argument label 'storedSamples:' in call
+//   error: 'AECCleanedMicSamples' initializer is inaccessible due to 'fileprivate' protection level
+//
+// private func attackA4() -> AECCleanedMicSamples {
+//     AECCleanedMicSamples(storedSamples: [Float](repeating: 0, count: 1))
+// }
+
+// Attack A5 -- THE THIRD DEFEAT: an extension in another file adding an initializer that assigns
+// the stored property. Compiled cleanly against the old internal-`let` shape; against the current
+// `private` shape:
+//   error: 'storedSamples' is inaccessible due to 'private' protection level
+//
+// extension AECCleanedMicSamples {
+//     init(attackA5 raw: [Float]) { self.storedSamples = raw }
+// }
+
+// Attack A6 -- the A5 variant that assigns nothing, which `swiftc -typecheck` alone permits and
+// only a full build rejects:
+//   error: 'self.init' isn't called on all paths before returning from initializer
+//
+// extension AECCleanedMicSamples {
+//     init(attackA6 raw: [Float]) { }
+// }
+
+// Attack A7 -- Codable/decoder-based construction retro-conformed from another file:
+//   error: extension outside of file declaring struct 'AECCleanedMicSamples' prevents automatic
+//          synthesis of 'init(from:)' for protocol 'Decodable'
+//
+// extension AECCleanedMicSamples: Decodable {}
+
+// Attack A13 -- building a mic stream with no canceller via the internal test seam:
+//   error: missing argument for parameter 'echoCanceller' in call
+//
+// private func attackA13(controller: StreamingVadController) -> MicVadStream {
+//     MicVadStream(controller: controller)
 // }
 
 private actor VadStreamProbe {
-    private(set) var recordedCounts: [Int] = []
+    private(set) var recordedBuffers: [[Float]] = []
 
-    func record(sampleCount: Int) {
-        recordedCounts.append(sampleCount)
+    func record(samples: [Float]) {
+        recordedBuffers.append(samples)
     }
 }
 

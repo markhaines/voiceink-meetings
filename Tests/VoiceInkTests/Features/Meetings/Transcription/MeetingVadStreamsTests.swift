@@ -6,17 +6,30 @@
 // - SystemVadStream.process only accepts RawSystemSamples and actually reaches the wrapped
 //   StreamingVadController.
 // - Both forward onChunkBoundary and start/stop correctly.
+// - A cheap, deterministic static scan (processAudioCallSitesAreFacadeOnly) catches any new
+//   production call site that bypasses this facade by calling StreamingVadController.processAudio
+//   directly.
 //
-// What this file does NOT and CANNOT test: that `MicVadStream.process(RawSystemSamples(...))`
-// is a compile error. Swift Testing has no "assert this does not compile" facility, and this
-// project has no separate negative-compilation-test harness. That claim is a property of the
-// type system (see MeetingVadStreams.swift's header for exactly what is and isn't enforced),
-// verifiable by hand: attempting `micStream.process(RawSystemSamples([]))` or
-// `systemStream.process(AECCleanedMicSamples([]))` anywhere in this file fails to build with
-// "cannot convert value of type 'RawSystemSamples' to expected argument type
-// 'AECCleanedMicSamples'" (and the mirror error) — confirmed manually while writing this file,
-// left commented out below rather than deleted, so a reviewer can uncomment either line and
-// watch the build fail.
+// What this file does NOT and CANNOT test with a normal @Test: that certain lines fail to
+// compile. Swift Testing has no "assert this does not compile" facility, and this project has no
+// separate negative-compilation-test harness. Those claims are properties of the type system
+// (see MeetingVadStreams.swift's header for exactly what is and isn't enforced) — each is left
+// commented out below with the EXACT compiler error it produces, captured by hand: uncomment the
+// line, build (VoiceInkTests, Debug), read the error, then re-comment. Three such controls exist
+// in this file:
+//
+// 1. Crossing the mic/system wrappers (`MeetingVadStreamsTests.swift`, this suite, inside
+//    `micStreamForwardsCleanedSamples`): `micStream.process(RawSystemSamples([...]))` fails with
+//    "cannot convert value of type 'RawSystemSamples' to expected argument type
+//    'AECCleanedMicSamples'" (and the mirror error for the system side).
+// 2. Constructing `AECCleanedMicSamples` directly from this file
+//    (`micStreamForwardsCleanedSamples`): `AECCleanedMicSamples([Float](repeating: 0, count: 1))`
+//    fails with "'AECCleanedMicSamples' initializer is inaccessible due to 'fileprivate'
+//    protection level" -- verbatim, captured by hand.
+// 3. Satisfying `AECMicOutputAttestation` from this file (`FakeAECAttestation` type, below,
+//    left as a negative control): the `_seal` requirement can be given the right TYPE, but not
+//    a VALUE of it -- `AECAttestationSeal()` fails with "'AECAttestationSeal' initializer is
+//    inaccessible due to 'fileprivate' protection level" -- verbatim, captured by hand.
 
 import FluidAudio
 import Foundation
@@ -40,7 +53,7 @@ struct MeetingVadStreamsTests {
         let micStream = MicVadStream(controller: controller)
 
         micStream.start()
-        micStream.process(AECCleanedMicSamples([Float](repeating: 0, count: VadManager.chunkSize)))
+        micStream.process(.forTesting([Float](repeating: 0, count: VadManager.chunkSize)))
 
         let deadline = ContinuousClock.now + .seconds(2)
         while await probe.recordedCounts.isEmpty, ContinuousClock.now < deadline {
@@ -50,9 +63,14 @@ struct MeetingVadStreamsTests {
 
         #expect(await probe.recordedCounts == [VadManager.chunkSize])
 
-        // Negative controls (left commented out, see file header): uncommenting either line
-        // must fail to build, not fail at runtime.
+        // Negative control 1 (see file header): crossing the wrappers must fail to build, not
+        // fail at runtime.
         // micStream.process(RawSystemSamples([Float](repeating: 0, count: VadManager.chunkSize)))
+
+        // Negative control 2 (see file header): constructing AECCleanedMicSamples directly, even
+        // from this file, must fail to build -- `init` is `fileprivate` to MeetingVadStreams.swift,
+        // not to this file.
+        // _ = AECCleanedMicSamples([Float](repeating: 0, count: 1))
     }
 
     @Test("SystemVadStream forwards RawSystemSamples to the wrapped controller")
@@ -80,9 +98,9 @@ struct MeetingVadStreamsTests {
 
         #expect(await probe.recordedCounts == [VadManager.chunkSize])
 
-        // Negative control (left commented out, see file header): uncommenting must fail to
-        // build, not fail at runtime.
-        // systemStream.process(AECCleanedMicSamples([Float](repeating: 0, count: VadManager.chunkSize)))
+        // Negative control 1, mirrored (see file header): crossing the wrappers the other way
+        // must fail to build, not fail at runtime.
+        // systemStream.process(AECCleanedMicSamples.forTesting([Float](repeating: 0, count: VadManager.chunkSize)))
     }
 
     @Test("MicVadStream forwards onChunkBoundary from the wrapped controller")
@@ -104,7 +122,7 @@ struct MeetingVadStreamsTests {
         micStream.onChunkBoundary = { boundaryProbe.boundaryTriggered() }
 
         micStream.start()
-        micStream.process(AECCleanedMicSamples([Float](repeating: 0, count: VadManager.chunkSize)))
+        micStream.process(.forTesting([Float](repeating: 0, count: VadManager.chunkSize)))
 
         let deadline = ContinuousClock.now + .seconds(3)
         while boundaryProbe.count < 1, ContinuousClock.now < deadline {
@@ -115,7 +133,65 @@ struct MeetingVadStreamsTests {
 
         #expect(boundaryProbe.count == 1)
     }
+
+    @Test("no production call site drives StreamingVadController.processAudio directly, bypassing the facade")
+    func processAudioCallSitesAreFacadeOnly() throws {
+        // Resolve the repo root from this test file's own path, so this works regardless of
+        // where the repo is checked out (a local Mac vs. a CI runner).
+        let thisFile = URL(fileURLWithPath: #filePath)
+        let repoRoot = thisFile
+            .deletingLastPathComponent()  // MeetingVadStreamsTests.swift -> Transcription/
+            .deletingLastPathComponent()  // Transcription/ -> Meetings/
+            .deletingLastPathComponent()  // Meetings/ -> Features/
+            .deletingLastPathComponent()  // Features/ -> VoiceInkTests/
+            .deletingLastPathComponent()  // VoiceInkTests/ -> Tests/
+            .deletingLastPathComponent()  // Tests/ -> repo root
+        let productionRoot = repoRoot.appendingPathComponent("VoiceInk", isDirectory: true)
+
+        guard FileManager.default.fileExists(atPath: productionRoot.path) else {
+            Issue.record("could not resolve VoiceInk/ from #filePath -- repo layout may have changed")
+            return
+        }
+
+        let allowedFileName = "MeetingVadStreams.swift"
+        var offenders: [String] = []
+
+        let enumerator = FileManager.default.enumerator(
+            at: productionRoot,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        )
+        while let url = enumerator?.nextObject() as? URL {
+            guard url.pathExtension == "swift", url.lastPathComponent != allowedFileName else { continue }
+            guard let contents = try? String(contentsOf: url, encoding: .utf8) else { continue }
+            if contents.contains(".processAudio(") {
+                offenders.append(url.path(percentEncoded: false))
+            }
+        }
+
+        #expect(
+            offenders.isEmpty,
+            """
+            Found direct StreamingVadController.processAudio(_:) call site(s) outside \
+            MeetingVadStreams.swift -- this bypasses the AEC-boundary facade \
+            (MicVadStream/SystemVadStream) entirely:
+            \(offenders.joined(separator: "\n"))
+            """
+        )
+    }
 }
+
+// Negative control 3 (see file header): a type in this file attempting to conform to
+// `AECMicOutputAttestation` must fail to build, because it cannot produce an `AECAttestationSeal`
+// -- `AECAttestationSeal.init()` is `fileprivate` to MeetingVadStreams.swift, not to this file.
+// Uncommenting this produces exactly:
+//   "'AECAttestationSeal' initializer is inaccessible due to 'fileprivate' protection level"
+// (verbatim, captured by hand; see file header item 3).
+//
+// private struct FakeAECAttestation: AECMicOutputAttestation {
+//     var cleanedMicSamples: [Float] { [] }
+//     var _seal: AECAttestationSeal { AECAttestationSeal() }
+// }
 
 private actor VadStreamProbe {
     private(set) var recordedCounts: [Int] = []

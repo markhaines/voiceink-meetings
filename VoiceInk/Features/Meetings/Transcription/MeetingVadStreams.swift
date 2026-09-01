@@ -26,33 +26,132 @@
 // AECCleanedMicSamples value cannot be handed to the system VAD, because the types are distinct
 // and neither wrapper is convertible to the other without an explicit, visible unwrap + rewrap.
 //
-// What this does NOT (and cannot, from this file alone) guarantee: that the samples inside an
-// `AECCleanedMicSamples` actually passed through AEC. Nothing in this fork's Meetings slice yet
-// owns the AEC boundary (a different Stage-1 cluster does), so `AECCleanedMicSamples.init` is a
-// public, unrestricted constructor — a caller could technically wrap raw mic samples in it. That
-// is a real, disclosed limit: closing it fully would mean this file also owning (or depending
-// on) the AEC module's output type, which is out of scope for this stage. The mitigation is
-// documentation plus the type name itself: the ONLY correct place to construct
-// `AECCleanedMicSamples` is immediately after the AEC cleaning step, and that is spelled out in
-// ADAPTER-HANDOVER.md. A future stage that owns both AEC and this facade could tighten this
-// further (e.g. making the initializer `internal` to a shared module, or having the AEC output
-// type itself conform to a marker protocol only it can satisfy) — noted there as a follow-up,
-// not invented here without owning the pieces it would depend on.
+// SECOND ROUND, closing a real hole in the first version of this file: `AECCleanedMicSamples`
+// used to have a plain, unrestricted `init(_ samples: [Float])`, so any file in the app target
+// could write `AECCleanedMicSamples(rawMicFloats)` and hand it straight to
+// `MicVadStream.process` with no compile error — the wrapper only defended against CROSSING mic
+// and system, not against the actual property that matters: raw mic must never reach the mic
+// VAD. `AECCleanedMicSamples.init` is now `fileprivate` — restricted to THIS file, not just to
+// the module — so that direct call no longer compiles from anywhere else (see the negative
+// control in MeetingVadStreamsTests.swift, and its captured compiler error). The only way to
+// construct one from another file is `AECCleanedMicSamples.mint(from:)`, which requires a value
+// conforming to `AECMicOutputAttestation` below.
+//
+// `AECMicOutputAttestation` is deliberately SEALED to this file too: its `_seal` requirement has
+// type `AECAttestationSeal`, which is nameable anywhere in the module (it's `internal`, the
+// default) but has NO accessible initializer outside this file — `init()` is `fileprivate`. A
+// conforming type declared in another file can reference the type name, but it cannot construct
+// a value of it (no public/internal init, no static factory anywhere), so it has no way to
+// produce anything to return from `_seal`, so it cannot satisfy `AECMicOutputAttestation`, so it
+// cannot call `mint(from:)` — full stop, today, for every file in the app target except this
+// one. This is the standard Swift "sealed protocol via a non-constructible witness type" idiom,
+// not an invented one-off trick. Verified by a second negative control in
+// MeetingVadStreamsTests.swift (attempting the conformance from the test file) — its captured
+// compiler error is quoted there too.
+//
+// The AEC port lives on a separate, still-unmerged branch (`phase-1-aec-dtln`, PR #6) as of this
+// writing, so nothing here depends on its real types, and nothing there is edited. The intended
+// integration shape is: once AEC lands, its own file adds a small conforming type (or an
+// extension on its real output type) that implements `AECMicOutputAttestation` — which, because
+// the protocol is sealed here, is only possible by SOMEONE EDITING THIS FILE to also grant that
+// conformance a legitimate `_seal` value (e.g. a small internal factory added right here,
+// reviewable in the same diff that wires AEC in). Until that happens, `mint(from:)` has zero
+// legitimate callers anywhere in the codebase, which is correct and safe — there is no real AEC
+// output to attest to yet.
+//
+// Residual limit, stated plainly: this closes the CARELESS/accidental path (a well-intentioned
+// integrator writing `AECCleanedMicSamples(rawFloats)` or a naive extra conformance without also
+// touching this file) — it does not, and within a single Swift module cannot, stop a determined
+// actor from editing THIS file to weaken the seal (e.g. deleting `fileprivate`, or adding a
+// throwaway conforming type right here) and shipping that as an innocuous-looking diff. Access
+// control operates on files, not on intent, and Swift has no cross-file capability system short
+// of a real module boundary. A separate SPM module (where `internal` would mean something) would
+// close that residual gap too, but that touches project configuration and the package-trust
+// file, which is out of scope for this stage and this agent's call — see ADAPTER-HANDOVER.md.
+// One more concrete narrowing of the hole, disclosed precisely: `AECCleanedMicSamples.forTesting(_:)`
+// (below, `#if DEBUG`-gated) exists so the test target can construct instances without a real
+// AEC attestation. It does not exist in Release builds, so production misuse would fail Release
+// compilation outright — but within a Debug build, any file could still call it. This is the
+// same class of residual gap as the rest of this section, scoped narrowly to test support.
+//
+// SEPARATELY, `StreamingVadController.processAudio(_:)` itself remains directly callable with a
+// bare `[Float]` by ANYONE who imports it and skips this facade entirely — nothing about
+// `MicVadStream`/`SystemVadStream` prevents that, because `StreamingVadController.swift` is a
+// verbatim port that this stage deliberately does not modify. See "Bypassing this facade" below
+// and ADAPTER-HANDOVER.md for what is and isn't done about that.
+//
+// Bypassing this facade: calling `StreamingVadController.processAudio(_:)` directly — on either
+// the mic or the system controller — instead of going through `MicVadStream.process(_:)` /
+// `SystemVadStream.process(_:)` is PROHIBITED for the mic path and bypasses every guarantee this
+// file provides. There is no compile-time way to prevent it (the ported controller is
+// intentionally left able to be constructed and driven directly, e.g. for the tests that verify
+// its own port fidelity). `MeetingVadStreamsTests.swift` has a cheap, deterministic static test
+// (`processAudioCallSitesAreFacadeOnly`) that scans `VoiceInk/` (production code only, not
+// `Tests/`) for `.processAudio(` call sites outside this file and fails if it finds one — see
+// that test for exactly what it does and does not catch.
 
 import FluidAudio
 import Foundation
 
+/// Opaque witness that only this file can construct (`init` is `fileprivate`). Exists solely to
+/// seal `AECMicOutputAttestation` below to this file — see this file's header comment for the
+/// full explanation of the technique and what it does and does not guarantee.
+struct AECAttestationSeal {
+    fileprivate init() {}
+}
+
+/// A future AEC integration's output type is expected to conform to this once AEC lands. Every
+/// conformance must supply `_seal`, whose type (`AECAttestationSeal`) can only be produced
+/// inside THIS file — so, today, nothing outside this file can conform, which is intentional:
+/// there is no real AEC output to attest to yet. See this file's header comment.
+protocol AECMicOutputAttestation {
+    /// The AEC-cleaned mic samples this attestation vouches for.
+    var cleanedMicSamples: [Float] { get }
+    /// Proof this attestation was constructed with this file's cooperation. Do not attempt to
+    /// satisfy this from another file — see this file's header comment for why it cannot work.
+    var _seal: AECAttestationSeal { get }
+}
+
 /// Float PCM samples that have already passed through AEC (acoustic echo cancellation) —
 /// i.e. `neuralAec.processStreamingMic(...)`'s output in the donor, or this fork's equivalent.
-/// The ONLY correct construction site is immediately after that cleaning step. See this file's
-/// header comment and ADAPTER-HANDOVER.md for why this exists and what it does not guarantee.
+/// Construction is restricted to this file (`init` is `fileprivate`) plus the sealed
+/// `mint(from:)` entry point below. See this file's header comment and ADAPTER-HANDOVER.md for
+/// why this exists and what it does and does not guarantee.
 struct AECCleanedMicSamples: Sendable {
     let samples: [Float]
 
-    init(_ samples: [Float]) {
+    fileprivate init(_ samples: [Float]) {
         self.samples = samples
     }
+
+    /// The only way to construct `AECCleanedMicSamples` from outside this file. Requires an
+    /// `AECMicOutputAttestation`, which nothing outside this file can currently provide — see
+    /// this file's header comment for the intended integration shape.
+    static func mint(from attestation: AECMicOutputAttestation) -> AECCleanedMicSamples {
+        AECCleanedMicSamples(attestation.cleanedMicSamples)
+    }
 }
+
+#if DEBUG
+extension AECCleanedMicSamples {
+    /// Test-only escape hatch, since `MeetingVadStreamsTests.swift` legitimately needs to
+    /// construct `AECCleanedMicSamples` to test `MicVadStream` without a real AEC output to
+    /// attest to. `@testable import` does not unlock `fileprivate`/`private` access — only
+    /// `internal` — so this file still has to hand the test target something.
+    ///
+    /// This symbol exists ONLY in `DEBUG` builds (VoiceInk's Debug configuration, which is what
+    /// both CI and `VoiceInk Dev.app` build with — `SWIFT_ACTIVE_COMPILATION_CONDITIONS`
+    /// includes `DEBUG` there and not in Release). It does not exist at all in a Release build,
+    /// so calling it from production glue code would fail Release compilation outright, not
+    /// silently ship. It does NOT, however, stop misuse from another file within a Debug build
+    /// — this is the same residual limit as the rest of this file's sealing: real closure needs
+    /// either nobody calling it outside tests (a convention, not a guarantee) or a real module
+    /// boundary. See this file's header "Residual limit" paragraph.
+    static func forTesting(_ samples: [Float]) -> AECCleanedMicSamples {
+        AECCleanedMicSamples(samples)
+    }
+}
+#endif
 
 /// Float PCM samples read directly from system audio capture, with no AEC cleaning applied.
 /// This is deliberately raw — the system VAD stream is meant to see the unmodified system

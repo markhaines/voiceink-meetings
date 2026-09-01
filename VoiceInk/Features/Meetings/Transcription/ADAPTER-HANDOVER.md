@@ -35,10 +35,31 @@ only AEC-cleaned float samples — never raw mic. Donor `MeetingSession.swift`:
   `vadController.processAudio`.
 
 **In this fork:** use `MicVadStream.process(_:)`, which only accepts `AECCleanedMicSamples`
-(see `MeetingVadStreams.swift`). Construct that wrapper immediately after your AEC step's output
-— nowhere else — mirroring `appendCleanedMicSamplesOnQueue`'s role as the single funnel. Feed the
-same cleaned samples to whatever this fork's mic `PCMChunkRecorder` equivalent is, so the VAD and
-the recorded chunk audio never diverge, exactly as the donor does.
+(see `MeetingVadStreams.swift`). As of the second fix round, `AECCleanedMicSamples` can no longer
+be constructed from bare `[Float]` outside `MeetingVadStreams.swift` at all — its initializer is
+`fileprivate`, and the only other path in, `AECCleanedMicSamples.mint(from:)`, requires an
+`AECMicOutputAttestation` that (deliberately) nothing outside that file can currently produce.
+**Wiring real AEC output in means editing `MeetingVadStreams.swift` itself** — adding a small,
+reviewable conformance or factory right there once the AEC branch (`phase-1-aec-dtln`, PR #6, not
+yet merged as of this writing) lands — not constructing the wrapper from wherever your glue code
+happens to live. See that file's header comment for the full mechanism, and its "Residual limit"
+paragraph for what this does and does not close (short version: it stops the careless mistake of
+wrapping a raw array; it cannot stop someone who deliberately edits that file to weaken the seal).
+
+**Bypassing this facade entirely is prohibited for the mic path.** `StreamingVadController.processAudio(_:)`
+itself is still directly callable with any `[Float]` — `MicVadStream`/`SystemVadStream` wrap it,
+they do not seal it, and this port deliberately never modifies `StreamingVadController.swift`.
+Driving the mic VAD through anything other than `MicVadStream.process(_:)` bypasses every
+guarantee above. `Tests/.../MeetingVadStreamsTests.swift` has a cheap, deterministic static test
+(`processAudioCallSitesAreFacadeOnly`) that scans `VoiceInk/` for `.processAudio(` call sites
+outside `MeetingVadStreams.swift` and fails the build if it finds one — it catches an accidental
+new call site added anywhere in production code, but it is a textual scan, not a real guarantee:
+it cannot catch, for example, a call reached only through a stored/partially-applied method
+reference (`let fn = controller.processAudio; fn(x)`), which does not contain the literal
+substring `.processAudio(`.
+
+Feed the same cleaned samples to whatever this fork's mic `PCMChunkRecorder` equivalent is, so
+the VAD and the recorded chunk audio never diverge, exactly as the donor does.
 
 ## 2. Raw system stream into system VAD
 

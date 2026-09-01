@@ -27,6 +27,31 @@
 // remains unit-tested only implicitly, through the donor's own two tests below plus the ported
 // C source being provably unchanged (see AudioGraphExceptionBridge.h/.m's attribution comments).
 //
+// The remaining two tests below regressed with the SAME failure mode once Phase 1 Stage 1
+// (mic-route: markhaines/voiceink-meetings#3) added ~700 lines of concurrency-heavy test
+// suites alongside them in the same xctest bundle. CI run 33555297407 (this PR's first run)
+// reported both `inputStateReadIsContained` and `invalidInputRouteIsContained` at 600.513s --
+// identical to each other, and identical to the "Testing started completed" elapsed marker for
+// the whole invocation -- while every other suite's tests (including the new ones) printed
+// their pass/fail lines in one burst immediately afterward. That pattern is `xcodebuild test`
+// buffering ALL Swift Testing output until the process exits, so per-test durations in this log
+// are not self-measured wall time; they are "how long the whole run took," misattributed to
+// whichever tests happened to be resident when it unblocked -- the same misattribution the
+// paragraph above already documented for `installTapExceptionIsContained`. Locally (Mac mini,
+// same "zero audio input devices" starting condition as the CI runner) both tests pass in
+// ~2.2s each, so the underlying AVAudioEngine-against-no-hardware call genuinely IS fast on at
+// least one no-device host; it is evidently not reliably fast on GitHub's virtualized runner.
+// Rather than reduce the new suites' concurrency to chase a call this file does not own
+// (StreamingMicRecorder/AudioRouteController's tests are legitimately concurrency-heavy by
+// design and un-serializable across suites without an .xctestplan this project does not have),
+// both tests below are now gated on a real, non-aggregate input device actually being present
+// (checked via CoreAudioDeviceInspector().availableInputDevices(), a plain
+// AudioObjectGetPropertyData enumeration -- no AVAudioEngine involved, so the guard itself
+// cannot hang). Neither this Mac nor the CI runner has one, so both tests report as SKIPPED,
+// not passed: an honest signal that this exception-boundary behavior has no environment in this
+// project's CI that can verify it fast and reliably, rather than an intermittent 2s-or-600s
+// runtime masquerading as a pass. See mic-route.md for the CI run ids and full diagnosis.
+//
 // MIT License
 //
 // Copyright (c) 2026 Pranav Hari
@@ -56,16 +81,30 @@ import CoreAudio
 import Testing
 @testable import VoiceInk
 
+/// True when at least one real (non-aggregate) CoreAudio input device is present. Backed
+/// entirely by `AudioObjectGetPropertyData` enumeration (`CoreAudioDeviceInspector`, from
+/// `AudioRouteController.swift`) -- never touches `AVAudioEngine`, so evaluating this guard
+/// cannot itself hang, unlike the calls it gates.
+private func hasRealAudioInputDevice() -> Bool {
+    !CoreAudioDeviceInspector().availableInputDevices().isEmpty
+}
+
 @Suite("AVFAudio exception boundary")
 struct AudioGraphExceptionBridgeTests {
-    @Test("input state reads return a format or a bridged error")
+    @Test(
+        "input state reads return a format or a bridged error",
+        .enabled(if: hasRealAudioInputDevice(), "requires a real CoreAudio input device")
+    )
     func inputStateReadIsContained() {
         let state = MuesliAudioGraphReadInputState(AVAudioEngine())
 
         #expect(state.outputFormat != nil || state.error != nil)
     }
 
-    @Test("invalid input routing returns an error instead of escaping the boundary")
+    @Test(
+        "invalid input routing returns an error instead of escaping the boundary",
+        .enabled(if: hasRealAudioInputDevice(), "requires a real CoreAudio input device")
+    )
     func invalidInputRouteIsContained() {
         let error = MuesliAudioGraphSetInputDevice(AVAudioEngine(), AudioObjectID.max)
 

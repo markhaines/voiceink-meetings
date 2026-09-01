@@ -1,5 +1,323 @@
 {
-  "_comment": "Every macro / package-plugin target declared anywhere in the pinned SPM graph, with the git object id of its source tree. Regenerate with scripts/verify-package-trust.sh --update AFTER reading the sources: the diff on this file IS the review record. See FORK-PATCHES.md S6.",
+  "_comment": "The reviewed build-time input of this fork. 'graph' binds the WHOLE resolved package graph -- the exact set of pinned packages, each pin's location and revision (a revision is a hash over that package's entire tree), each package's root tree and root Package*.swift blob ids, and sha256 of Package.resolved itself -- so a new package, a moved pin or a changed manifest fails the check no matter how a target is declared inside it. 'components' is additional review evidence: the macro/plugin targets a regex can see, with the note recording what reading them found. Regenerate with scripts/verify-package-trust.sh --update AFTER reading what changed: the diff on this file IS the review record. See FORK-PATCHES.md S6.",
+  "graph": {
+    "resolved_sha256": "fbe902c58f68ce07dbf1ed3d6a4f1002897863d5d9673cd8658578d3adc3fb76",
+    "packages": [
+      {
+        "identity": "axswift",
+        "kind": "remoteSourceControl",
+        "location": "https://github.com/tisfeng/AXSwift.git",
+        "revision": "d737b605c99f6e0f6a21448d0836110bd15b7710",
+        "tree": "2a3901a9c28fb68e0c60abd92da2889afd382a2d",
+        "manifests": {
+          "Package.swift": "112f472d3456008beb08de2d1df293051fdf0656"
+        },
+        "version": "0.3.7"
+      },
+      {
+        "identity": "eventsource",
+        "kind": "remoteSourceControl",
+        "location": "https://github.com/mattt/EventSource.git",
+        "revision": "a3a85a85214caf642abaa96ae664e4c772a59f6e",
+        "tree": "047bf388d9350b5649fca029c0ce14c6e8604a52",
+        "manifests": {
+          "Package.swift": "32d5ccf426156fa47887758509c4e45bd1bffa65",
+          "Package@swift-6.0.swift": "2bfac39541490fe88f1bcf24e9611d57e6fd0c83"
+        },
+        "version": "1.4.1"
+      },
+      {
+        "identity": "fluidaudio",
+        "kind": "remoteSourceControl",
+        "location": "https://github.com/FluidInference/FluidAudio",
+        "revision": "c7b13a3942e79893f3bd76bfe3b1ed8d03e0bfc7",
+        "tree": "1ce266c7b304537643669b41dc2b3221a7655d6f",
+        "manifests": {
+          "Package.swift": "acf6c6777d0e48ca3e831a6bbaf4f0f76d02c1c0"
+        },
+        "branch": "main"
+      },
+      {
+        "identity": "keysender",
+        "kind": "remoteSourceControl",
+        "location": "https://github.com/jordanbaird/KeySender",
+        "revision": "99584bf1a03ab600cc44be89a2dcd98b2dbeb9de",
+        "tree": "5de263e39bbf219df77ef88e3fe8affa7f62531a",
+        "manifests": {
+          "Package.swift": "238abb234932388d8932ada330d81963bdc2f4e7"
+        },
+        "version": "0.0.5"
+      },
+      {
+        "identity": "llmkit",
+        "kind": "remoteSourceControl",
+        "location": "https://github.com/Beingpax/LLMkit.git",
+        "revision": "95b29c2e1ad22754c2f21495aafb483874c8f06c",
+        "tree": "d291697adfc7d97dba6930d4c6f06559c1e4254c",
+        "manifests": {
+          "Package.swift": "d4b954e7f874118bdba11468de40a4b4c8c953fd"
+        }
+      },
+      {
+        "identity": "mediaremote-adapter",
+        "kind": "remoteSourceControl",
+        "location": "https://github.com/Beingpax/mediaremote-adapter",
+        "revision": "b97fa53f0654c8e33519e8a601b0bead3abd310a",
+        "tree": "814b39c1eebc98d1d150d850cd58293283a7da35",
+        "manifests": {
+          "Package.swift": "0f9c15f9361539ae45435eb5badd64bb7b4e8b07"
+        },
+        "branch": "master"
+      },
+      {
+        "identity": "mlx-swift",
+        "kind": "remoteSourceControl",
+        "location": "https://github.com/ml-explore/mlx-swift",
+        "revision": "0bb916c67f4b9e5c682cbe02a42c701c93ab5021",
+        "tree": "a9e6def423b34bf53b045154ec3d15a90188daef",
+        "manifests": {
+          "Package.swift": "e36e0d862c551d8e780072166f8755b452df11d3"
+        },
+        "version": "0.31.6"
+      },
+      {
+        "identity": "mlx-swift-lm",
+        "kind": "remoteSourceControl",
+        "location": "https://github.com/ml-explore/mlx-swift-lm.git",
+        "revision": "cd1ab3dd98ceb02d095490aa25e61298ea3e2f5b",
+        "tree": "45cbaa41c9cc90ce350857116746450143b3e3a4",
+        "manifests": {
+          "Package.swift": "965a5b6fa7ebfde14f80d9f79a6758b06cde26c3"
+        }
+      },
+      {
+        "identity": "networkimage",
+        "kind": "remoteSourceControl",
+        "location": "https://github.com/gonzalezreal/NetworkImage",
+        "revision": "2849f5323265386e200484b0d0f896e73c3411b9",
+        "tree": "36a19c77ed9e41feda3bc233b893172bcdb95f2c",
+        "manifests": {
+          "Package.swift": "f761b5841a7565aa4bf57d6f6aae13d57aa2a6f5",
+          "Package@swift-6.0.swift": "5adaa30452c7800163f337db8c29a443906b5f15"
+        },
+        "version": "6.0.1"
+      },
+      {
+        "identity": "selectedtextkit",
+        "kind": "remoteSourceControl",
+        "location": "https://github.com/Beingpax/SelectedTextKit.git",
+        "revision": "05a3e5177300d800c2785be83ba2ba7fa775e41a",
+        "tree": "b625cc1c04df98872b3c34f537b6841d89cf45f1",
+        "manifests": {
+          "Package.swift": "2dfd80e8d0badf6d32a029dc46560aff42ad6b9c"
+        },
+        "branch": "performance/off-main-menu-action"
+      },
+      {
+        "identity": "sparkle",
+        "kind": "remoteSourceControl",
+        "location": "https://github.com/sparkle-project/Sparkle",
+        "revision": "6276ba2b404829d139c45ff98427cf90e2efc59b",
+        "tree": "33a642a854fdd87aebea8eeb8593fc24ff6a1ee9",
+        "manifests": {
+          "Package.swift": "52bf055a6ceac8d3e0c9c04a8690fa4d63bce35e"
+        },
+        "version": "2.9.2"
+      },
+      {
+        "identity": "swift-argument-parser",
+        "kind": "remoteSourceControl",
+        "location": "https://github.com/apple/swift-argument-parser",
+        "revision": "6a52f3251125d74daf04fcbd5e6f08a75d074382",
+        "tree": "f2352f1593c3d1dffeae2d21fb206ea1e77910dd",
+        "manifests": {
+          "Package.swift": "bc835353a2e24de227c387209f7e1c83c31e002e"
+        },
+        "version": "1.8.2"
+      },
+      {
+        "identity": "swift-asn1",
+        "kind": "remoteSourceControl",
+        "location": "https://github.com/apple/swift-asn1.git",
+        "revision": "a9a5efd40eaf558a2bcd48d64b1d1646be686008",
+        "tree": "f2771f6c8e429274da304e8ef4c1f74c9ce71d4c",
+        "manifests": {
+          "Package.swift": "22198e81c222f62d53b873f90ac6b56032253420"
+        },
+        "version": "1.7.1"
+      },
+      {
+        "identity": "swift-atomics",
+        "kind": "remoteSourceControl",
+        "location": "https://github.com/apple/swift-atomics.git",
+        "revision": "b601256eab081c0f92f059e12818ac1d4f178ff7",
+        "tree": "1e061337a6ceec91c82fae10bd6063ca0208f6d0",
+        "manifests": {
+          "Package.swift": "5aace102f02942576d950d076c0b293ec2532da2"
+        },
+        "version": "1.3.0"
+      },
+      {
+        "identity": "swift-cmark",
+        "kind": "remoteSourceControl",
+        "location": "https://github.com/swiftlang/swift-cmark",
+        "revision": "924936d0427cb25a61169739a7660230bffa6ea6",
+        "tree": "5d3c52b126088aa913e6a99c7a15dcea4405c1ef",
+        "manifests": {
+          "Package.swift": "6cdf00ff5a798d94f72e10a2f8e9495edea57a60"
+        },
+        "version": "0.8.0"
+      },
+      {
+        "identity": "swift-collections",
+        "kind": "remoteSourceControl",
+        "location": "https://github.com/apple/swift-collections.git",
+        "revision": "a0cb0954ecb21e4e31b0070e6ed5674e8556685a",
+        "tree": "c34084212b28d721be6bea75daf0d1a87175dc18",
+        "manifests": {
+          "Package.swift": "cb425802761cbd56b240d00dd98c04ca8b95c6c2",
+          "Package@swift-6.0.swift": "7d6e2566ea330531d279288385d971b3d5589c34"
+        },
+        "version": "1.6.0"
+      },
+      {
+        "identity": "swift-crypto",
+        "kind": "remoteSourceControl",
+        "location": "https://github.com/apple/swift-crypto.git",
+        "revision": "47d3869a7291f085c1fb9fb1e6d3b97a793f45c6",
+        "tree": "ae875d9fa9a1029796d3b242b34d45de13d15de4",
+        "manifests": {
+          "Package.swift": "227c9d757db563ca160df35eafd970c78894e897"
+        },
+        "version": "4.5.1"
+      },
+      {
+        "identity": "swift-huggingface",
+        "kind": "remoteSourceControl",
+        "location": "https://github.com/huggingface/swift-huggingface.git",
+        "revision": "b721959445b617d0bf03910b2b4aced345fd93bf",
+        "tree": "44eb5c7981ba6d811c30d67b541c00a65dd19735",
+        "manifests": {
+          "Package.swift": "252a2de8c60ca90eb82b776477949cc3c8ef25a8",
+          "Package@swift-6.0.swift": "2b2c79c0533a557695b307b0bb6799dd7c08a9df"
+        },
+        "version": "0.9.0"
+      },
+      {
+        "identity": "swift-jinja",
+        "kind": "remoteSourceControl",
+        "location": "https://github.com/huggingface/swift-jinja.git",
+        "revision": "7d0b8880ef8e567dd4e0089f8b99fb354129017c",
+        "tree": "2205a6721866694529fd49ab4fd33c282b3b19b7",
+        "manifests": {
+          "Package.swift": "fed18b2b1f969cf0ca234b8059509a44489ca564"
+        },
+        "version": "2.4.2"
+      },
+      {
+        "identity": "swift-markdown-ui",
+        "kind": "remoteSourceControl",
+        "location": "https://github.com/gonzalezreal/swift-markdown-ui",
+        "revision": "5f613358148239d0292c0cef674a3c2314737f9e",
+        "tree": "b0d32a99fcf7a5f5a013e70e83f35efc68667622",
+        "manifests": {
+          "Package.swift": "5fb61bc92880b35a13d96d283960f4103eb1e696"
+        },
+        "version": "2.4.1"
+      },
+      {
+        "identity": "swift-nio",
+        "kind": "remoteSourceControl",
+        "location": "https://github.com/apple/swift-nio.git",
+        "revision": "0b18836bd8b0162e7e17a995a3fbee20ed8f3b2b",
+        "tree": "56553ba89201dffd63fb7258b97a720555abdbfe",
+        "manifests": {
+          "Package.swift": "600c8ac1d25f92f48f3141535b37e3dd17256149"
+        },
+        "version": "2.101.3"
+      },
+      {
+        "identity": "swift-numerics",
+        "kind": "remoteSourceControl",
+        "location": "https://github.com/apple/swift-numerics",
+        "revision": "0c0290ff6b24942dadb83a929ffaaa1481df04a2",
+        "tree": "4560bfb65f2c26cbd159c3e1a9cbf01600bace1b",
+        "manifests": {
+          "Package.swift": "ae835441958bc437564f9f33c8f6d7fea7db44ed"
+        },
+        "version": "1.1.1"
+      },
+      {
+        "identity": "swift-syntax",
+        "kind": "remoteSourceControl",
+        "location": "https://github.com/swiftlang/swift-syntax.git",
+        "revision": "79e4b74a295b6eb74a8b585e3a39d29e70c1dbd1",
+        "tree": "f2f9593e75815c34b4ea53977d0065b182a5b6fd",
+        "manifests": {
+          "Package.swift": "ba92d6854a76feacd87c1083da99ad8188e21be1"
+        },
+        "version": "603.0.2"
+      },
+      {
+        "identity": "swift-system",
+        "kind": "remoteSourceControl",
+        "location": "https://github.com/apple/swift-system.git",
+        "revision": "50688cacbd41d547e9eb9f7a213542340b7c442b",
+        "tree": "65424672ddff71ad59cd0e09a9fdf8702231efb4",
+        "manifests": {
+          "Package.swift": "2c75bb0ee0def344a6d8994c7996a88f1f651f82"
+        },
+        "version": "1.7.5"
+      },
+      {
+        "identity": "swift-transformers",
+        "kind": "remoteSourceControl",
+        "location": "https://github.com/huggingface/swift-transformers",
+        "revision": "b38443e44d93eca770f2eb68e2a4d0fa100f9aa2",
+        "tree": "b973309bc7bad3c28d94a74344f3075cb2d8c77f",
+        "manifests": {
+          "Package.swift": "d39be4cff87324dc8b03102f89bdbcb48fc89bab",
+          "Package@swift-6.1.swift": "c681b07ea060454509e6f43a77656daca96988ee"
+        },
+        "version": "1.3.0"
+      },
+      {
+        "identity": "transcribe-cpp-swift",
+        "kind": "remoteSourceControl",
+        "location": "https://github.com/Beingpax/Transcribe-cpp-swift.git",
+        "revision": "fb1c1ad99e8939a69fcfb613417d9635fb77ef42",
+        "tree": "a709da17b80980fd653d5c3a540f919927ce0ad9",
+        "manifests": {
+          "Package.swift": "8839ca6a3c4ddf302809af955be0116d0459008b"
+        },
+        "version": "0.2.0-dev.856d7c1"
+      },
+      {
+        "identity": "yyjson",
+        "kind": "remoteSourceControl",
+        "location": "https://github.com/ibireme/yyjson.git",
+        "revision": "8b4a38dc994a110abaec8a400615567bd996105f",
+        "tree": "a51e8386f5e259392d2a77ee2300ea17210f5fa1",
+        "manifests": {
+          "Package.swift": "8f27d611e560858882596696c7c377e3a88dd34e"
+        },
+        "version": "0.12.0"
+      },
+      {
+        "identity": "zip",
+        "kind": "remoteSourceControl",
+        "location": "https://github.com/marmelroy/Zip",
+        "revision": "67fa55813b9e7b3b9acee9c0ae501def28746d76",
+        "tree": "f3c279cbd38d49a82df9532b890dada0f438c518",
+        "manifests": {
+          "Package.swift": "fd33704c0d1ac86156ac4e8747f30df19ee61aff",
+          "Package@swift-4.2.swift": "6cb1c9851ce88ffbd9afe701d22f9823e8ec1205",
+          "Package@swift-5.0.swift": "03bcf3a574088650fd3a9cf240393ea8852d751f"
+        },
+        "version": "2.1.2"
+      }
+    ]
+  },
   "components": [
     {
       "package": "mlx-swift",

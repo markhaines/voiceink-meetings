@@ -7,6 +7,26 @@ files that already existed upstream.
 
 Entries are grouped by branch/PR. This is `phase-0-fork-hygiene`.
 
+## Fork point: `711297b`
+
+The fork point is upstream commit **`711297b`** ("Separate Xcode debug app identity from
+production", authored by Prakash Joshi Pax). That is the merge-base, and it is the ONLY
+correct base for enumerating what this fork changed:
+
+```bash
+git merge-base upstream/main origin/phase-0-fork-hygiene   # -> 711297b6c8b918fd73665fbbea4736369ac655a9
+git diff --name-only 711297b..origin/phase-0-fork-hygiene  # -> 107 paths, matching the Appendix below
+```
+
+**Diff from the merge-base, not from an older upstream commit.** A review generated from an
+earlier base (`9f95226`) attributed upstream's own `711297b` to this fork, and so reported
+`BUILDING.md`, `LocalBuild.xcconfig` and `VoiceInk.xcscheme` as undocumented fork changes and
+this document's "the scheme is byte-identical to upstream" statement as false. Both readings
+were artefacts of the wrong base: `711297b` is upstream's commit, it touches exactly those
+files, and the `LaunchAction` Release -> Debug change in the scheme is upstream's, not ours.
+The Appendix at the end of this file is generated from the command above.
+
+
 ## phase-0-fork-hygiene
 
 ### 1. Bundle identity: `com.prakashjoshipax.VoiceInk` → `com.hainesy.VoiceInkMeetings`
@@ -298,15 +318,78 @@ that makes the fork buildable without a human clicking through Xcode dialogs:
   (run **33443041941**).
 
   So the blanket flag is kept and bounded, by `scripts/verify-package-trust.sh` +
-  `package-trust.json`, which run **before anything is built**:
+  `package-trust.json`, which run **before anything is built** (all 28 packages, by shallow
+  blobless `git fetch` of each pinned revision: no `xcodebuild`, nothing compiled, nothing
+  executed, ~30 seconds).
 
-  - it re-derives from `Package.resolved` alone every macro and plugin target declared
-    anywhere in the pinned graph (all 28 packages, by shallow blobless `git fetch` of each
-    pinned revision -- no `xcodebuild`, nothing compiled, nothing executed, ~20 seconds);
-  - it fails if any of them is not in the reviewed set, which is what catches the reviewer's
-    "and all future transitive additions" case;
-  - it fails if a reviewed component's pinned revision moves, or if the git tree object id of
-    its source directory differs from the reviewed one.
+  **The first version of that guard enumerated the dangerous things, and that was unsound.**
+  It ran a regular expression over each package manifest looking for `.macro(name: "X")` /
+  `.plugin(name: "X")` and required every match to be an allowlisted, hash-pinned component.
+  A `Package.swift` is executable Swift, not data: a target can be declared through a helper
+  function, a variable, a loop, `#if` logic, or simply formatting the pattern does not match.
+  A package whose manifest declared a build-tool plugin in any of those forms produced zero
+  matches, contributed no component to check, and, because a package with no recognised
+  components was not itself required to be allowlisted, passed. Reproduced before the rewrite,
+  against the real 28-package graph plus one added package whose manifest builds its plugin
+  target via `func buildToolTarget(_:) -> Target`:
+
+  ```
+  scanned 29 pinned packages; 4 macro/plugin target(s) declared in the graph
+  OK: every macro/plugin target in the graph is reviewed and unchanged     [exit 0]
+  ```
+
+  The same hole let a pinned revision move unnoticed on any package that declared no
+  recognised component: moving `zip`'s pin to a different real commit also printed `OK`,
+  exit 0.
+
+  **Trust is now bound to the whole resolved input, not to what a regex can find inside it.**
+  `package-trust.json` gained a `graph` section, and the check fails on any of:
+
+  - **the package set.** Every pin in `Package.resolved` must be one recorded in `graph`, and
+    every recorded package must still be pinned. A new package entering the graph is a hard
+    failure whatever it does or does not declare, which is the property the regex could not
+    provide. A recorded package leaving the graph also fails, because a trust file that no
+    longer describes the graph is not a reviewed one.
+  - **the pinned revision and location.** A git revision is a hash over that package's entire
+    tree, so an unchanged revision is a cryptographic guarantee that not one byte of that
+    package (manifest, plugin source, anything) has changed. A moved pin, or a `location`
+    repointed at a different repository, is a hard failure.
+  - **the tree and the manifests, recorded explicitly.** Per package the file also carries the
+    root tree object id and the blob object id of every root `Package*.swift`. These are
+    implied by the revision; recording them makes the review record legible on its own terms
+    and names exactly which manifest changed when one does.
+  - **`Package.resolved` itself,** by sha256 of its bytes, so an edit to a field the script
+    does not otherwise model still forces a re-bless. When only the bytes moved and no
+    package, pin or manifest did, the failure says so, because the review needed there is a
+    glance at `git diff` rather than reading a dependency.
+  - **an unmodelled pin kind.** Only `remoteSourceControl` pins are understood; a registry or
+    local-path pin fails rather than being waved through.
+
+  The per-component records are kept, as **additional review evidence rather than as the
+  mechanism**: for each macro/plugin target the regex can see, the path and git tree id of its
+  sources plus the note recording what reading them found. They still fail on an unreviewed
+  match, a moved revision, a source tree that changed, or a companion path that vanished.
+
+  A second CI step re-checks `Package.resolved` **after** the build and test steps and fails if
+  it changed, so a build-time re-resolution cannot add a package behind the pre-build check.
+
+  **Re-blessing the package trust file.** After any legitimate dependency change (a pin bump, a
+  new package, an Xcode-rewritten `Package.resolved`) the check will fail, by design. The fix
+  is one command:
+
+  ```bash
+  scripts/verify-package-trust.sh --update   # rewrites package-trust.json from the current pins
+  git diff package-trust.json                # THIS DIFF IS THE REVIEW RECORD - read it
+  ```
+
+  `--update` prints what it is blessing (`+ package X @ rev`, `~ package X: old -> new`,
+  `- package X (left the graph)`) before writing, preserves the `note` on every existing
+  component, and marks any newly discovered component `PENDING REVIEW` so an unread one is
+  visible in the diff. What "reviewing" means in practice: for a pin bump, read the upstream
+  diff for that package's manifest and for any macro or plugin sources it touches; for a new
+  package, read its manifest and note what build-time-executable targets it declares. Then
+  replace `PENDING REVIEW` with what you found and commit both files together. `--help` prints
+  the script's own reasoning.
 
   Four components are declared in the current graph and each was read before being recorded:
   `mlx-swift/CudaBuild` (buildTool), `mlx-swift-lm/MLXHuggingFaceMacros` (macro, declared but
@@ -319,9 +402,11 @@ that makes the fork buildable without a human clicking through Xcode dialogs:
   helper. The reviewed hashes cover the plugin sources and `Source/Encuda`.
 
   Residual risk, stated plainly: the plugin still runs, unprompted, as part of the build. What
-  the guard buys is that it can only ever be *this* reviewed plugin at *this* reviewed
-  revision, and that a second one cannot arrive unnoticed. `make local` on a desk Mac is
-  unaffected -- `LOCAL_XCODEBUILD_FLAGS` defaults to empty, so Xcode still prompts there.
+  the guard buys is that the build can only ever run *this* reviewed plugin at *this* reviewed
+  revision, out of *this* reviewed set of 28 packages, and that nothing else can arrive without
+  a human re-blessing the trust file first. It does not read the plugin for you; it guarantees
+  that what you read last is what runs. `make local` on a desk Mac is unaffected --
+  `LOCAL_XCODEBUILD_FLAGS` defaults to empty, so Xcode still prompts there.
 - `Makefile`: added `LOCAL_XCODEBUILD_FLAGS ?=` (empty by default) and appended
   `$(LOCAL_XCODEBUILD_FLAGS)` to the `local` target's `xcodebuild` invocation, so CI/scripted
   callers can inject the flags above without duplicating the whole recipe. No effect on
@@ -577,7 +662,7 @@ These changed what the app does. Read the reason before merging upstream changes
 - `FORK-PATCHES.md` -- this file
 - `NOTICE` -- upstream attribution and licence notice
 - `VoiceInkRefineXPC/HuggingFaceTokenizerLoader.swift` -- the fork's own copy of the `#huggingFaceTokenizerLoader()` expansion, which is what removes mlx-swift-lm's macro from the build graph (section 6)
-- `package-trust.json` -- the reviewed set of macros/build-tool plugins in the pinned package graph, with source-tree hashes (section 6)
+- `package-trust.json` -- the reviewed build-time input: the whole pinned package graph (every pin's location, revision, root tree and manifest blob ids, plus sha256 of `Package.resolved`), and the reviewed macro/build-tool plugin components with their source-tree hashes (section 6)
 - `scripts/assert-fork-identity.sh` -- the fork-identity guard, run against the built app and the project configuration (section 6)
 - `scripts/verify-package-trust.sh` -- enforces `package-trust.json` before anything is built (section 6)
 - `whisper-cpp.rev` -- the pinned whisper.cpp revision (section 6)

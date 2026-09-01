@@ -668,6 +668,85 @@ These changed what the app does. Read the reason before merging upstream changes
 - `whisper-cpp.rev` -- the pinned whisper.cpp revision (section 6)
 
 
+## phase-1-foundation (Stage 0: Meetings slice foundation)
+
+Ported from Muesli-HQ/muesli into the new `VoiceInk/Features/Meetings/` slice, verbatim
+(comments, branches and constants unchanged, MIT header + minimal import trims only):
+`Capture/PCMChunkRecorder.swift` (donor 101 lines), `Capture/MeetingChunkTimingTracker.swift`
+(58), `Capture/WavWriter.swift` (donor's full `WavWriter.swift`, pulled in unscoped because
+`PCMChunkRecorder` calls it directly and every Stage-1 capture cluster needs it too),
+`Capture/AudioSampleStats.swift` (extracted from `MeetingSessionDiagnostics.swift` lines 5-52,
+along with `AudioSampleStatsSnapshot` since `.snapshot()` returns one), and the
+`AudioGraphExceptionBridge` ObjC pair (`.h`/`.m`, ported from the donor's separate SwiftPM
+target of the same name — see section 1 below for why that needed a bridging header).
+
+Two fork-owned (not verbatim — the task descriptions of the donor equivalents were slightly
+off, corrected after reading the real donor code) shared types in `Models/`:
+- **`SpeechSegment.swift`**: three fields (`start: Double`, `end: Double`, `text: String`),
+  `Sendable`. Donor's real type lives at `MuesliNativeApp/TranscriptionRuntime.swift:5`, not in
+  the `MuesliCore` library target as the task brief assumed. Confirmed against all 11 donor
+  construction sites — every one uses exactly this shape, nothing else.
+- **`MeetingRuntimePaths.swift`**: donor's `RuntimePaths.swift` is actually about app-bundle
+  resource resolution (icons), unrelated to meeting audio — not ported. What Stage-1 capture
+  code needs instead comes from `MeetingSession.swift` (chunk-scratch directory names) and
+  `MeetingRecordingWriter.swift` (permanent recording directory). The permanent directory is
+  `~/Library/Application Support/<Bundle.main.bundleIdentifier>/MeetingRecordings/` — a
+  sibling of VoiceInkEngine's own `Recordings/`, scoped by the running build's actual bundle
+  identifier (not a hardcoded literal, so the Debug build — `com.hainesy.VoiceInkMeetings.dev`
+  — and the Release build — `com.hainesy.VoiceInkMeetings`, both confirmed in this file's own
+  `PRODUCT_BUNDLE_IDENTIFIER` settings — never share a meeting-audio directory). It is
+  structurally exempt from BOTH of VoiceInk's existing audio-cleanup mechanisms: (1)
+  `AudioCleanupManager` only ever deletes paths it reads from `Transcription.audioFileURL` in
+  SwiftData, never scans a directory; (2)
+  `TranscriptionAutoCleanupService.cleanupOrphanAudioFiles()` — the second, easy-to-miss
+  mechanism, which also deletes files with no matching `Transcription` record — only lists its
+  own hardcoded `Recordings/` directory, so a sibling directory is outside its scan by
+  construction. Both read and confirmed directly, not assumed.
+
+`MeetingPromptStateMachine.swift` was in scope but is NOT ported — see the dedicated section
+below. Full narrative detail (every donor use-site read, exact commands run for each gate) is
+additionally in the task report at `.tandem/884f6ef6905c4e2aa4e2ca28c34ea629/phase1-foundation.md`,
+but that path is orchestration state, not part of this repository, so nothing above depends on
+it being reachable. This entry covers the one upstream-file touch, against the ~6-touchpoint
+budget the note below sets for Phase 1+.
+
+### 1. `project.pbxproj`: `SWIFT_OBJC_BRIDGING_HEADER` added (VoiceInk target, Debug + Release)
+
+`AudioGraphExceptionBridge` is ObjC (an `installTap` exception boundary AVFAudio needs, since
+Swift cannot catch the NSExceptions it raises). In the donor it is its own SwiftPM module
+target; VoiceInk.xcodeproj is a plain Xcode app target with no prior ObjC/Swift interop and no
+bridging header at all. Calling ObjC from Swift within a single app target requires one, so
+both `buildSettings` blocks for the `VoiceInk` native target (not the XPC service, not the
+test targets) gained:
+
+```
+SWIFT_OBJC_BRIDGING_HEADER = "VoiceInk/Features/Meetings/Capture/VoiceInk-Bridging-Header.h";
+```
+
+Landed once, here, deliberately: had this been left for Stage 1, at least two of the four
+parallel clusters (capture core, mic+route — both call into `installTap`) would likely have
+needed the same setting independently, which is exactly the kind of `project.pbxproj`
+collision this Stage-0 pass exists to avoid. `VoiceInk-Bridging-Header.h` itself is a new
+fork-owned file (not from the donor), and only `#import`s the ported `AudioGraphExceptionBridge.h`.
+No other upstream file was touched — new files under `VoiceInk/Features/Meetings/` and
+`Tests/VoiceInkTests/Features/Meetings/` join their targets automatically
+(`PBXFileSystemSynchronizedRootGroup`, confirmed for both `VoiceInk` and `VoiceInkTests`
+before this stage began).
+
+### Known gap: `MeetingPromptStateMachine.swift` NOT ported
+
+Task scope named this as one of four "smallest verbatim ports" for `Detection/`. It doesn't
+compile standalone: it references `MeetingCandidate` (id, suppressionID, evidence set),
+defined in the donor's `MeetingCandidateResolver.swift` — 666 lines, a full meeting-detection
+feature (platform enum, evidence enum, resolution logic), not a small shared primitive and not
+in this task's scope. Porting `MeetingPromptStateMachine.swift` alone would either break the
+build or require inventing a placeholder `MeetingCandidate` here that would collide with the
+real one when the Detection cluster later ports `MeetingCandidateResolver.swift` for real.
+Left unported; `VoiceInk/Features/Meetings/Detection/` currently holds only `.gitkeep`.
+Recommendation for whichever Stage-1 cluster owns Detection: port
+`MeetingPromptStateMachine.swift` and `MeetingCandidateResolver.swift` together, verbatim, in
+the same change, under the same non-negotiable porting rules (every comment, every branch).
+
 ## Architecture budget note
 
 The instruction for this project caps ongoing upstream touchpoints (outside the new

@@ -803,9 +803,13 @@ adds `MicVadStream`/`SystemVadStream`, a facade over the (unedited) ported
 `StreamingVadController`, with distinct nominal wrapper types (`RawMicSamples`,
 `RawSystemSamples`) so feeding the wrong stream to the wrong VAD is a compile error. `MicVadStream`
 additionally owns the AEC call itself (`MicEchoCanceller`), so there is no API by which raw mic
-samples can reach the mic VAD un-cancelled. See that
-file's header comment for exactly what is and is not compile-enforced (stream-crossing: yes;
-proving the wrapped samples genuinely passed through AEC: no, documented as a disclosed limit).
+samples can reach the mic VAD un-cancelled: the facade takes raw samples and runs the canceller
+itself, and `AECCleanedMicSamples` is an unforgeable receipt it hands back rather than an input a
+caller constructs. Two earlier designs that instead restricted who could CONSTRUCT that type were
+both defeated (a trapping protocol witness; a cross-file extension initializer assigning an
+internal stored property) -- see that file's header comment for both defeats, and
+`MeetingVadStreamsTests.swift` for the full attack list with each verbatim compiler error. The two
+residual holes are stated there and accepted: passing a no-op canceller, and `unsafeBitCast`.
 `ADAPTER-HANDOVER.md`, alongside it in the same directory, is the self-contained (in-repo, no
 `.tandem/` dependency) handover document for the next stage, covering AEC/VAD wiring, rotation
 inputs/outputs, reconcile-before-format ordering, and diarizer preload/cancellation semantics,

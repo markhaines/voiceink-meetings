@@ -704,11 +704,9 @@ off, corrected after reading the real donor code) shared types in `Models/`:
   construction. Both read and confirmed directly, not assumed.
 
 `MeetingPromptStateMachine.swift` was in scope but is NOT ported — see the dedicated section
-below. Full narrative detail (every donor use-site read, exact commands run for each gate) is
-additionally in the task report at `.tandem/884f6ef6905c4e2aa4e2ca28c34ea629/phase1-foundation.md`,
-but that path is orchestration state, not part of this repository, so nothing above depends on
-it being reachable. This entry covers the one upstream-file touch, against the ~6-touchpoint
-budget the note below sets for Phase 1+.
+below. Every fact needed to understand this stage's changes is above, in this document; this
+entry covers the one upstream-file touch, against the ~6-touchpoint budget the note below sets
+for Phase 1+.
 
 ### 1. `project.pbxproj`: `SWIFT_OBJC_BRIDGING_HEADER` added (VoiceInk target, Debug + Release)
 

@@ -1,7 +1,7 @@
 {
   "_comment": "The reviewed build-time input of this fork. 'graph' binds the WHOLE resolved package graph -- the exact set of pinned packages, each pin's location and revision (a revision is a hash over that package's entire tree), each package's root tree and root Package*.swift blob ids, and sha256 of Package.resolved itself -- so a new package, a moved pin or a changed manifest fails the check no matter how a target is declared inside it. 'components' is additional review evidence: the macro/plugin targets a regex can see, with the note recording what reading them found. Regenerate with scripts/verify-package-trust.sh --update AFTER reading what changed: the diff on this file IS the review record. See FORK-PATCHES.md S6.",
   "graph": {
-    "resolved_sha256": "fbe902c58f68ce07dbf1ed3d6a4f1002897863d5d9673cd8658578d3adc3fb76",
+    "resolved_sha256": "6b08ae10a95d02456b5167978baffd6a94b0f8e77da25def79def99b0582ca57",
     "packages": [
       {
         "identity": "axswift",
@@ -13,6 +13,18 @@
           "Package.swift": "112f472d3456008beb08de2d1df293051fdf0656"
         },
         "version": "0.3.7"
+      },
+      {
+        "identity": "dtln-aec-coreml",
+        "kind": "remoteSourceControl",
+        "location": "https://github.com/MimicScribe/dtln-aec-coreml.git",
+        "revision": "a74105dafdc1cc8e2ef0a991240b669868cf3b63",
+        "tree": "413b606fe57f8e46a16b1a0e22514697f6226527",
+        "manifests": {
+          "Package.swift": "e41c9ef8064ee1cd1ad964e9ce23e1dce05f8f07"
+        },
+        "version": "0.7.0",
+        "note": "Reviewed 2026-09-01 at this revision (tag 0.7.0, one commit before archived HEAD ecb641d). Publisher: MimicScribe (mimicscribe.app), a small commercial outfit publishing its own internal tooling; single-author repo (one person under two git identities). ARCHIVED and UNMAINTAINED: upstream README states \"This repository is archived. The package works as published, but we no longer use or maintain it,\" replaced in production by LocalVQE (Apache-2.0) for reasons that are exactly this project's own alignment/drift problem -- see the Phase 1 AEC de-risk reports. KNOWN STOPGAP: this fork takes the archived DTLN path deliberately for v1 (Apple Voice Processing I/O was tried and rejected first -- ducks other apps' audio 60-80% even at minimum, making meetings inaudible without headphones), with a LocalVQE follow-up tracked separately, not silently deferred. VENDORED BINARY: the DTLNAec512 product this fork links carries ~40MB of prebuilt CoreML weights as .copy() resources (DTLN_AEC_512_Part1/2.mlpackage, 17MB + 23MB) -- pretrained, not source-buildable from this repo, so this review trusts the weights' provenance, not just the ~1100-line Swift wrapper (DTLNAecEchoProcessor.swift). LICENSE: both the wrapper and the underlying breizhn/DTLN-aec model weights (Nils L. Westhausen, 3rd place Microsoft AEC Challenge 2021, via ThirdPartyLicenses/DTLN-aec-LICENSE) are MIT. Note for the record: LICENSE at this pinned tag names the copyright holder as \"Anthropic\" -- an unchanged carry-over present since 0.1.0-beta, not something introduced at this pin -- and is corrected to \"MimicScribe\" in the archive-notice commit one commit later at HEAD (ecb641d, docs-only, not part of this pin). Does not change the MIT terms; flagged so a future reviewer does not mistake it for a new discrepancy. No macro or build-tool plugin target: DTLNAecCoreML/DTLNAec128/256/512 are plain library targets with .copy() resources only, confirmed by reading Package.swift at this revision -- nothing for this package to contribute to the components section below. No runtime download: grep for URLSession/download( across Sources/DTLNAecCoreML/ at this revision returns nothing; all model assets ship inside the SPM resource bundle."
       },
       {
         "identity": "eventsource",

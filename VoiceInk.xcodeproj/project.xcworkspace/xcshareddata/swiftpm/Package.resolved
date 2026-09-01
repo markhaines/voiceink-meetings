@@ -11,6 +11,15 @@
       }
     },
     {
+      "identity" : "dtln-aec-coreml",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/MimicScribe/dtln-aec-coreml.git",
+      "state" : {
+        "revision" : "a74105dafdc1cc8e2ef0a991240b669868cf3b63",
+        "version" : "0.7.0"
+      }
+    },
+    {
       "identity" : "eventsource",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/mattt/EventSource.git",

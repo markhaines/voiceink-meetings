@@ -4,15 +4,17 @@
 # Fails if a built product still carries upstream VoiceInk's identity. Two things must hold:
 #
 #   1. CFBundleIdentifier is this fork's bundle id, not upstream's.
-#   2. Nothing in the bundle points at upstream's Sparkle appcast host. If it did, the fork
-#      could auto-update itself into upstream's build -- silently replacing the de-licensed,
-#      re-signed fork with the original app.
+#   2. Nothing in the bundle points at upstream's host. If it did, the fork could auto-update
+#      itself into upstream's build -- silently replacing the de-licensed, re-signed fork with
+#      the original app -- or pull remote content upstream controls. Both existed here: the
+#      Sparkle feed in Info.plist, and AnnouncementsService's remote-config fetch, which was
+#      compiled into the executable and which only the bundle-wide scan caught.
 #
 # The feed check is deliberately a HOST-level substring match, not an exact-URL match: a
 # near-miss such as ".../VoiceInk/appcast-v2.xml" on the same host is just as dangerous, and
 # an exact-string comparison would wave it through.
 #
-# Env: EXPECTED_BUNDLE_ID, FORBIDDEN_SPARKLE_FEED_HOST (both required).
+# Env: EXPECTED_BUNDLE_ID, FORBIDDEN_UPSTREAM_HOST (both required).
 # Exits 0 when the product is clean, 1 otherwise. CI runs this against the real build AND
 # against fabricated negative controls, so the assertion itself is verified every run.
 
@@ -24,7 +26,7 @@ if [ -z "$app_path" ]; then
   exit 2
 fi
 : "${EXPECTED_BUNDLE_ID:?EXPECTED_BUNDLE_ID must be set}"
-: "${FORBIDDEN_SPARKLE_FEED_HOST:?FORBIDDEN_SPARKLE_FEED_HOST must be set}"
+: "${FORBIDDEN_UPSTREAM_HOST:?FORBIDDEN_UPSTREAM_HOST must be set}"
 
 info_plist="$app_path/Contents/Info.plist"
 if [ ! -f "$info_plist" ]; then
@@ -41,18 +43,18 @@ fi
 
 feed_url="$(/usr/libexec/PlistBuddy -c 'Print :SUFeedURL' "$info_plist" 2>/dev/null || true)"
 echo "  SUFeedURL:        ${feed_url:-<none>}"
-if [ -n "$feed_url" ] && printf '%s' "$feed_url" | grep -qiF "$FORBIDDEN_SPARKLE_FEED_HOST"; then
-  echo "error: SUFeedURL '$feed_url' points at upstream's appcast host '$FORBIDDEN_SPARKLE_FEED_HOST'" >&2
+if [ -n "$feed_url" ] && printf '%s' "$feed_url" | grep -qiF "$FORBIDDEN_UPSTREAM_HOST"; then
+  echo "error: SUFeedURL '$feed_url' points at upstream's appcast host '$FORBIDDEN_UPSTREAM_HOST'" >&2
   exit 1
 fi
 
 # Belt and braces: the URL could also be hardcoded in the executable or a nested bundle
 # (XPC service, framework) rather than the top-level Info.plist. -a so binaries are scanned.
-if grep -rqaiF "$FORBIDDEN_SPARKLE_FEED_HOST" "$app_path" 2>/dev/null; then
-  echo "error: upstream appcast host '$FORBIDDEN_SPARKLE_FEED_HOST' is referenced inside $app_path:" >&2
-  grep -rlaiF "$FORBIDDEN_SPARKLE_FEED_HOST" "$app_path" 2>/dev/null | sed 's/^/    /' >&2 || true
+if grep -rqaiF "$FORBIDDEN_UPSTREAM_HOST" "$app_path" 2>/dev/null; then
+  echo "error: upstream appcast host '$FORBIDDEN_UPSTREAM_HOST' is referenced inside $app_path:" >&2
+  grep -rlaiF "$FORBIDDEN_UPSTREAM_HOST" "$app_path" 2>/dev/null | sed 's/^/    /' >&2 || true
   exit 1
 fi
-echo "  bundle scan:      no reference to $FORBIDDEN_SPARKLE_FEED_HOST"
+echo "  bundle scan:      no reference to $FORBIDDEN_UPSTREAM_HOST"
 
 echo "OK: fork identity clean"

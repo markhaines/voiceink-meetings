@@ -49,6 +49,44 @@ silently — Sparkle handles a missing feed URL as an error, not a crash — but
 fork gets its own Sparkle keys/appcast) should decide whether to default this off instead until
 a real feed exists.
 
+### 2b. Upstream remote-config channel removed (`AnnouncementsService`)
+
+Found by the hardened CI guard, not by inspection — and worth recording because the original
+Phase 0 pass reported *"No feed URL anywhere in the repo now — confirmed by a full-repo grep
+after the edit"*. That grep looked for the **appcast URL**. It did not look for the **host**,
+and so it missed this:
+
+```swift
+// VoiceInk/Infrastructure/RemoteConfig/AnnouncementsService.swift:13
+private let announcementsURL = URL(string: "https://beingpax.github.io/VoiceInk/announcements.json")!
+```
+
+The Sparkle feed was not the only thing pointing at upstream. `AnnouncementsService` polled
+upstream's GitHub Pages site **every 4 hours, starting 5 seconds after launch**, with
+`enableAnnouncements` registered as `true` by default (`AppDefaults.swift`). It decoded whatever
+JSON it got and displayed it as a floating in-app banner with a "Learn More" button that opens
+an **arbitrary upstream-supplied URL** (`AnnouncementManager.showAnnouncement`). So a fork built
+from this tree would phone home to upstream on every launch and render upstream-controlled
+content, with a clickable link, inside Mark's app.
+
+That is the same class of problem as the Sparkle feed — an upstream-controlled channel into a
+fork that is supposed to be independent — so it gets the same treatment as the licensing code:
+removed, not disabled. Deleted `Infrastructure/RemoteConfig/AnnouncementsService.swift`,
+`App/Notifications/AnnouncementManager.swift` and `App/Notifications/Views/AnnouncementView.swift`
+(the manager and view had no other callers), plus the `start()`/`stop()` wiring in
+`App/VoiceInk.swift`, the `enableAnnouncements` default in `App/Configuration/AppDefaults.swift`,
+and the "Show Announcements" toggle in `Features/Settings/Views/SettingsView.swift`.
+
+The general lesson, now encoded in the guard: **check the host, and check the built product, not
+the source.** This string was compiled into `Contents/MacOS/VoiceInk`, so only a scan of the
+built bundle (`grep -a`, binaries included) would have caught it. CI run **33486598551** did,
+failing with:
+
+```
+error: upstream appcast host 'beingpax.github.io' is referenced inside /Users/runner/Downloads/VoiceInk.app:
+    /Users/runner/Downloads/VoiceInk.app/Contents/MacOS/VoiceInk
+```
+
 ### 3. Code signing identity stripped
 
 - `DEVELOPMENT_TEAM = V6J6A3VWY2;` → `DEVELOPMENT_TEAM = "";` in all 4 build configurations in

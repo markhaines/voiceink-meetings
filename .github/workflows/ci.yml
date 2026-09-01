@@ -12,9 +12,11 @@ concurrency:
 
 env:
   EXPECTED_BUNDLE_ID: com.hainesy.VoiceInkMeetings
-  # Host, not a full URL: any appcast on upstream's host is disqualifying, including a
-  # renamed one. scripts/assert-fork-identity.sh does a host-level substring match.
-  FORBIDDEN_SPARKLE_FEED_HOST: beingpax.github.io
+  # Host, not a full URL. Two reasons: a renamed appcast on the same host is just as
+  # disqualifying as the exact one, and the Sparkle feed is not the only thing that pointed
+  # here -- AnnouncementsService fetched remote config from this host too (now removed).
+  # scripts/assert-fork-identity.sh does a host-level substring match over the whole bundle.
+  FORBIDDEN_UPSTREAM_HOST: beingpax.github.io
 
 jobs:
   build-and-test:
@@ -139,11 +141,11 @@ jobs:
           scripts/assert-fork-identity.sh "$tmp/Clean.app" >/dev/null
           echo "  accepted as expected: clean bundle"
 
-          mk "$tmp/Exact.app"    "$EXPECTED_BUNDLE_ID" "https://$FORBIDDEN_SPARKLE_FEED_HOST/VoiceInk/appcast.xml"
+          mk "$tmp/Exact.app"    "$EXPECTED_BUNDLE_ID" "https://$FORBIDDEN_UPSTREAM_HOST/VoiceInk/appcast.xml"
           must_reject "$tmp/Exact.app" "upstream appcast URL"
 
           # The near-miss an exact-string comparison would have waved through.
-          mk "$tmp/NearMiss.app" "$EXPECTED_BUNDLE_ID" "https://$FORBIDDEN_SPARKLE_FEED_HOST/VoiceInk/appcast-v2.xml"
+          mk "$tmp/NearMiss.app" "$EXPECTED_BUNDLE_ID" "https://$FORBIDDEN_UPSTREAM_HOST/VoiceInk/appcast-v2.xml"
           must_reject "$tmp/NearMiss.app" "renamed appcast on upstream's host"
 
           mk "$tmp/UpstreamId.app" "com.prakashjoshipax.VoiceInk"
@@ -152,7 +154,7 @@ jobs:
           # Feed URL hidden outside the top-level Info.plist.
           mk "$tmp/Nested.app" "$EXPECTED_BUNDLE_ID"
           mkdir -p "$tmp/Nested.app/Contents/Resources"
-          printf 'feed=https://%s/VoiceInk/appcast.xml\n' "$FORBIDDEN_SPARKLE_FEED_HOST" \
+          printf 'feed=https://%s/VoiceInk/appcast.xml\n' "$FORBIDDEN_UPSTREAM_HOST" \
             > "$tmp/Nested.app/Contents/Resources/config.dat"
           must_reject "$tmp/Nested.app" "upstream host referenced in a nested resource"
 

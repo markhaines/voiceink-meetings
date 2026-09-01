@@ -87,19 +87,22 @@ jobs:
         run: test -d "$HOME/VoiceInk-Dependencies/whisper.cpp/build-apple/whisper.xcframework"
 
       - name: Build VoiceInk (unsigned local build)
-        # -skipMacroValidation: mlx-swift-lm ships the MLXHuggingFaceMacros Swift macro, and
-        # Xcode gates first use of a package macro behind an interactive "Trust & Enable"
-        # dialog that a headless runner cannot answer -- CI run 33442033271 failed with
-        # `Macro "MLXHuggingFaceMacros" from package "mlx-swift-lm" must be enabled before it
-        # can be used`. This is the minimum flag that clears it; -skipPackagePluginValidation
-        # was dropped after CI showed it is not needed. See FORK-PATCHES.md.
+        # Both validation-skip flags are required, and each was proven separately against CI
+        # rather than assumed -- Xcode gates first use of a package macro or build-tool plugin
+        # behind an interactive "Trust & Enable" dialog a headless runner cannot answer:
+        #   -skipMacroValidation         run 33442033271 (neither flag):
+        #     `Macro "MLXHuggingFaceMacros" from package "mlx-swift-lm" must be enabled
+        #      before it can be used`
+        #   -skipPackagePluginValidation run 33486090430 (macro flag only):
+        #     `Validate plug-in "CudaBuild" in package "mlx-swift"` -> ** BUILD FAILED **
+        # Dropping either one breaks the build. See FORK-PATCHES.md for the trust rationale.
         # -onlyUsePackageVersionsFromResolvedFile: a from-scratch resolve on a fresh checkout
         # was picking the FLOOR of a transitive dependency's version range (mlx-swift 0.31.4)
         # instead of the version locked in Package.resolved (0.31.6), which is missing an API
         # mlx-swift-lm needs.
         run: >
           make local
-          LOCAL_XCODEBUILD_FLAGS="-skipMacroValidation -onlyUsePackageVersionsFromResolvedFile"
+          LOCAL_XCODEBUILD_FLAGS="-skipMacroValidation -skipPackagePluginValidation -onlyUsePackageVersionsFromResolvedFile"
 
       - name: Locate built app
         id: app
@@ -190,6 +193,7 @@ jobs:
             CODE_SIGN_ENTITLEMENTS="$(pwd)/VoiceInk/VoiceInk.local.entitlements" \
             SWIFT_ACTIVE_COMPILATION_CONDITIONS='$(inherited) LOCAL_BUILD' \
             -skipMacroValidation \
+            -skipPackagePluginValidation \
             -onlyUsePackageVersionsFromResolvedFile
 
       - name: Zip built app artifact

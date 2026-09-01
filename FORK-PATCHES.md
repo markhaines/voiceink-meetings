@@ -181,9 +181,11 @@ that makes the fork buildable without a human clicking through Xcode dialogs:
   **default** — which happens to be the exact same build this Mac's local toolchain now runs
   (also 26.6/17F113, Swift 6.3.3), confirmed by comparing `xcodebuild -version` output on both.
   So CI and local aren't just "same major generation" any more, they're the same Xcode build.
-- **`-skipMacroValidation`** (passed to both `xcodebuild` invocations, and to `make local` via
-  the new `LOCAL_XCODEBUILD_FLAGS` Makefile variable): **a security-relevant weakening, kept
-  deliberately, narrowed to the minimum, and justified here.**
+- **`-skipMacroValidation -skipPackagePluginValidation`** (passed to both `xcodebuild`
+  invocations, and to `make local` via the new `LOCAL_XCODEBUILD_FLAGS` Makefile variable):
+  **a security-relevant weakening, kept deliberately, tested down to the minimum set, and
+  justified here.** Both flags are required; each was proven necessary by a separate CI run
+  rather than assumed.
 
   *What breaks without it.* `mlx-swift-lm` ships a Swift macro target, `MLXHuggingFaceMacros`.
   Xcode gates the first use of any package macro behind a one-time interactive "Trust & Enable"
@@ -204,15 +206,22 @@ that makes the fork buildable without a human clicking through Xcode dialogs:
   and has been removed. It is worth naming plainly: that commit weakened a security-adjacent
   setting *and did not even achieve the thing it was added for*.
 
-  *Narrowed to one flag.* Commit `f38bdc3` used **two** flags, `-skipMacroValidation` **and**
-  `-skipPackagePluginValidation`. Only the first is needed: the reproduced error names a macro
-  target, not a build-tool plugin, and this dependency graph runs no build-tool plugins.
-  `-skipPackagePluginValidation` was therefore dropped, and CI confirms the build and tests
-  still pass without it. The remaining flag is Apple's own documented `xcodebuild` option for
-  exactly this case; its help text is explicit that it "can be a security risk if they are not
+  *Both flags tested individually; both are required.* Commit `f38bdc3` added the two flags
+  together, which left it unproven whether both were actually needed — exactly the kind of
+  untested blanket weakening that should not survive a review. So the narrower set was tried:
+  CI run **33486090430** kept `-skipMacroValidation` and dropped `-skipPackagePluginValidation`,
+  and the build failed at a different gate:
+
+  > `Validate plug-in “CudaBuild” in package “mlx-swift”` → `** BUILD FAILED **`
+
+  `mlx-swift` ships a build-tool plugin (`CudaBuild`) in addition to `mlx-swift-lm`'s macro, and
+  each flag clears its own gate: neither substitutes for the other, and dropping either one
+  breaks the build. The minimum working set is therefore both flags, now established
+  empirically rather than by assumption. They are Apple's own documented `xcodebuild` options
+  for this case; the help text is explicit that this "can be a security risk if they are not
   from trusted sources".
 
-  *Why it is an acceptable risk here.* The flag skips a **fingerprint/consent prompt**, not a
+  *Why it is an acceptable risk here.* The flags skip a **fingerprint/consent prompt**, not a
   signature or integrity check, and it changes nothing about *which* code is fetched. What code
   runs is decided by `Package.resolved`, which pins every dependency to an exact commit hash,
   and by `-onlyUsePackageVersionsFromResolvedFile`, which forbids `xcodebuild` from resolving to

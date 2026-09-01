@@ -1,15 +1,28 @@
 // Ported verbatim from Muesli-HQ/muesli (native/MuesliNative/Sources/MuesliNativeApp/DiarizerRuntimePolicy.swift),
 // WITH ONE FLAGGED DEVIATION, called out again at its exact location below: this fork has no
 // TelemetryDeck dependency (grep of Package.resolved / project.pbxproj confirms it — VoiceInk
-// has no telemetry system at all yet), so `import TelemetryDeck` is dropped and the default
-// `signalSink` argument of `DiarizerPreloadDiagnostics.init` — the only line in this file that
-// referenced TelemetryDeck — is replaced with a no-op closure instead of silently failing to
-// compile. This is a disclosed, isolated substitution, not a silent drop: every call site in
-// the ported test suite already injects its own explicit `signalSink`, so no test behavior
-// depends on the default. Adding TelemetryDeck as a real dependency would mean editing
-// project.pbxproj and the package-trust file, both out of scope/owned elsewhere this round —
-// see the Stage-1 vad-chunking report for the full writeup. Everything else, including every
-// comment and the M1/macOS-15.1 GPU-avoidance branch, is byte-for-byte identical to the donor.
+// has no telemetry system at all yet), so `import TelemetryDeck` is dropped.
+//
+// The donor's `DiarizerPreloadDiagnostics.init` (donor lines 176-186) defaults `signalSink` to:
+//   signalSink: @escaping SignalSink = { event, parameters in
+//       TelemetryDeck.signal(event, parameters: parameters)
+//   }
+// That default cannot be ported verbatim — TelemetryDeck is out of scope this round (adding it
+// would mean editing project.pbxproj and the package-trust file, both owned elsewhere). A prior
+// round of this fork replaced it with a no-op closure; independent review correctly flagged that
+// as an unacceptable silent behavior change — every production caller that relies on the default
+// (i.e. every caller, since none of them pass an explicit sink) would lose every preload
+// started/ready/failed/interrupted diagnostic with nothing to show it was ever dropped. Per that
+// review's required fix, `signalSink` stays defaulted (matching the donor's own signature, so no
+// call site is forced to change) but the default now emits through this fork's existing
+// `os.Logger` facility instead of TelemetryDeck or nothing — the same
+// `Logger(subsystem: "com.hainesy.voiceinkmeetings", category: ...)` convention used throughout
+// the rest of the app (see e.g. `VoiceInk/App/VoiceInk.swift`). See `defaultSignalLogger` below
+// for the exact substitution. Every call site in the ported test suite still supplies its own
+// `signalSink`, so this default is only ever exercised by production code that hasn't been given
+// one. Recorded in FORK-PATCHES.md's `phase-1-vad-chunking` section as well. Everything else,
+// including every comment and the M1/macOS-15.1 GPU-avoidance branch, is byte-for-byte identical
+// to the donor.
 //
 // MIT License
 //
@@ -39,6 +52,7 @@ import CoreML
 import Darwin
 import FluidAudio
 import Foundation
+import os
 
 enum DiarizerComputePolicy: String, Sendable, Equatable {
     case all
@@ -205,6 +219,21 @@ struct DiarizerPreloadDiagnostics {
 
     static let pendingAttemptKey = "diarizerPreload.pendingAttempt.v1"
 
+    // FLAGGED DEVIATION from the donor (see file-header note): stands in for
+    // `TelemetryDeck.signal(event, parameters: parameters)` (donor lines 179-181), which this
+    // fork cannot call — no TelemetryDeck dependency. Logs at `.default` level so preload
+    // diagnostics remain visible in Console.app / `log stream --predicate 'subsystem ==
+    // "com.hainesy.voiceinkmeetings"'` rather than vanishing, until a real telemetry backend
+    // replaces this default. Interpolated with `privacy: .public` because event names and
+    // parameter values here are all from the fixed, privacy-safe allowlist
+    // `DiarizerPreloadContext.telemetryParameters` documents (schema_version/trigger/
+    // compute_policy/compatibility_rule/cache_state/model_set/fluid_audio_version/
+    // duration_bucket/failure_category) — never raw error text or user data.
+    private static let defaultSignalLogger = Logger(
+        subsystem: "com.hainesy.voiceinkmeetings",
+        category: "DiarizerPreloadDiagnostics"
+    )
+
     private let defaults: UserDefaults
     private let now: () -> Date
     private let signalSink: SignalSink
@@ -214,9 +243,12 @@ struct DiarizerPreloadDiagnostics {
         now: @escaping () -> Date = Date.init,
         // FLAGGED DEVIATION from the donor (see file-header note): the donor's default here is
         // `{ event, parameters in TelemetryDeck.signal(event, parameters: parameters) }`. This
-        // fork has no TelemetryDeck dependency yet, so the default is a no-op until a telemetry
-        // backend is wired up; every caller in the ported test suite supplies its own sink.
-        signalSink: @escaping SignalSink = { _, _ in }
+        // fork has no TelemetryDeck dependency yet, so the default logs through
+        // `defaultSignalLogger` instead — a real, observable emission, never a no-op. Every
+        // caller in the ported test suite supplies its own sink.
+        signalSink: @escaping SignalSink = { event, parameters in
+            Self.defaultSignalLogger.log("\(event, privacy: .public) \(String(describing: parameters), privacy: .public)")
+        }
     ) {
         self.defaults = defaults
         self.now = now

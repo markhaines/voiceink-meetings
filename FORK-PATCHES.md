@@ -747,6 +747,68 @@ Recommendation for whichever Stage-1 cluster owns Detection: port
 `MeetingPromptStateMachine.swift` and `MeetingCandidateResolver.swift` together, verbatim, in
 the same change, under the same non-negotiable porting rules (every comment, every branch).
 
+## phase-1-vad-chunking (Stage 1: VAD chunking and transcript assembly)
+
+Ported verbatim into `VoiceInk/Features/Meetings/Transcription/`:
+`StreamingVadController.swift` (donor 225 lines, byte-identical), `TranscriptFormatter.swift`
+(donor 226, only `import MuesliCore` dropped), `TranscriptReconciler.swift` (donor 321, same),
+and `DiarizerRuntimePolicy.swift` (donor 306, one flagged deviation below). This section exists
+even though these files live entirely under `Features/Meetings/` — normally exempt per this
+file's header — because an independent review round required the one deviation below to be
+recorded here explicitly, not just in the file's own header comment.
+
+### `DiarizerRuntimePolicy.swift`: `DiarizerPreloadDiagnostics`'s default `signalSink`
+
+The donor's `DiarizerPreloadDiagnostics.init` (donor `DiarizerRuntimePolicy.swift:176-186`)
+defaults `signalSink` to:
+
+```swift
+signalSink: @escaping SignalSink = { event, parameters in
+    TelemetryDeck.signal(event, parameters: parameters)
+}
+```
+
+This fork has no `TelemetryDeck` dependency (confirmed by grepping `Package.resolved` and
+`project.pbxproj` — 28 pinned packages, none of them TelemetryDeck; VoiceInk has no telemetry
+system at all yet), and adding one is out of scope for this stage: it would mean editing
+`project.pbxproj` (forbidden for this cluster) and `package-trust.json` (owned by a different
+concurrent change). The verbatim default cannot compile as-is.
+
+**First attempt (reverted): a no-op default.** An earlier pass of this file replaced the default
+with `{ _, _ in }`. Independent cross-vendor review correctly flagged this as an unacceptable
+silent behavior change: every production caller that relies on the default (which is every real
+caller — none inject an explicit sink) would silently lose every preload
+started/ready/failed/interrupted diagnostic, with nothing anywhere signaling that anything had
+been dropped. A silent no-op default is not acceptable in any form, per that review.
+
+**Fix applied.** `signalSink` stays a defaulted parameter — same shape as the donor, so no call
+site is forced to change — but the default now logs through this fork's existing `os.Logger`
+facility (`Logger(subsystem: "com.hainesy.voiceinkmeetings", category: "DiarizerPreloadDiagnostics")`,
+the same convention used throughout the rest of the app, e.g. `VoiceInk/App/VoiceInk.swift`)
+instead of calling `TelemetryDeck.signal` or doing nothing. Preload diagnostics remain observable
+in Console.app / `log stream` until a real telemetry backend replaces this default. Every call
+site in the ported test suite (`DiarizerRuntimePolicyTests.swift`) already supplies its own
+explicit `signalSink`, so this default is only ever exercised by production code that hasn't been
+given one — no test behavior depends on it. Everything else in the file, including every comment
+and the M1/macOS-15.1 GPU-avoidance branch (FluidAudio issue #344), remains byte-for-byte
+identical to the donor.
+
+### `MeetingVadStreams.swift` and `ADAPTER-HANDOVER.md`: new fork-owned files, not ports
+
+Added in the same review round, for a different finding: `StreamingVadController.processAudio(_:)`
+takes an untyped `[Float]`, so nothing in this cluster's own code enforced the donor's
+AEC-cleaned-mic-only / raw-system-only split (`MeetingSession.swift:1226-1233` and
+`:1257-1262`) once a later adapter stage started wiring real audio in. `MeetingVadStreams.swift`
+adds `MicVadStream`/`SystemVadStream`, a thin facade over the (unedited) ported
+`StreamingVadController`, with distinct nominal wrapper types (`AECCleanedMicSamples`,
+`RawSystemSamples`) so feeding the wrong stream to the wrong VAD is a compile error. See that
+file's header comment for exactly what is and is not compile-enforced (stream-crossing: yes;
+proving the wrapped samples genuinely passed through AEC: no, documented as a disclosed limit).
+`ADAPTER-HANDOVER.md`, alongside it in the same directory, is the self-contained (in-repo, no
+`.tandem/` dependency) handover document for the next stage, covering AEC/VAD wiring, rotation
+inputs/outputs, reconcile-before-format ordering, and diarizer preload/cancellation semantics,
+all cited against donor file/line references.
+
 ## Architecture budget note
 
 The instruction for this project caps ongoing upstream touchpoints (outside the new

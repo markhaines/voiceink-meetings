@@ -273,9 +273,38 @@ final class MeetingNeuralAec {
         // nothing to cancel, so running it wastes Neural Engine time and risks
         // over-suppressing an already-clean signal. Bypass to a passthrough, same as the
         // unloaded-processor path above.
+        //
+        // Bypassed samples never enter pendingMicSamples, but they still occupy real space
+        // on the mic timeline that pendingMicStartSample tracks in absolute samples, never
+        // wall clock. Two invariants keep that timeline truthful across a bypass span:
+        //   - On the call where bypass is entered, any frame still sitting in
+        //     pendingMicSamples is drained now, while pendingMicStartSample is still valid,
+        //     rather than left dangling to collide with post-bypass audio later (that
+        //     collision is exactly what produced misaligned echo cancellation and wrong
+        //     downstream timestamps/speaker attribution before this fix). Draining -- not
+        //     discarding -- is correct here: this fragment is still pre-bypass audio with a
+        //     real, currently-valid system reference, so it can get genuine cancellation
+        //     via the same zero-padded flush path flushStreamingMic() uses, instead of being
+        //     silently dropped from the output.
+        //   - On every bypassed call (draining one or not), pendingMicStartSample advances
+        //     by the raw sample count, exactly as if those samples had been queued and
+        //     consumed. pendingMicSamples stays empty throughout, so trimHistoryBuffersIfNeeded()
+        //     already trims system history freely during a bypass span (oldestNeededForAec
+        //     collapses to systemSamplesReceived when nothing is queued -- unchanged,
+        //     pre-existing behavior). When bypass ends, pendingMicStartSample is caught up
+        //     to the true elapsed position, so the first post-bypass frame lands at the
+        //     correct absolute offset and looks up the correct system reference -- no
+        //     separate "on leaving bypass" step is needed beyond keeping this invariant true
+        //     throughout.
         guard !shouldBypassForRoute else {
+            var output: [Float] = []
+            if !pendingMicSamples.isEmpty {
+                output = processQueuedFrames(processor: processor, flush: true)
+            }
+            pendingMicStartSample += micSamples.count
             trimHistoryBuffersIfNeeded()
-            return micSamples
+            output.append(contentsOf: micSamples)
+            return output
         }
 
         pendingMicSamples.append(contentsOf: micSamples)

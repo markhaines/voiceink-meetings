@@ -16,8 +16,10 @@
 #
 # What must hold:
 #
-#   1. The app's CFBundleIdentifier is this fork's, and every NESTED bundle (the XPC
-#      service, plugins, embedded frameworks) is under the fork's identifier too.
+#   1. The app's CFBundleIdentifier is this fork's, and so is every bundle the fork itself
+#      ships inside it -- the XPC service. (Embedded third-party frameworks legitimately
+#      carry their vendor's identifier, e.g. org.sparkle-project.Sparkle, so they are held
+#      to the weaker rule that they must not carry UPSTREAM's identifier: rule 5.)
 #   2. Nothing anywhere in the bundle references upstream's host. If it did, the fork could
 #      auto-update itself into upstream's build -- silently replacing the de-licensed,
 #      re-signed fork with the original app -- or pull remote content upstream controls.
@@ -109,9 +111,11 @@ assert_product() {
     fail "SUFeedURL '$feed_url' points at upstream's host '$FORBIDDEN_UPSTREAM_HOST'"
   fi
 
-  # Every nested bundle -- XPC services, plugins, embedded frameworks -- must be under the
-  # fork's identifier. The XPC service ships inside the app and is signed with it, so an
-  # upstream id there is exactly as bad as one at the top level.
+  # Bundles the fork itself ships inside the app -- the XPC service -- must be under the
+  # fork's identifier. The XPC service is signed with the app, so an upstream id there is
+  # exactly as bad as one at the top level. Embedded third-party frameworks are deliberately
+  # NOT held to this rule: org.sparkle-project.Sparkle is correct and must stay. They are
+  # covered instead by the bundle-wide upstream-identifier scan below.
   local nested count=0
   while IFS= read -r nested; do
     [ -n "$nested" ] || continue
@@ -119,15 +123,14 @@ assert_product() {
     nested_id="$(plist_value "$nested" CFBundleIdentifier)"
     [ -n "$nested_id" ] || continue
     count=$((count + 1))
-    echo "  nested bundle:    $nested_id"
+    echo "  XPC service:      $nested_id"
     case "$nested_id" in
-      "$EXPECTED_BUNDLE_ID"|"$EXPECTED_BUNDLE_ID".*) ;;
-      *) fail "nested bundle id '$nested_id' ($nested) is not under '$EXPECTED_BUNDLE_ID'" ;;
+      "$EXPECTED_BUNDLE_ID"*) ;;
+      *) fail "XPC service bundle id '$nested_id' ($nested) is not in the fork's namespace '$EXPECTED_BUNDLE_ID'" ;;
     esac
-  done < <(find "$app_path/Contents" \
-             \( -path '*/XPCServices/*' -o -path '*/PlugIns/*' -o -path '*/Frameworks/*' \) \
-             -name Info.plist -maxdepth 4 2>/dev/null || true)
-  echo "  nested bundles checked: $count"
+  done < <(find "$app_path/Contents" -path '*/XPCServices/*' \
+             -name Info.plist -maxdepth 5 2>/dev/null || true)
+  echo "  XPC services checked: $count"
 
   scan "upstream host"          "$FORBIDDEN_UPSTREAM_HOST"            "$app_path" || true
   scan "upstream bundle id"     "$FORBIDDEN_UPSTREAM_BUNDLE_PREFIX"   "$app_path" || true
@@ -149,9 +152,13 @@ assert_project() {
     [ -n "$id" ] || continue
     count=$((count + 1))
     echo "  product id:       $id"
+    # Prefix match, not an exact-or-dotted match: the test bundles are named
+    # com.hainesy.VoiceInkMeetingsTests / ...UITests, mirroring upstream's own shape, so a
+    # dot is not always the separator. What matters is that the id is in the fork's
+    # namespace and not upstream's.
     case "$id" in
-      "$EXPECTED_BUNDLE_ID"|"$EXPECTED_BUNDLE_ID".*) ;;
-      *) fail "PRODUCT_BUNDLE_IDENTIFIER '$id' is not under '$EXPECTED_BUNDLE_ID'" ;;
+      "$EXPECTED_BUNDLE_ID"*) ;;
+      *) fail "PRODUCT_BUNDLE_IDENTIFIER '$id' is not in the fork's namespace '$EXPECTED_BUNDLE_ID'" ;;
     esac
   done <<< "$ids"
   [ "$count" -gt 0 ] || fail "no PRODUCT_BUNDLE_IDENTIFIER found in $pbxproj -- the check would be vacuous"

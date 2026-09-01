@@ -2,9 +2,15 @@
 DEPS_DIR := $(HOME)/VoiceInk-Dependencies
 WHISPER_CPP_DIR := $(DEPS_DIR)/whisper.cpp
 FRAMEWORK_PATH := $(WHISPER_CPP_DIR)/build-apple/whisper.xcframework
+# Pinned whisper.cpp revision (see whisper-cpp.rev). Comments and blanks stripped so the
+# file can carry the reasoning next to the sha; CI keys its cache off the same value.
+WHISPER_CPP_REV := $(shell grep -v '^[[:space:]]*\#' $(CURDIR)/whisper-cpp.rev | tr -d '[:space:]')
 LOCAL_DERIVED_DATA := $(CURDIR)/.local-build
 LOCAL_CODESIGN_IDENTITY ?=
 RUN_APP_NAME ?= VoiceInk
+# Extra xcodebuild flags for `make local`, e.g. non-interactive CI passing
+# -skipPackagePluginValidation -skipMacroValidation (no GUI to click "Trust & Enable" on).
+LOCAL_XCODEBUILD_FLAGS ?=
 
 .PHONY: all clean whisper setup build local check healthcheck help dev run release release-setup
 
@@ -28,14 +34,16 @@ healthcheck: check
 # Build process
 whisper:
 	@mkdir -p $(DEPS_DIR)
+	@if [ -z "$(WHISPER_CPP_REV)" ]; then echo "whisper-cpp.rev is empty"; exit 1; fi
 	@if [ ! -d "$(FRAMEWORK_PATH)" ]; then \
-		echo "Building whisper.xcframework in $(DEPS_DIR)..."; \
+		echo "Building whisper.xcframework at $(WHISPER_CPP_REV) in $(DEPS_DIR)..."; \
 		if [ ! -d "$(WHISPER_CPP_DIR)" ]; then \
 			git clone https://github.com/ggerganov/whisper.cpp.git $(WHISPER_CPP_DIR); \
-		else \
-			(cd $(WHISPER_CPP_DIR) && git pull); \
 		fi; \
-		cd $(WHISPER_CPP_DIR) && ./build-xcframework.sh; \
+		cd $(WHISPER_CPP_DIR) && git fetch --quiet origin $(WHISPER_CPP_REV) \
+			&& git -c advice.detachedHead=false checkout --quiet --force $(WHISPER_CPP_REV) \
+			&& git clean -qfdx -e build-apple \
+			&& ./build-xcframework.sh; \
 	else \
 		echo "whisper.xcframework already built in $(DEPS_DIR), skipping build"; \
 	fi
@@ -78,6 +86,7 @@ local: check setup
 		DEVELOPMENT_TEAM="" \
 		CODE_SIGN_ENTITLEMENTS="$(CURDIR)/VoiceInk/VoiceInk.local.entitlements" \
 		SWIFT_ACTIVE_COMPILATION_CONDITIONS='$$(inherited) LOCAL_BUILD' \
+		$(LOCAL_XCODEBUILD_FLAGS) \
 		build
 	@APP_PATH="$(LOCAL_DERIVED_DATA)/Build/Products/Release/VoiceInk.app" && \
 	if [ -d "$$APP_PATH" ]; then \

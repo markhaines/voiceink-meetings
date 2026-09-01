@@ -73,7 +73,7 @@ class WhisperModelManager: ObservableObject {
     /// TranscriptionModelManager can rebuild allAvailableModels.
     var onModelsChanged: (() -> Void)?
 
-    let logger = Logger(subsystem: "com.prakashjoshipax.voiceink", category: "WhisperModelManager")
+    let logger = Logger(subsystem: "com.hainesy.voiceinkmeetings", category: "WhisperModelManager")
 
     init(modelsDirectory: URL) {
         self.modelsDirectory = modelsDirectory

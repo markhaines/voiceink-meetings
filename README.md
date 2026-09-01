@@ -20,6 +20,16 @@
 
 ---
 
+> **This is `markhaines/voiceink-meetings`, a personal fork of [Beingpax/VoiceInk](https://github.com/Beingpax/VoiceInk).**
+> It is not affiliated with, endorsed by, or supported by the original VoiceInk project or its author.
+> The fork exists to add local meeting capture (ported from [Muesli-HQ/muesli](https://github.com/Muesli-HQ/muesli))
+> on top of VoiceInk's dictation engine, with the app's own licensing/paywall removed and its own bundle
+> identity (`com.hainesy.VoiceInkMeetings`) so it can never auto-update into or be mistaken for an upstream
+> build. See `FORK-PATCHES.md` for the full log of changes made to upstream-owned files, and `NOTICE` for
+> third-party attribution. For the original app, go to [tryvoiceink.com](https://tryvoiceink.com).
+
+---
+
 VoiceInk is a native macOS application that transcribes what you say to text almost instantly. You can find all the information and download the app from [here](https://tryvoiceink.com). 
 
 ![VoiceInk Mac App](https://github.com/user-attachments/assets/12367379-83e7-48a6-b52c-4488a6a04bba)

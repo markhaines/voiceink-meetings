@@ -2,7 +2,6 @@ import Foundation
 
 #if arch(arm64)
     import MLX
-    import MLXHuggingFace
     import MLXLLM
     import MLXLMCommon
     import Tokenizers
@@ -216,7 +215,7 @@ actor VoiceInkRefineInferenceEngine {
 
             let loadedContainer = try await loadModelContainer(
                 from: modelDirectory,
-                using: #huggingFaceTokenizerLoader()
+                using: HuggingFaceTokenizerLoader()
             )
             try Task.checkCancellation()
 

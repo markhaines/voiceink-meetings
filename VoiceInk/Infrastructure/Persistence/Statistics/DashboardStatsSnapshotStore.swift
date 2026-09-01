@@ -36,12 +36,12 @@ final class DashboardStatsSnapshotStore: @unchecked Sendable {
 
     private static let currentVersion = 1
     private static let staleDefaultsKey = "dashboardStatsSnapshotStale"
-    private let logger = Logger(subsystem: "com.prakashjoshipax.voiceink", category: "DashboardStatsSnapshotStore")
+    private let logger = Logger(subsystem: "com.hainesy.voiceinkmeetings", category: "DashboardStatsSnapshotStore")
     private let fileManager: FileManager
     private let userDefaults: UserDefaults
     private let snapshotURL: URL
     private let saveQueue = DispatchQueue(
-        label: "com.prakashjoshipax.voiceink.dashboardStatsSnapshotStore", qos: .utility)
+        label: "com.hainesy.voiceinkmeetings.dashboardStatsSnapshotStore", qos: .utility)
 
     private init(fileManager: FileManager = .default, userDefaults: UserDefaults = .standard) {
         self.fileManager = fileManager
@@ -52,7 +52,7 @@ final class DashboardStatsSnapshotStore: @unchecked Sendable {
                 "Library/Application Support", isDirectory: true)
         let appSupportURL =
             appSupportRoot
-            .appendingPathComponent("com.prakashjoshipax.VoiceInk", isDirectory: true)
+            .appendingPathComponent("com.hainesy.VoiceInkMeetings", isDirectory: true)
         self.snapshotURL = appSupportURL.appendingPathComponent("dashboard-stats-snapshot.json")
     }
 

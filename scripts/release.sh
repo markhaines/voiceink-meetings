@@ -15,12 +15,14 @@ DMG_BACKGROUND="$DMG_ASSET_DIR/background.tiff"
 DMG_VOLUME_ICON="$DMG_ASSET_DIR/volume-icon.icns"
 WHISPER_FRAMEWORK="${VOICEINK_WHISPER_FRAMEWORK:-$HOME/VoiceInk-Dependencies/whisper.cpp/build-apple/whisper.xcframework}"
 
-DEVELOPER_IDENTITY="${VOICEINK_DEVELOPER_IDENTITY:-Developer ID Application: Prakash Joshi (V6J6A3VWY2)}"
-NOTARY_PROFILE="${VOICEINK_NOTARY_PROFILE:-VoiceInk-Notarization}"
-SPARKLE_ACCOUNT="${VOICEINK_SPARKLE_ACCOUNT:-VoiceInk}"
-RELEASE_BASE_URL="${VOICEINK_RELEASE_BASE_URL:-https://github.com/Beingpax/VoiceInk/releases/download}"
-EXPECTED_FEED_URL="https://beingpax.github.io/VoiceInk/appcast.xml"
-EXPECTED_BUNDLE_ID="com.prakashjoshipax.VoiceInk"
+# No fork-owned Developer ID / Sparkle account exists yet (deferred to Phase 5); this script
+# is not wired for a runnable release until then. See FORK-PATCHES.md.
+DEVELOPER_IDENTITY="${VOICEINK_DEVELOPER_IDENTITY:?Set VOICEINK_DEVELOPER_IDENTITY to the fork's Developer ID Application identity}"
+NOTARY_PROFILE="${VOICEINK_NOTARY_PROFILE:-VoiceInkMeetings-Notarization}"
+SPARKLE_ACCOUNT="${VOICEINK_SPARKLE_ACCOUNT:-VoiceInkMeetings}"
+RELEASE_BASE_URL="${VOICEINK_RELEASE_BASE_URL:-https://github.com/markhaines/voiceink-meetings/releases/download}"
+EXPECTED_FEED_URL=""
+EXPECTED_BUNDLE_ID="com.hainesy.VoiceInkMeetings"
 EXPECTED_MINIMUM_SYSTEM_VERSION="14.4"
 
 XCODE_DEVELOPER_DIR="${VOICEINK_XCODE_DEVELOPER_DIR:-${DEVELOPER_DIR:-}}"

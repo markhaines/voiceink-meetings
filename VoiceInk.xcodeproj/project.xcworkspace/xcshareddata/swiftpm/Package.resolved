@@ -15,8 +15,7 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/MimicScribe/dtln-aec-coreml.git",
       "state" : {
-        "revision" : "a74105dafdc1cc8e2ef0a991240b669868cf3b63",
-        "version" : "0.7.0"
+        "revision" : "ecb641dcb4b152fd10b1261a869aaa1e8acf0174"
       }
     },
     {

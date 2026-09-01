@@ -812,9 +812,12 @@ one-package/two-products shape, there `MLXLLM`+`MLXLMCommon`, here `DTLNAecCoreM
 4. `PBXProject.packageReferences`: 1 entry appended
    (`XCRemoteSwiftPackageReference "dtln-aec-coreml"`).
 5. `XCRemoteSwiftPackageReference` section: 1 new block, `repositoryURL =
-   "https://github.com/MimicScribe/dtln-aec-coreml.git"`, `requirement = { kind =
+   "https://github.com/MimicScribe/dtln-aec-coreml.git"`, originally `requirement = { kind =
    exactVersion; version = 0.7.0; }` — pinned exact, not `upToNextMajorVersion`, since this
-   package is archived and will never publish a compatible newer tag to float onto.
+   package is archived and will never publish a compatible newer tag to float onto. **Repinned
+   to `{ kind = revision; revision = ecb641dcb4b152fd10b1261a869aaa1e8acf0174; }` shortly after
+   — see the dedicated subsection below — for a LICENSE fix found during review, not for any
+   code reason.**
 6. `XCSwiftPackageProductDependency` section: 2 new blocks (`DTLNAecCoreML`, `DTLNAec512`), both
    `package`-linked to the one reference above.
 
@@ -826,6 +829,61 @@ matched exactly what a real Xcode resolution produces). `scripts/verify-package-
 unchanged. Debug build and the full local test run (`xcodebuild test`, CI's exact invocation)
 both succeeded afterward — see the AEC task report,
 `.tandem/884f6ef6905c4e2aa4e2ca28c34ea629/aec-dtln.md`, for the literal commands and output.
+
+### 3. `dtln-aec-coreml` repinned from tag `0.7.0` to commit `ecb641d`, for a LICENSE fix
+
+The review that produced section 2's pin found that `LICENSE` at tag `0.7.0` read verbatim
+`Copyright (c) 2026 Anthropic` — not MimicScribe, the actual publisher — unchanged since the
+repo's first commit and identical at the donor's older `0.6.0-beta` pin, with the same
+misattribution in `DTLNAecCoreML.podspec` (`s.author`, `s.homepage`, `s.source` all pointing at
+an unrelated `anthropics/` GitHub org). An MIT grant is only worth what the granting party can
+actually grant. The maintainer's very next commit, `ecb641d` — one commit past the `0.7.0` tag,
+and the current archived HEAD — fixes exactly that (LICENSE and podspec renamed to MimicScribe)
+and nothing else functional, and additionally adds the archive notice to the README.
+
+**Verified docs-only before repinning**, so this costs nothing in code: `git diff
+0.7.0..ecb641d --stat` touches exactly 4 files (`DTLNAecCoreML.podspec`,
+`Documentation/GettingStarted.md`, `LICENSE`, `README.md`) — zero changes under `Sources/`, to
+`Package.swift`, under `ThirdPartyLicenses/`, or to any `.mlpackage` resource. Confirmed by git
+object identity, not just diff absence: the `Sources/` tree
+(`9d3f71f8f9ab8ac185c4b79425f913c27edd7067`) and the `Package.swift` blob
+(`e41c9ef8064ee1cd1ad964e9ce23e1dce05f8f07`) are byte-identical at both revisions. Nothing in
+`MeetingNeuralAec.swift` or its tests needed to change.
+
+**The pbxproj edit for the repin** was a single-hunk, one-line-pair change to the existing
+`XCRemoteSwiftPackageReference "dtln-aec-coreml"` block's `requirement`, from `kind =
+exactVersion; version = 0.7.0;` to `kind = revision; revision =
+ecb641dcb4b152fd10b1261a869aaa1e8acf0174;` (pinning a commit rather than a tag requires the
+`revision` requirement kind). Read in full; nothing else in the file changed.
+`xcodebuild -resolvePackageDependencies` resolved `DTLNAecCoreML` at `ecb641d` afterward;
+`scripts/verify-package-trust.sh --update` re-blessed the moved pin; Debug build and the full
+local test run both succeeded again. Full history of the LICENSE finding, kept rather than
+discarded, lives in the `dtln-aec-coreml` entry's `note` field in `package-trust.json` and in
+the AEC task report.
+
+### 4. `scripts/verify-package-trust.sh`: plain-package `note` field now survives `--update`
+
+Found while writing the note above: `--update` already preserves an existing `note` across runs
+for the `components` section (`entry.get("note", "PENDING REVIEW")`), but rebuilds each plain
+package's `graph.packages` record from scratch every time, with no equivalent preservation. A
+`note` manually added to a package (as done here, twice, once for each pin) would be silently
+dropped by the very next `--update` for a completely unrelated pin bump elsewhere in the graph
+— and `verify` mode would keep passing, since it only compares `location`/`revision`/`tree`/
+`manifests`, not `note`, so nobody would notice. Fixed surgically: in the same loop that builds
+each package's record, look up the previously-trusted record for that identity and carry its
+`note` forward if one exists (mirrors the components pattern; does *not* default-inject
+`"PENDING REVIEW"` onto every plain package, since most carry no note and don't need one).
+
+**Proved with a real, reversible test**, not just reasoning about the code: temporarily bumped
+`KeySender`'s pin in `Package.resolved` to a different, real commit on its own repo
+(`bd01c54755b337ea63211656dab916afe7e40357`, an unrelated package to `dtln-aec-coreml`), ran
+`scripts/verify-package-trust.sh --update`, and confirmed both halves of the result: KeySender's
+own record genuinely changed (`~ package keysender: 99584bf1a03a -> bd01c54755b3`, proving this
+was a real re-bless, not a no-op), and `dtln-aec-coreml`'s `note` survived intact (present,
+correct length, revision unchanged) despite having nothing to do with the pin that moved. Then
+reverted KeySender's pin back to its correct committed revision and ran `--update` once more to
+restore the clean, correct final state — confirmed with `scripts/verify-package-trust.sh`
+(verify mode) passing and `git diff --stat` showing no residual KeySender change anywhere.
 
 ## Architecture budget note
 

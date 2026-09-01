@@ -353,6 +353,11 @@ component_records.sort(key=lambda r: (r["package"], r["name"]))
 
 # ------------------------------------------------------------------------------- re-bless
 if mode == "update":
+    # Structural problems (a pin with no root manifest, a component whose sources cannot be
+    # located) are collected even in update mode. Blessing over them silently would write a
+    # trust file that cannot subsequently verify, so say so loudly first.
+    for f in failures:
+        print("  warning: " + f.splitlines()[0], file=sys.stderr)
     was = {p["identity"]: p for p in graph_trust.get("packages", [])}
     now = {p["identity"]: p for p in pkg_records}
     for i in sorted(set(now) - set(was)):

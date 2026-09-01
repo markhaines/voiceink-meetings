@@ -1,0 +1,11 @@
+# Pinned whisper.cpp revision.
+#
+# whisper.cpp is compiled from source into whisper.xcframework and linked into the app, so
+# it is native code we ship. It used to be built from whatever `git ls-remote ... HEAD`
+# returned at build time, i.e. an unreviewed, remotely mutable input to every build. It is
+# now pinned here and BOTH the Makefile checkout and the CI cache key use this exact sha,
+# so a bump is a reviewed commit to this file. This is the revision the last green CI run
+# built (run 33488189890).
+#
+# To bump: review upstream's diff, put the new sha below, let CI rebuild the framework.
+eacbd8234c6654cdbf2c377f72b2106875479bdc

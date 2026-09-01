@@ -17,6 +17,13 @@ env:
   # here -- AnnouncementsService fetched remote config from this host too (now removed).
   # scripts/assert-fork-identity.sh does a host-level substring match over the whole bundle.
   FORBIDDEN_UPSTREAM_HOST: beingpax.github.io
+  # Upstream's bundle id prefix, Apple Developer team id, and Sparkle public EdDSA key.
+  # Any of the three coming back would re-point this fork's identity, signing or update
+  # trust at upstream. The team id and the test-bundle identifiers never appear in the
+  # built .app, which is why the assertion also runs in --project mode.
+  FORBIDDEN_UPSTREAM_BUNDLE_PREFIX: com.prakashjoshipax
+  FORBIDDEN_UPSTREAM_TEAM_ID: V6J6A3VWY2
+  FORBIDDEN_UPSTREAM_ED_KEY: gnXep9+mzNXFSbX0jU7CpLtubcQ5WVfVGe0BxsSdS40=
 
 jobs:
   build-and-test:
@@ -28,8 +35,13 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 60
     steps:
+      # Every action is pinned to a full commit sha. A tag -- even a version tag, and
+      # especially a floating major like @v4 -- is a mutable pointer the action's owner can
+      # repoint at any time, so `uses: some/action@v4` is an instruction to run whatever
+      # code that account publishes next, with this workflow's token. The trailing comment
+      # records which release the sha is, so bumps stay readable in review.
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Select Xcode
         run: |
@@ -53,19 +65,39 @@ jobs:
           build="$(xcodebuild -version | awk '/^Build version/{print $3}')"
           echo "xcode_build=$build" >> "$GITHUB_OUTPUT"
 
-      - name: Resolve whisper.cpp ref
+      # Runs BEFORE anything is built, because a macro or build-tool plugin is code that
+      # executes on this runner during the build. See scripts/verify-package-trust.sh and
+      # FORK-PATCHES.md section 6: this is the mechanism that makes the one remaining
+      # -skipPackagePluginValidation safe to keep, by failing whenever the set of
+      # build-time-executable components in the pinned graph, or their source, changes.
+      - name: Verify package plugin/macro trust
+        run: scripts/verify-package-trust.sh
+
+      # Cheap, and it fails fast. The test bundles' identifiers and DEVELOPMENT_TEAM only
+      # exist in the project file -- they are never inside the built .app -- so the product
+      # scan later on cannot see them.
+      - name: Assert fork identity of the project configuration
+        run: scripts/assert-fork-identity.sh --project "$(pwd)"
+
+      - name: Read pinned whisper.cpp revision
         id: whisper_ref
         run: |
-          sha="$(git ls-remote https://github.com/ggerganov/whisper.cpp.git HEAD | cut -f1)"
-          if [ -z "$sha" ]; then
-            echo "error: could not resolve whisper.cpp HEAD sha" >&2
+          # Pinned in whisper-cpp.rev, NOT resolved from upstream HEAD at build time.
+          # whisper.cpp is compiled into whisper.xcframework and linked into the shipped
+          # app, so building "whatever HEAD is right now" made an unreviewed, remotely
+          # mutable input part of every build. The same value keys the cache below and
+          # drives `make setup`, so cache and build can never diverge.
+          sha="$(grep -v '^[[:space:]]*#' whisper-cpp.rev | tr -d '[:space:]')"
+          if ! printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "error: whisper-cpp.rev does not contain a 40-character sha: '$sha'" >&2
             exit 1
           fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "whisper.cpp pinned at $sha"
 
       - name: Restore whisper.xcframework cache
         id: whisper_cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/VoiceInk-Dependencies
           key: whisper-deps-${{ runner.os }}-xcode${{ steps.toolchain.outputs.xcode_build }}-${{ steps.whisper_ref.outputs.sha }}
@@ -80,31 +112,52 @@ jobs:
         # later step (app build, tests) can fail -- building whisper.xcframework is expensive
         # and independent of whether the rest of the job passes.
         if: steps.whisper_cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/VoiceInk-Dependencies
           key: ${{ steps.whisper_cache.outputs.cache-primary-key }}
 
-      - name: Verify whisper.xcframework is present
-        run: test -d "$HOME/VoiceInk-Dependencies/whisper.cpp/build-apple/whisper.xcframework"
+      - name: Verify whisper.xcframework is present and built from the pinned revision
+        run: |
+          deps="$HOME/VoiceInk-Dependencies/whisper.cpp"
+          test -d "$deps/build-apple/whisper.xcframework"
+          # The cache key contains the sha, so a restored cache should already match; assert
+          # it rather than assume, since a stale checkout would otherwise ship silently.
+          head="$(git -C "$deps" rev-parse HEAD)"
+          if [ "$head" != "${{ steps.whisper_ref.outputs.sha }}" ]; then
+            echo "error: whisper.cpp checkout is at $head, expected ${{ steps.whisper_ref.outputs.sha }}" >&2
+            exit 1
+          fi
+          echo "whisper.cpp at $head matches whisper-cpp.rev"
 
       - name: Build VoiceInk (unsigned local build)
-        # Both validation-skip flags are required, and each was proven separately against CI
-        # rather than assumed -- Xcode gates first use of a package macro or build-tool plugin
-        # behind an interactive "Trust & Enable" dialog a headless runner cannot answer:
-        #   -skipMacroValidation         run 33442033271 (neither flag):
-        #     `Macro "MLXHuggingFaceMacros" from package "mlx-swift-lm" must be enabled
-        #      before it can be used`
-        #   -skipPackagePluginValidation run 33486090430 (macro flag only):
-        #     `Validate plug-in "CudaBuild" in package "mlx-swift"` -> ** BUILD FAILED **
-        # Dropping either one breaks the build. See FORK-PATCHES.md for the trust rationale.
+        # -skipMacroValidation is deliberately NOT passed. It used to be required, because
+        # mlx-swift-lm's MLXHuggingFaceMacros macro was in the build graph via the
+        # MLXHuggingFace product; this fork now provides that macro's expansion itself
+        # (VoiceInkRefineXPC/HuggingFaceTokenizerLoader.swift) and no longer links the
+        # product, so no macro is built at all. Its absence here is the proof: with a macro
+        # in the graph and no flag, the build fails with
+        #   `Macro "MLXHuggingFaceMacros" from package "mlx-swift-lm" must be enabled
+        #    before it can be used`   (CI run 33442033271)
+        # so if anything ever puts a macro back, this step fails instead of silently
+        # trusting it.
+        #
+        # -skipPackagePluginValidation is still required, for exactly one component:
+        # mlx-swift attaches its CudaBuild build-tool plugin unconditionally to Cmlx, the
+        # core target every MLX product depends on, so it cannot be dropped without forking
+        # mlx-swift (run 33486090430: `Validate plug-in "CudaBuild" in package "mlx-swift"`
+        # -> ** BUILD FAILED **). The flag is blanket by nature, so the
+        # "Verify package plugin/macro trust" step above bounds it: it fails the build if
+        # any macro or plugin in the pinned graph is not one this fork has reviewed, or if
+        # a reviewed one's source changes. See FORK-PATCHES.md section 6.
+        #
         # -onlyUsePackageVersionsFromResolvedFile: a from-scratch resolve on a fresh checkout
         # was picking the FLOOR of a transitive dependency's version range (mlx-swift 0.31.4)
         # instead of the version locked in Package.resolved (0.31.6), which is missing an API
         # mlx-swift-lm needs.
         run: >
           make local
-          LOCAL_XCODEBUILD_FLAGS="-skipMacroValidation -skipPackagePluginValidation -onlyUsePackageVersionsFromResolvedFile"
+          LOCAL_XCODEBUILD_FLAGS="-skipPackagePluginValidation -onlyUsePackageVersionsFromResolvedFile"
 
       - name: Locate built app
         id: app
@@ -115,7 +168,7 @@ jobs:
 
       # Verifies the ASSERTION ITSELF before trusting it against the real build. A check that
       # silently never fires is worse than no check: it reads as green forever. Each control
-      # is a fabricated bundle the assertion MUST reject; if any is accepted, CI fails here.
+      # is a fabricated input the assertion MUST reject; if any is accepted, CI fails here.
       - name: Self-test the fork-identity assertion (negative controls)
         run: |
           set -euo pipefail
@@ -134,6 +187,13 @@ jobs:
             fi
             echo "  rejected as expected: $2"
           }
+          must_reject_project() {
+            if scripts/assert-fork-identity.sh --project "$1" >/dev/null 2>&1; then
+              echo "error: assertion ACCEPTED a project it must reject ($2)" >&2
+              exit 1
+            fi
+            echo "  rejected as expected: $2"
+          }
 
           # Positive control: a clean bundle must pass, or the assertion is simply always-fail
           # and would tell us nothing about the real build.
@@ -148,7 +208,7 @@ jobs:
           mk "$tmp/NearMiss.app" "$EXPECTED_BUNDLE_ID" "https://$FORBIDDEN_UPSTREAM_HOST/VoiceInk/appcast-v2.xml"
           must_reject "$tmp/NearMiss.app" "renamed appcast on upstream's host"
 
-          mk "$tmp/UpstreamId.app" "com.prakashjoshipax.VoiceInk"
+          mk "$tmp/UpstreamId.app" "$FORBIDDEN_UPSTREAM_BUNDLE_PREFIX.VoiceInk"
           must_reject "$tmp/UpstreamId.app" "upstream bundle id"
 
           # Feed URL hidden outside the top-level Info.plist.
@@ -158,9 +218,60 @@ jobs:
             > "$tmp/Nested.app/Contents/Resources/config.dat"
           must_reject "$tmp/Nested.app" "upstream host referenced in a nested resource"
 
-          echo "fork-identity assertion verified: rejects every control, accepts a clean bundle"
+          # Upstream's Sparkle public key: whoever holds the matching private key can hand
+          # this app an update it will accept.
+          mk "$tmp/EdKey.app" "$EXPECTED_BUNDLE_ID"
+          /usr/libexec/PlistBuddy -c "Add :SUPublicEDKey string $FORBIDDEN_UPSTREAM_ED_KEY" \
+            "$tmp/EdKey.app/Contents/Info.plist" >/dev/null
+          must_reject "$tmp/EdKey.app" "upstream Sparkle public key"
 
-      - name: Assert fork identity of the built app (bundle id + Sparkle feed URL)
+          # Upstream's Apple Developer team id, as it would appear in an embedded profile or
+          # a code signature.
+          mk "$tmp/TeamId.app" "$EXPECTED_BUNDLE_ID"
+          mkdir -p "$tmp/TeamId.app/Contents/Resources"
+          printf 'TeamIdentifier=%s\n' "$FORBIDDEN_UPSTREAM_TEAM_ID" \
+            > "$tmp/TeamId.app/Contents/Resources/embedded.provisionprofile"
+          must_reject "$tmp/TeamId.app" "upstream team id inside the bundle"
+
+          # The XPC service ships inside the app and is signed with it, so an upstream id
+          # there matters as much as one at the top level.
+          mk "$tmp/NestedXpc.app" "$EXPECTED_BUNDLE_ID"
+          mkdir -p "$tmp/NestedXpc.app/Contents/XPCServices/Refine.xpc/Contents"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string com.example.Rogue" \
+            "$tmp/NestedXpc.app/Contents/XPCServices/Refine.xpc/Contents/Info.plist" >/dev/null
+          must_reject "$tmp/NestedXpc.app" "nested XPC bundle outside the fork's identifier"
+
+          # An unreadable path must FAIL the scan, not be silently skipped. `grep ... || true`
+          # or `2>/dev/null` would turn this into a pass and quietly drop part of the tree.
+          mk "$tmp/Unreadable.app" "$EXPECTED_BUNDLE_ID"
+          mkdir -p "$tmp/Unreadable.app/Contents/Resources"
+          printf 'nothing to see\n' > "$tmp/Unreadable.app/Contents/Resources/locked.dat"
+          chmod 000 "$tmp/Unreadable.app/Contents/Resources/locked.dat"
+          must_reject "$tmp/Unreadable.app" "unreadable file (scan could not complete)"
+          chmod 644 "$tmp/Unreadable.app/Contents/Resources/locked.dat"
+
+          # --project mode, which is the only check that can see the test bundles' ids and
+          # DEVELOPMENT_TEAM.
+          mkproj() { # mkproj <dir> <bundle-id> <team-id>
+            mkdir -p "$1/VoiceInk.xcodeproj"
+            {
+              printf '\t\t\t\tPRODUCT_BUNDLE_IDENTIFIER = %s;\n' "$2"
+              printf '\t\t\t\tDEVELOPMENT_TEAM = "%s";\n' "$3"
+            } > "$1/VoiceInk.xcodeproj/project.pbxproj"
+          }
+          mkproj "$tmp/proj-clean" "$EXPECTED_BUNDLE_ID.Tests" ""
+          scripts/assert-fork-identity.sh --project "$tmp/proj-clean" >/dev/null
+          echo "  accepted as expected: clean project configuration"
+
+          mkproj "$tmp/proj-team" "$EXPECTED_BUNDLE_ID.Tests" "$FORBIDDEN_UPSTREAM_TEAM_ID"
+          must_reject_project "$tmp/proj-team" "upstream DEVELOPMENT_TEAM restored"
+
+          mkproj "$tmp/proj-id" "$FORBIDDEN_UPSTREAM_BUNDLE_PREFIX.VoiceInkTests" ""
+          must_reject_project "$tmp/proj-id" "upstream test-bundle identifier"
+
+          echo "fork-identity assertion verified: rejects every control, accepts clean inputs"
+
+      - name: Assert fork identity of the built app
         run: scripts/assert-fork-identity.sh "${{ steps.app.outputs.path }}"
 
       # -configuration Debug is load-bearing, not a preference. The scheme's TestAction is set
@@ -177,6 +288,9 @@ jobs:
       # and VoiceInk needs Accessibility and microphone consent to get past its onboarding.
       # A GitHub runner grants neither, so these cannot pass unattended. The unit test bundle
       # (VoiceInkTests) does run. Revisit if the UI tests are ever made permission-free.
+      #
+      # Same flag set as the app build: no -skipMacroValidation, and
+      # -skipPackagePluginValidation only for the reviewed CudaBuild plugin.
       - name: Run test targets
         run: |
           xcodebuild test \
@@ -194,7 +308,6 @@ jobs:
             DEVELOPMENT_TEAM="" \
             CODE_SIGN_ENTITLEMENTS="$(pwd)/VoiceInk/VoiceInk.local.entitlements" \
             SWIFT_ACTIVE_COMPILATION_CONDITIONS='$(inherited) LOCAL_BUILD' \
-            -skipMacroValidation \
             -skipPackagePluginValidation \
             -onlyUsePackageVersionsFromResolvedFile
 
@@ -204,7 +317,7 @@ jobs:
           ditto -c -k --keepParent "${{ steps.app.outputs.path }}" artifact/VoiceInk.zip
 
       - name: Upload app artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: VoiceInk-app
           path: artifact/VoiceInk.zip

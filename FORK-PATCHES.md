@@ -87,6 +87,39 @@ error: upstream appcast host 'beingpax.github.io' is referenced inside /Users/ru
     /Users/runner/Downloads/VoiceInk.app/Contents/MacOS/VoiceInk
 ```
 
+### 2c. GitHub star prompt removed (`GitHubStarPromptCoordinator`, `GitHubCLIStarService`)
+
+The reviewer asked whether the retained star prompt performs network access to something
+upstream controls, or merely opens a URL on click. It is not merely a URL: it makes an
+automatic, credentialed network call on the user's behalf, about upstream's repository,
+without anyone clicking anything.
+
+`GitHubStarPromptCoordinator.scheduleIfNeeded(modelContainer:)` was called from
+`VoiceInk.swift`'s `.onAppear`. Three seconds after the main window appears, once the user
+has 30 completed sessions, it called `GitHubCLIStarService.checkRemoteStarState()`, which
+locates the `gh` binary (probing Homebrew paths, then sourcing the user's `.zshrc` for
+`PATH`) and runs:
+
+```
+gh api --include user/starred/Beingpax/VoiceInk
+```
+
+That is an authenticated request to the GitHub API using **the user's own `gh`
+credentials**, disclosing to GitHub that this account is running the app and reading whether
+they have starred upstream's repo. Clicking the card then ran
+`gh api -X PUT user/starred/Beingpax/VoiceInk`, a **write to the user's GitHub account**.
+The host is GitHub's, not upstream's, but the repo, the trigger and the benefit are
+upstream's, and no consent is asked for the automatic check.
+
+Removed on the same reasoning as `AnnouncementsService`: deleted
+`Features/Dashboard/State/GitHubStarPromptCoordinator.swift`,
+`Features/Dashboard/Components/GitHubStarPromptCard.swift` and
+`Infrastructure/ExternalServices/GitHubCLIStarService.swift`, the `.onAppear` hook in
+`VoiceInk.swift`, the overlay in `DashboardView.swift`, and the footer button plus its label
+builder in `DashboardContent.swift`. A de-branded private fork promoting upstream's star
+count was dead weight regardless; the credentialed call is what made it worth removing
+rather than leaving.
+
 ### 3. Code signing identity stripped
 
 - `DEVELOPMENT_TEAM = V6J6A3VWY2;` → `DEVELOPMENT_TEAM = "";` in all 4 build configurations in
@@ -219,57 +252,76 @@ that makes the fork buildable without a human clicking through Xcode dialogs:
   **default** — which happens to be the exact same build this Mac's local toolchain now runs
   (also 26.6/17F113, Swift 6.3.3), confirmed by comparing `xcodebuild -version` output on both.
   So CI and local aren't just "same major generation" any more, they're the same Xcode build.
-- **`-skipMacroValidation -skipPackagePluginValidation`** (passed to both `xcodebuild`
-  invocations, and to `make local` via the new `LOCAL_XCODEBUILD_FLAGS` Makefile variable):
-  **a security-relevant weakening, kept deliberately, tested down to the minimum set, and
-  justified here.** Both flags are required; each was proven necessary by a separate CI run
-  rather than assumed.
+- **Build-time macro and plugin trust.** Swift package **macros** and **build-tool plugins**
+  are executables that Xcode compiles and *runs on the build machine*, with the build user's
+  privileges, during every build. Xcode gates the first use of each behind an interactive
+  "Trust & Enable" dialog that a headless runner cannot answer, so CI used to pass both
+  `-skipMacroValidation` and `-skipPackagePluginValidation`.
 
-  *What breaks without it.* `mlx-swift-lm` ships a Swift macro target, `MLXHuggingFaceMacros`.
-  Xcode gates the first use of any package macro behind a one-time interactive "Trust & Enable"
-  dialog, and a headless runner has no way to answer it. CI run **33442033271** (commit
-  `0614d43`, no flags) failed with:
+  *State the blast radius honestly.* An earlier version of this section described those flags
+  as removing "a click a build machine cannot perform". That understated it. The flags are
+  not scoped to the two components that needed them: they disable the trust gate for **every**
+  macro and build-tool plugin in the resolved graph, including any that a future transitive
+  dependency bump silently introduces. Pinning in `Package.resolved` gives reproducibility,
+  not review: it guarantees you run the same code every time, not that anyone looked at it.
+  Two things changed as a result.
 
-  > `/…/SourcePackages/checkouts/mlx-swift-lm/Package.swift:PACKAGE-TARGET:MLXHuggingFaceMacros:`
-  > `error: Macro “MLXHuggingFaceMacros” from package “mlx-swift-lm” must be enabled before it can be used`
+  **One flag is gone, by taking the macro out of the build graph.** `-skipMacroValidation` was
+  required only for `MLXHuggingFaceMacros`, and that macro target is a dependency of exactly
+  one target in `mlx-swift-lm`: `MLXHuggingFace`. This project linked the `MLXHuggingFace`
+  product for a single expression, `#huggingFaceTokenizerLoader()`, in
+  `VoiceInkRefineXPC/VoiceInkRefineInferenceEngine.swift`. That macro's entire expansion is
+  mechanical adapter code -- an `MLXLMCommon.TokenizerLoader` calling
+  `Tokenizers.AutoTokenizer.from(modelFolder:)`, wrapped in a bridge conforming
+  `Tokenizers.Tokenizer` to `MLXLMCommon.Tokenizer`. It is now written out, verbatim from the
+  macro's own source at the pinned revision `cd1ab3dd98ce`, in the new fork-owned file
+  `VoiceInkRefineXPC/HuggingFaceTokenizerLoader.swift`, and the `MLXHuggingFace` product
+  dependency is dropped from the `VoiceInkRefineXPC` target. `MLXLLM` and `MLXLMCommon` do not
+  depend on `MLXHuggingFace`, so the MLX inference path is unchanged and the XPC service still
+  runs the local model. **No macro is built at all now**, and CI proves it rather than
+  asserting it: the flag is simply not passed, so if a macro ever re-enters the graph the
+  build fails with `Macro "MLXHuggingFaceMacros" ... must be enabled before it can be used`
+  (the exact failure seen in run **33442033271**) instead of quietly trusting it.
 
-  So this is a real, reproduced headless blocker, not a symptom of some other fault. (The
-  separate local `xcodebuild -resolvePackageDependencies` hang is unrelated — its sampled stack
-  sits in `waitForRemoteSourcePackagesToFinishLoading`, i.e. package-graph loading, and never
-  reaches macro validation. Neither problem masks the other; see §7.)
+  **The other flag stays, and is now bounded by a check that fails when the trusted sources
+  change.** `-skipPackagePluginValidation` is still required for one component: `mlx-swift`
+  attaches its `CudaBuild` build-tool plugin unconditionally to `Cmlx`, the core C++ target
+  that every MLX product depends on, so it cannot be excluded without forking `mlx-swift`
+  itself -- which would mean vendoring its several-hundred-megabyte vendored MLX/mlx-c/fmt
+  tree to delete one line of manifest. Dropping the flag fails the build
+  (`Validate plug-in "CudaBuild" in package "mlx-swift"` -> `** BUILD FAILED **`, run
+  **33486090430**). Xcode offers no durable, per-identity CI trust store to use instead: the
+  only SwiftPM security state on a developer Mac is
+  `~/Library/org.swift.swiftpm/security/fingerprints/`, a TOFU record of package *versions*,
+  not a plugin allowlist, and the undocumented
+  `IDESkipPackagePluginFingerprintValidatation` default was already tried and proved inert
+  (run **33443041941**).
 
-  *What did not work.* The first attempt (commit `c523224`) set the undocumented default
-  `defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidatation -bool YES`.
-  CI run **33443041941** produced the identical macro error, so that commit's change was inert
-  and has been removed. It is worth naming plainly: that commit weakened a security-adjacent
-  setting *and did not even achieve the thing it was added for*.
+  So the blanket flag is kept and bounded, by `scripts/verify-package-trust.sh` +
+  `package-trust.json`, which run **before anything is built**:
 
-  *Both flags tested individually; both are required.* Commit `f38bdc3` added the two flags
-  together, which left it unproven whether both were actually needed — exactly the kind of
-  untested blanket weakening that should not survive a review. So the narrower set was tried:
-  CI run **33486090430** kept `-skipMacroValidation` and dropped `-skipPackagePluginValidation`,
-  and the build failed at a different gate:
+  - it re-derives from `Package.resolved` alone every macro and plugin target declared
+    anywhere in the pinned graph (all 28 packages, by shallow blobless `git fetch` of each
+    pinned revision -- no `xcodebuild`, nothing compiled, nothing executed, ~20 seconds);
+  - it fails if any of them is not in the reviewed set, which is what catches the reviewer's
+    "and all future transitive additions" case;
+  - it fails if a reviewed component's pinned revision moves, or if the git tree object id of
+    its source directory differs from the reviewed one.
 
-  > `Validate plug-in “CudaBuild” in package “mlx-swift”` → `** BUILD FAILED **`
+  Four components are declared in the current graph and each was read before being recorded:
+  `mlx-swift/CudaBuild` (buildTool), `mlx-swift-lm/MLXHuggingFaceMacros` (macro, declared but
+  no longer built here), and `swift-argument-parser`'s `GenerateManual` and
+  `GenerateDoccReference` (both capability `.command`, which never run during a build).
+  Worth recording about the one plugin that does have build-tool capability: `CudaBuild`'s
+  `createBuildCommands` opens with `guard isCudaEnabled()`, and `isCudaEnabled()` is
+  `#if os(Linux) ... #else return false #endif`. On macOS it prints "CUDA is disabled" and
+  returns an empty command list -- it emits no build commands and never invokes its `encuda`
+  helper. The reviewed hashes cover the plugin sources and `Source/Encuda`.
 
-  `mlx-swift` ships a build-tool plugin (`CudaBuild`) in addition to `mlx-swift-lm`'s macro, and
-  each flag clears its own gate: neither substitutes for the other, and dropping either one
-  breaks the build. The minimum working set is therefore both flags, now established
-  empirically rather than by assumption. They are Apple's own documented `xcodebuild` options
-  for this case; the help text is explicit that this "can be a security risk if they are not
-  from trusted sources".
-
-  *Why it is an acceptable risk here.* The flags skip a **fingerprint/consent prompt**, not a
-  signature or integrity check, and it changes nothing about *which* code is fetched. What code
-  runs is decided by `Package.resolved`, which pins every dependency to an exact commit hash,
-  and by `-onlyUsePackageVersionsFromResolvedFile`, which forbids `xcodebuild` from resolving to
-  anything else. Every macro-shipping package in this graph (`mlx-swift-lm`, `swift-syntax`) is
-  a transitive dependency of *upstream* VoiceInk's own lockfile — the fork adds no new trust
-  surface, it only removes a click a build machine cannot perform. The residual risk is the one
-  that already exists for anyone who clicks "Trust & Enable" locally: a compromised upstream
-  dependency at a pinned hash. The mitigation that actually matters is the pinning, and it is
-  in place. Mark's interactive `make local` is unaffected (`LOCAL_XCODEBUILD_FLAGS` defaults to
-  empty), so on a desk Mac Xcode still shows the prompt as normal.
+  Residual risk, stated plainly: the plugin still runs, unprompted, as part of the build. What
+  the guard buys is that it can only ever be *this* reviewed plugin at *this* reviewed
+  revision, and that a second one cannot arrive unnoticed. `make local` on a desk Mac is
+  unaffected -- `LOCAL_XCODEBUILD_FLAGS` defaults to empty, so Xcode still prompts there.
 - `Makefile`: added `LOCAL_XCODEBUILD_FLAGS ?=` (empty by default) and appended
   `$(LOCAL_XCODEBUILD_FLAGS)` to the `local` target's `xcodebuild` invocation, so CI/scripted
   callers can inject the flags above without duplicating the whole recipe. No effect on
@@ -326,23 +378,209 @@ that makes the fork buildable without a human clicking through Xcode dialogs:
   The UI test bundle is skipped because `VoiceInkUITests` launches a real `XCUIApplication`, and
   VoiceInk needs Accessibility and microphone consent to clear onboarding — a GitHub runner
   grants neither. `VoiceInkTests` does run.
-- **`scripts/assert-fork-identity.sh`** (new file) — the guard that stops the fork
-  auto-updating into upstream's build. It fails if `CFBundleIdentifier` is not this fork's, if
-  `SUFeedURL` points at upstream's appcast **host**, or if that host appears anywhere else in
-  the bundle (nested plists, resources, or the executable itself — `grep -a`, so binaries are
-  scanned too).
+- **`scripts/assert-fork-identity.sh`** (new file) -- the guard that stops the fork
+  auto-updating into upstream's build, or quietly carrying upstream's identity. It runs in two
+  modes, because the evidence lives in two places.
 
-  Two deliberate strengthenings over the inline check it replaces. First, the old check compared
-  `SUFeedURL` for **exact string equality** with upstream's appcast URL, so a merely *renamed*
-  feed on the same host (`…/VoiceInk/appcast-v2.xml`) would have passed. The match is now
-  host-level. Second, and more important, CI now **verifies the assertion itself** on every run,
-  in a `Self-test the fork-identity assertion` step that runs before the real check: four
-  fabricated bundles it must reject (upstream URL, renamed URL on upstream's host, upstream
-  bundle id, host hidden in a nested resource) and one clean bundle it must accept. An assertion
-  that can never fire is worse than no assertion, because it reads as green forever. This
-  self-test was itself checked by sabotage: reverting the script to the old exact-URL comparison
-  makes the self-test fail on the renamed-feed control, and stubbing the script to `exit 0`
-  makes it fail on the first control.
+  *Product mode* (`assert-fork-identity.sh <path-to-.app>`) inspects the built app: the
+  top-level `CFBundleIdentifier` must be the fork's, **every nested bundle** (XPC service,
+  plugins, embedded frameworks) must be under the fork's identifier, and nothing anywhere in
+  the bundle may reference upstream's appcast **host**, upstream's bundle-id prefix, upstream's
+  Apple Developer team id `V6J6A3VWY2`, or upstream's Sparkle public EdDSA key. The scan is
+  `grep -r -a`, so compiled-in strings are caught: that is how `AnnouncementsService` was
+  found, hidden in `Contents/MacOS/VoiceInk` with nothing in any plist.
+
+  *Project mode* (`assert-fork-identity.sh --project <repo-root>`) inspects the repository's
+  build configuration, and it exists because two of those things are invisible to the product
+  scan. The unit and UI **test bundles are never inside the .app**, so their
+  `PRODUCT_BUNDLE_IDENTIFIER` can only be checked in `project.pbxproj`; and `DEVELOPMENT_TEAM`
+  is a signing setting, not a built-product string, so restoring `V6J6A3VWY2` would not have
+  failed the old guard at all. Project mode asserts positively that every configured
+  `PRODUCT_BUNDLE_IDENTIFIER` is under the fork's, and fails if the file is somehow empty of
+  them (a vacuous check is not a passing one).
+
+  *A suppressed error is not an absence of matches.* `grep` exits 0 on a match, 1 on no match
+  and **>1 on an error** -- an unreadable path, an I/O failure. The previous implementation
+  ran the bundle-wide scan with `2>/dev/null`, which collapses "the scan could not complete"
+  into "the scan found nothing", so a single unreadable file could take part of the tree out
+  of the scan while the check still reported success. Every scan now captures grep's exit
+  status and treats anything above 1 as a hard failure, prints any warning grep emitted, and
+  never swallows stderr.
+
+  *The assertion is verified on every run.* A check that can never fire is worse than no
+  check, because it reads as green forever. The `Self-test the fork-identity assertion` step
+  runs before the real one, against **twelve** controls: two that must be accepted (a clean
+  bundle, a clean project) and ten that must be rejected -- upstream appcast URL; a *renamed*
+  appcast on upstream's host (the near-miss an exact-string comparison waved through);
+  upstream bundle id; the host hidden in a nested resource; upstream's Sparkle public key;
+  upstream's team id inside the bundle; a nested XPC bundle outside the fork's identifier; an
+  **unreadable file**, which must fail the scan rather than be skipped; upstream's
+  `DEVELOPMENT_TEAM` restored in the project; and an upstream **test-bundle** identifier. If
+  any control is accepted, CI fails there rather than at the real check.
+- **whisper.cpp pinned (`whisper-cpp.rev`, `Makefile`, CI).** CI used to resolve
+  `git ls-remote https://github.com/ggerganov/whisper.cpp.git HEAD` at run time and `make
+  setup` built whatever that returned. whisper.cpp is compiled into `whisper.xcframework` and
+  linked into the shipped app, so that made an unreviewed, remotely mutable native-code input
+  part of every build: the same commit could produce a different binary tomorrow, and nothing
+  would record it. The revision now lives in `whisper-cpp.rev`
+  (`eacbd8234c6654cdbf2c377f72b2106875479bdc`, the revision the last green run built), and
+  **both** consumers read that one file -- the Makefile's `whisper` target fetches and checks
+  out exactly that sha instead of `git pull`ing, and CI's cache key is derived from it, so
+  cache and build cannot diverge. CI additionally asserts that the restored checkout's `HEAD`
+  is the pinned sha, rather than trusting the cache key. Bumping it is now a reviewed commit.
+- **All GitHub Actions pinned to full commit shas.** `actions/checkout@v4`,
+  `actions/cache/restore@v4`, `actions/cache/save@v4` and `actions/upload-artifact@v4` were
+  floating major tags. A tag is a mutable pointer the action's owner can repoint at will, so
+  `uses: ...@v4` means "run whatever code that account publishes next, in this workflow, with
+  this workflow's token". Each is now pinned to the commit sha that tag resolved to, with the
+  release version in a trailing comment so bumps stay reviewable:
+  `actions/checkout@11d5960a...` (v4.4.0), `actions/cache/{restore,save}@0057852b...` (v4.3.0),
+  `actions/upload-artifact@ea165f8d...` (v4.6.2).
+- **The shared scheme is not modified by this fork** -- worth stating because it was queried.
+  `VoiceInk.xcodeproj/xcshareddata/xcschemes/VoiceInk.xcscheme` does not appear in
+  `git diff --name-only 711297b..HEAD` at all; it is byte-identical to upstream. Its
+  `LaunchAction buildConfiguration = "Debug"` is upstream's own value, not a fork change (its
+  `TestAction` is `"Release"`, which is the latent defect the CI test step works around on the
+  command line, exactly so the scheme need not be touched).
+
+## Appendix: every upstream file this branch touches
+
+Acceptance criterion 5 asks for the complete list, not a summary: at merge time the
+question is always "did upstream change one of *these* files", and a count with example
+paths cannot answer it. The grouping below is generated from git, not typed by hand --
+regenerate it with `git diff --name-status 711297b..HEAD` (that commit is the fork
+point, `git merge-base HEAD upstream/main`) and re-sort into these five groups.
+
+Totals: 60 identity-only edits, 15 behavioural edits, 7 build/project changes, 17 deletions, 8 new fork-only files (107 paths).
+
+### A1. Identity-only edits (60 files)
+
+Mechanical: every changed line in these files is one of the identity strings -- the
+`Logger(subsystem:)` name `com.prakashjoshipax.voiceink` -> `com.hainesy.voiceinkmeetings`,
+a Keychain service name, or an application-support path component. No logic changed, so a
+conflicting upstream change to any of them can be taken wholesale and re-swept.
+
+- `Shared/VoiceInkRefineXPCProtocol.swift`
+- `VoiceInk/App/Lifecycle/ModelPrewarmService.swift`
+- `VoiceInk/App/Windows/WindowManager.swift`
+- `VoiceInk/Features/AudioImport/Workflows/AudioFileTranscriptionManager.swift`
+- `VoiceInk/Features/Dictionary/Workflows/DictionaryService.swift`
+- `VoiceInk/Features/Enhancement/Workflows/AIEnhancementService.swift`
+- `VoiceInk/Features/History/Presentation/HistoryWindowController.swift`
+- `VoiceInk/Features/History/Workflows/AudioFileTranscriptionService.swift`
+- `VoiceInk/Features/ModelLibrary/State/CustomAIProviderManager.swift`
+- `VoiceInk/Features/ModelLibrary/State/CustomCloudModelManager.swift`
+- `VoiceInk/Features/ModelLibrary/State/FluidAudioModelManager.swift`
+- `VoiceInk/Features/ModelLibrary/State/TranscribeCppModelManager.swift`
+- `VoiceInk/Features/ModelLibrary/State/TranscriptionModelManager.swift`
+- `VoiceInk/Features/ModelLibrary/State/VoiceInkRefineService.swift`
+- `VoiceInk/Features/ModelLibrary/State/WhisperModelManager.swift`
+- `VoiceInk/Features/Recording/Capture/Recorder.swift`
+- `VoiceInk/Features/Recording/Presentation/MiniRecorderPanel.swift`
+- `VoiceInk/Features/Recording/Presentation/MiniWindowManager.swift`
+- `VoiceInk/Features/Recording/Presentation/NotchRecorderPanel.swift`
+- `VoiceInk/Features/Recording/Presentation/NotchWindowManager.swift`
+- `VoiceInk/Features/Recording/Presentation/RecorderUIManager.swift`
+- `VoiceInk/Features/Recording/Streaming/StreamingTranscriptionService.swift`
+- `VoiceInk/Features/Recording/Workflows/TranscriptionPipeline.swift`
+- `VoiceInk/Features/Recording/Workflows/TranscriptionServiceRegistry.swift`
+- `VoiceInk/Features/Recording/Workflows/TranscriptionSession.swift`
+- `VoiceInk/Features/Recording/Workflows/VoiceInkEngine.swift`
+- `VoiceInk/Features/Shortcuts/Coordination/ShortcutMonitor.swift`
+- `VoiceInk/Infrastructure/Audio/AudioFileProcessor.swift`
+- `VoiceInk/Infrastructure/Audio/CoreAudioRecorder.swift`
+- `VoiceInk/Infrastructure/Audio/Devices/AudioDeviceConfiguration.swift`
+- `VoiceInk/Infrastructure/Audio/Devices/AudioDeviceManager.swift`
+- `VoiceInk/Infrastructure/Audio/SoundPlaybackEngine.swift`
+- `VoiceInk/Infrastructure/Credentials/APIKeyManager.swift`
+- `VoiceInk/Infrastructure/Credentials/KeychainService.swift`
+- `VoiceInk/Infrastructure/Diagnostics/LogExporter.swift`
+- `VoiceInk/Infrastructure/Persistence/Cleanup/TranscriptionAutoCleanupService.swift`
+- `VoiceInk/Infrastructure/Persistence/Migrations/SessionMetricMigrationService.swift`
+- `VoiceInk/Infrastructure/Persistence/Statistics/DashboardStatsSnapshotStore.swift`
+- `VoiceInk/Infrastructure/Persistence/Statistics/SessionMetricRecorder.swift`
+- `VoiceInk/Infrastructure/Providers/Enhancement/VoiceInkRefine/VoiceInkRefineModelDownloader.swift`
+- `VoiceInk/Infrastructure/Providers/Enhancement/VoiceInkRefine/VoiceInkRefineXPCClient.swift`
+- `VoiceInk/Infrastructure/Providers/Transcription/AppleSpeech/NativeAppleSpeechAssetManager.swift`
+- `VoiceInk/Infrastructure/Providers/Transcription/AppleSpeech/NativeAppleTranscriptionService.swift`
+- `VoiceInk/Infrastructure/Providers/Transcription/FluidAudio/FluidAudioTranscriptionService.swift`
+- `VoiceInk/Infrastructure/Providers/Transcription/FluidAudio/Streaming/FluidAudioNemotronStreamingProvider.swift`
+- `VoiceInk/Infrastructure/Providers/Transcription/FluidAudio/Streaming/FluidAudioStreamingProvider.swift`
+- `VoiceInk/Infrastructure/Providers/Transcription/FluidAudio/Streaming/FluidAudioUnifiedStreamingProvider.swift`
+- `VoiceInk/Infrastructure/Providers/Transcription/TranscribeCpp/OfflineTranscribeCppService.swift`
+- `VoiceInk/Infrastructure/Providers/Transcription/TranscribeCpp/TranscribeCppModelCatalog.swift`
+- `VoiceInk/Infrastructure/Providers/Transcription/Whisper/LibWhisper.swift`
+- `VoiceInk/Infrastructure/Providers/Transcription/Whisper/VADModelManager.swift`
+- `VoiceInk/Infrastructure/Providers/Transcription/Whisper/WhisperTranscriptionService.swift`
+- `VoiceInk/Infrastructure/SystemIntegration/Accessibility/SelectedTextService.swift`
+- `VoiceInk/Infrastructure/SystemIntegration/Context/ActiveWindowService.swift`
+- `VoiceInk/Infrastructure/SystemIntegration/Context/BrowserURLService.swift`
+- `VoiceInk/Infrastructure/SystemIntegration/Hardware/ClamshellStateMonitor.swift`
+- `VoiceInk/Infrastructure/SystemIntegration/LaunchAtLoginManager.swift`
+- `VoiceInk/Infrastructure/SystemIntegration/Paste/CursorPaster.swift`
+- `VoiceInk/Infrastructure/SystemIntegration/Processes/CustomCommandDeliveryRunner.swift`
+- `VoiceInk/Infrastructure/SystemIntegration/Processes/ShellCommandEnvironment.swift`
+
+### A2. Behavioural edits (15 files)
+
+These changed what the app does. Read the reason before merging upstream changes here.
+
+- `VoiceInk/App/Configuration/AppDefaults.swift` -- dropped the `enableAnnouncements` default (the upstream remote-config channel is gone)
+- `VoiceInk/App/Navigation/AppSidebar.swift` -- removed the `.license` sidebar item and its icon/colour cases
+- `VoiceInk/App/Navigation/ContentView.swift` -- removed the `.license` destination (`LicenseManagementView`); logging subsystem renamed
+- `VoiceInk/App/Notifications/AppNotifications.swift` -- removed the `licenseCelebrationRequested` notification name
+- `VoiceInk/App/VoiceInk.swift` -- removed `LicenseViewModel`, the announcements start-up hook and the star-prompt scheduling; CloudKit container forced to `.none` (fork has no iCloud container); support paths and logging subsystem renamed
+- `VoiceInk/Features/Dashboard/Views/DashboardContent.swift` -- removed the GitHub star footer button and its label builder
+- `VoiceInk/Features/Dashboard/Views/DashboardView.swift` -- removed the star-prompt overlay; the view is now just `DashboardContent`
+- `VoiceInk/Features/Onboarding/State/OnboardingCoordinator.swift` -- removed the licensing step from the onboarding flow
+- `VoiceInk/Features/Onboarding/State/OnboardingFlowController.swift` -- removed the licensing step and its transitions
+- `VoiceInk/Features/Onboarding/State/OnboardingPermissionModels.swift` -- removed the `.license` step case (title, icon, ordering, copy)
+- `VoiceInk/Features/Onboarding/Views/OnboardingView.swift` -- removed the licensing screen from the onboarding switch
+- `VoiceInk/Features/Recording/Workflows/TranscriptionDelivery.swift` -- `deliverableText(from:)` is now a passthrough -- it used to prepend `LicenseViewModel.usageRestrictionMessage` to transcripts; logging subsystem renamed
+- `VoiceInk/Features/Settings/Diagnostics/SystemInfoService.swift` -- dropped the License Status line and `getLicenseStatus()` from the diagnostics dump
+- `VoiceInk/Features/Settings/Views/SettingsView.swift` -- removed the "Show Announcements" toggle and its start/stop wiring
+- `VoiceInkRefineXPC/VoiceInkRefineInferenceEngine.swift` -- dropped `import MLXHuggingFace` and swapped `#huggingFaceTokenizerLoader()` for the fork-owned `HuggingFaceTokenizerLoader()` -- this is what takes the macro out of the build graph (section 6)
+
+### A3. Build and project configuration (7 files)
+
+- `Makefile` -- added `LOCAL_XCODEBUILD_FLAGS ?=` for CI, and pinned the whisper.cpp checkout to `whisper-cpp.rev` instead of `git pull`ing upstream HEAD
+- `README.md` -- fork header, build instructions, upstream attribution
+- `VoiceInk.xcodeproj/project.pbxproj` -- bundle identifiers for app/XPC/tests/UI-tests, `DEVELOPMENT_TEAM` emptied, iCloud entitlement removals, and the `MLXHuggingFace` package product dependency dropped
+- `VoiceInk/Info.plist` -- `SUFeedURL` and `SUPublicEDKey` removed, automatic update checks disabled
+- `VoiceInk/VoiceInk.debug.entitlements` -- same, for the debug configuration
+- `VoiceInk/VoiceInk.entitlements` -- iCloud/CloudKit container entitlements removed
+- `scripts/release.sh` -- notarisation/signing identifiers pointed at the fork
+
+### A4. Deleted upstream files (17 files)
+
+- `VoiceInk/App/Notifications/AnnouncementManager.swift` -- announcements state, no other callers
+- `VoiceInk/App/Notifications/Views/AnnouncementView.swift` -- announcements banner UI
+- `VoiceInk/Features/Dashboard/Components/GitHubStarPromptCard.swift` -- star-prompt card UI
+- `VoiceInk/Features/Dashboard/State/GitHubStarPromptCoordinator.swift` -- scheduled that call automatically after 30 sessions (section 2c)
+- `VoiceInk/Features/Licensing/Components/ProBadge.swift` -- licensing (section 5)
+- `VoiceInk/Features/Licensing/State/LicenseViewModel.swift` -- licensing (section 5)
+- `VoiceInk/Features/Licensing/Views/ConfettiCelebrationOverlay.swift` -- licensing (section 5)
+- `VoiceInk/Features/Licensing/Views/LicenseManagementView.swift` -- licensing (section 5)
+- `VoiceInk/Features/Licensing/Views/LicenseView.swift` -- licensing (section 5)
+- `VoiceInk/Features/Licensing/Views/TrialMessageView.swift` -- licensing (section 5)
+- `VoiceInk/Features/Onboarding/Components/OnboardingLicenseCards.swift` -- licensing (section 5)
+- `VoiceInk/Features/Onboarding/Views/OnboardingLicenseScreen.swift` -- licensing (section 5)
+- `VoiceInk/Infrastructure/ExternalServices/GitHubCLIStarService.swift` -- ran `gh api user/starred/Beingpax/VoiceInk` with the user's own credentials (section 2c)
+- `VoiceInk/Infrastructure/Licensing/LicenseKeychainAccessibilityMigration.swift` -- licensing (section 5)
+- `VoiceInk/Infrastructure/Licensing/LicenseManager.swift` -- licensing (section 5)
+- `VoiceInk/Infrastructure/Licensing/PolarService.swift` -- licensing (section 5)
+- `VoiceInk/Infrastructure/RemoteConfig/AnnouncementsService.swift` -- polled upstream's GitHub Pages host every 4 hours and rendered upstream-supplied content with a clickable link (section 2b)
+
+### A5. New fork-only files (8 files)
+
+- `.github/workflows/ci.yml` -- the CI pipeline (section 6)
+- `FORK-PATCHES.md` -- this file
+- `NOTICE` -- upstream attribution and licence notice
+- `VoiceInkRefineXPC/HuggingFaceTokenizerLoader.swift` -- the fork's own copy of the `#huggingFaceTokenizerLoader()` expansion, which is what removes mlx-swift-lm's macro from the build graph (section 6)
+- `package-trust.json` -- the reviewed set of macros/build-tool plugins in the pinned package graph, with source-tree hashes (section 6)
+- `scripts/assert-fork-identity.sh` -- the fork-identity guard, run against the built app and the project configuration (section 6)
+- `scripts/verify-package-trust.sh` -- enforces `package-trust.json` before anything is built (section 6)
+- `whisper-cpp.rev` -- the pinned whisper.cpp revision (section 6)
 
 
 ## Architecture budget note

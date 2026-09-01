@@ -1,0 +1,47 @@
+{
+  "_comment": "Every macro / package-plugin target declared anywhere in the pinned SPM graph, with the git object id of its source tree. Regenerate with scripts/verify-package-trust.sh --update AFTER reading the sources: the diff on this file IS the review record. See FORK-PATCHES.md S6.",
+  "components": [
+    {
+      "package": "mlx-swift",
+      "name": "CudaBuild",
+      "capability": "buildTool",
+      "path": "Plugins/CudaBuild",
+      "revision": "0bb916c67f4b9e5c682cbe02a42c701c93ab5021",
+      "tree": "5c1b7e5f1dddb68c118013278fb15a44fc5e2429",
+      "also": [
+        "Source/Encuda"
+      ],
+      "also_trees": {
+        "Source/Encuda": "3b6153bd8ec5a33c4a45a3eef6f802d0e4214fc2"
+      },
+      "note": "Reviewed 2026-09-01 at this revision. Build-tool plugin attached unconditionally to mlx-swift's core Cmlx target, so it cannot be taken out of the graph without forking mlx-swift. Read in full (Plugins/CudaBuild/plugin.swift): createBuildCommands() calls isCudaEnabled(), which is `#if os(Linux) ... #else return false #endif`, so on macOS it prints \"CUDA is disabled\" and returns an EMPTY command list. It emits no build commands, compiles nothing, and never invokes encuda on this platform. The companion tree Source/Encuda (the executable it would drive on Linux) is hashed too."
+    },
+    {
+      "package": "mlx-swift-lm",
+      "name": "MLXHuggingFaceMacros",
+      "capability": "macro",
+      "path": "Libraries/MLXHuggingFaceMacros",
+      "revision": "cd1ab3dd98ceb02d095490aa25e61298ea3e2f5b",
+      "tree": "024f06d7e321dfb42c1d78e51751f6f9c7830541",
+      "note": "Reviewed 2026-09-01 at this revision. DECLARED in the pinned package but NO LONGER BUILT by this project: it is a dependency only of the MLXHuggingFace target, whose product this fork stopped linking (see VoiceInkRefineXPC/HuggingFaceTokenizerLoader.swift). CI proves it is out of the build graph by NOT passing -skipMacroValidation: were the macro still in the graph, the build would fail with 'Macro \"MLXHuggingFaceMacros\" ... must be enabled before it can be used' (CI run 33442033271). Source read: SwiftSyntax expression macros emitting adapter shims, no file or network I/O, no process execution."
+    },
+    {
+      "package": "swift-argument-parser",
+      "name": "GenerateDoccReference",
+      "capability": "command",
+      "path": "Plugins/GenerateDoccReference",
+      "revision": "6a52f3251125d74daf04fcbd5e6f08a75d074382",
+      "tree": "15e5973ba43e0e0c910be66345c9fecbaef28300",
+      "note": "Reviewed 2026-09-01 at this revision. Apple's own documentation plugin, capability .command: command plugins are never run as part of a build, only when a developer explicitly invokes them, so this never executes in CI. Hash-pinned anyway so a change to it cannot arrive unnoticed."
+    },
+    {
+      "package": "swift-argument-parser",
+      "name": "GenerateManual",
+      "capability": "command",
+      "path": "Plugins/GenerateManual",
+      "revision": "6a52f3251125d74daf04fcbd5e6f08a75d074382",
+      "tree": "69692e65f981759dd93c127683f96c611550671e",
+      "note": "Reviewed 2026-09-01 at this revision. Apple's own man-page plugin, capability .command; same reasoning as GenerateDoccReference. Never runs during a build."
+    }
+  ]
+}

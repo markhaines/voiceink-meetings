@@ -668,6 +668,54 @@ These changed what the app does. Read the reason before merging upstream changes
 - `whisper-cpp.rev` -- the pinned whisper.cpp revision (section 6)
 
 
+## phase-1-foundation (Stage 0: Meetings slice foundation)
+
+Ported from Muesli-HQ/muesli into the new `VoiceInk/Features/Meetings/` slice: `Capture/`
+(`PCMChunkRecorder.swift`, `MeetingChunkTimingTracker.swift`, `AudioSampleStats.swift`
+extracted from `MeetingSessionDiagnostics.swift`, `WavWriter.swift`, and the
+`AudioGraphExceptionBridge` ObjC pair) plus two fork-owned shared types in `Models/`
+(`MeetingRuntimePaths.swift`, `SpeechSegment.swift`). Full detail, including which donor
+files were read to confirm each design decision, is in the task report at
+`.tandem/884f6ef6905c4e2aa4e2ca28c34ea629/phase1-foundation.md`. This entry covers only the
+one upstream-file touch, against the ~6-touchpoint budget the note below sets for Phase 1+.
+
+### 1. `project.pbxproj`: `SWIFT_OBJC_BRIDGING_HEADER` added (VoiceInk target, Debug + Release)
+
+`AudioGraphExceptionBridge` is ObjC (an `installTap` exception boundary AVFAudio needs, since
+Swift cannot catch the NSExceptions it raises). In the donor it is its own SwiftPM module
+target; VoiceInk.xcodeproj is a plain Xcode app target with no prior ObjC/Swift interop and no
+bridging header at all. Calling ObjC from Swift within a single app target requires one, so
+both `buildSettings` blocks for the `VoiceInk` native target (not the XPC service, not the
+test targets) gained:
+
+```
+SWIFT_OBJC_BRIDGING_HEADER = "VoiceInk/Features/Meetings/Capture/VoiceInk-Bridging-Header.h";
+```
+
+Landed once, here, deliberately: had this been left for Stage 1, at least two of the four
+parallel clusters (capture core, mic+route — both call into `installTap`) would likely have
+needed the same setting independently, which is exactly the kind of `project.pbxproj`
+collision this Stage-0 pass exists to avoid. `VoiceInk-Bridging-Header.h` itself is a new
+fork-owned file (not from the donor), and only `#import`s the ported `AudioGraphExceptionBridge.h`.
+No other upstream file was touched — new files under `VoiceInk/Features/Meetings/` and
+`Tests/VoiceInkTests/Features/Meetings/` join their targets automatically
+(`PBXFileSystemSynchronizedRootGroup`, confirmed for both `VoiceInk` and `VoiceInkTests`
+before this stage began).
+
+### Known gap: `MeetingPromptStateMachine.swift` NOT ported
+
+Task scope named this as one of four "smallest verbatim ports" for `Detection/`. It doesn't
+compile standalone: it references `MeetingCandidate` (id, suppressionID, evidence set),
+defined in the donor's `MeetingCandidateResolver.swift` — 666 lines, a full meeting-detection
+feature (platform enum, evidence enum, resolution logic), not a small shared primitive and not
+in this task's scope. Porting `MeetingPromptStateMachine.swift` alone would either break the
+build or require inventing a placeholder `MeetingCandidate` here that would collide with the
+real one when the Detection cluster later ports `MeetingCandidateResolver.swift` for real.
+Left unported; `VoiceInk/Features/Meetings/Detection/` currently holds only `.gitkeep`.
+Recommendation for whichever Stage-1 cluster owns Detection: port
+`MeetingPromptStateMachine.swift` and `MeetingCandidateResolver.swift` together, verbatim, in
+the same change, under the same non-negotiable porting rules (every comment, every branch).
+
 ## Architecture budget note
 
 The instruction for this project caps ongoing upstream touchpoints (outside the new

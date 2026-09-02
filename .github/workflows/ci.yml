@@ -299,7 +299,23 @@ jobs:
       #
       # Same flag set as the app build: no -skipMacroValidation, and
       # -skipPackagePluginValidation only for the reviewed CudaBuild plugin.
+      #
+      # env.TEST_RUNNER_VOICEINK_CI: `xcodebuild test` launches the actual xctest host
+      # ("VoiceInk Dev.app" / VoiceInkTests.xctest) through a LaunchServices-mediated path that
+      # does NOT inherit this step's own environment -- a plain `GITHUB_ACTIONS` or `CI` check
+      # inside a test body evaluates to nil there even though this shell sees it fine. Verified
+      # empirically (Phase 1 Stage 1, mic-route PR #3): xcodebuild forwards any env var prefixed
+      # `TEST_RUNNER_` into that host process with the prefix stripped; a plain `xcodebuild
+      # TEST_RUNNER_X=1 test ...` trailing argument does NOT do this (that sets a build setting,
+      # not a process environment variable) -- it must be a real environment variable on the
+      # process that invokes xcodebuild, which `env:` below provides. This is how
+      # AudioGraphExceptionBridgeTests.swift tells this runner apart from a developer Mac to
+      # skip the three tests in it that hang for ~600s against this runner's CoreAudio device
+      # inventory, without skipping them everywhere. See that file's header and
+      # FORK-PATCHES.md's "phase-1-mic-route" section for the full diagnosis.
       - name: Run test targets
+        env:
+          TEST_RUNNER_VOICEINK_CI: 1
         run: |
           xcodebuild test \
             -project VoiceInk.xcodeproj \

@@ -803,6 +803,37 @@ PR; not a general license to edit CI). `AudioGraphExceptionBridgeTests.swift`'s 
 under the same guard in this same change). None of this stage's own 7 ported source files or 6
 ported test files needed any change to reach this fix.
 
+### 2. `Tests/VoiceInkTests/Features/Meetings/Capture/RouteAwareMeetingMicRecorderTests.swift`: deflake `liveRouteChangeWaitsForFirstBuffer`
+
+`RouteAwareMeetingMicRecorder.completePendingHandoff` delivers the promoted buffer via
+`onRawPCMSamplesStorage?(firstSamples)` synchronously, then calls `retireAfterHandoffAsync`,
+which retires the pre-handoff child on `cleanupQueue` — a queue created `.concurrent` — via
+`cleanupQueue.async { ... stop(); cancel(); ... }`. That retirement is fire-and-forget: nothing
+orders it before the test's next line. `liveRouteChangeWaitsForFirstBuffer` asserted
+`system.stopCalls == 1` / `system.cancelCalls == 1` synchronously right after waiting only for
+the promoted samples, so it raced the async cleanup and could flake under load.
+
+The sibling test in the same file, `activeFailureRebuildsSameRoute`, already guards the
+identical race with `try await waitUntil { failed.stopCalls == 1 }` before asserting. This
+entry initially cited a "donor commit `e1f6a227`" as the source of that guard, on the premise
+that some upstream donor had fixed the race there and never carried the fix to this test. That
+premise does not hold: `git log --all --grep="Deflake" -i` and `git cat-file -t e1f6a227` both
+come up empty across every branch and remote in this clone, and `git blame` shows the entire
+file — both tests, guard included — was introduced in a single fork commit, `895dedc55`
+("Phase 1 Stage 1: mic capture and audio route control"). There is no separate donor fix to
+have missed; this was simply an inconsistency within that one commit, where one test in the
+file used the wait-then-assert pattern and its sibling did not.
+
+Fix: add the same `try await waitUntil { system.stopCalls == 1 }` before the assertions in
+`liveRouteChangeWaitsForFirstBuffer`, matching the sibling's comment and style verbatim. Test
+file only; no production code touched. Verified load-bearing (not cosmetic) by temporarily
+patching the test's `FakeMeetingMicRecorder.stop()` to sleep before incrementing `stopCalls`:
+with the old unguarded form the test failed in ~12ms with `Expectation failed: (system.stopCalls
+→ 0) == 1`; with the wait restored, the same delayed stub passed in ~310ms (waiting out the
+delay). The stub patch was reverted before committing. Landed byte-identical on both
+`phase-1-mic-route` and `phase-1-integration` (cherry-pick) since this test file exists on both
+branches and both reach `main`.
+
 ## Architecture budget note
 
 The instruction for this project caps ongoing upstream touchpoints (outside the new

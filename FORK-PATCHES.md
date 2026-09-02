@@ -2494,3 +2494,88 @@ path (`pause`/`resume`/`discard`) before Phase 2, rather than one call at a time
 No upstream file touched, no SPM dependency added. Files changed: `MeetingChunkCollector.swift`,
 `MeetingEngine.swift`, `MeetingPersisting.swift` (new, fork-only), `MeetingChunkCollectorTests
 .swift`, `MeetingEngineTests.swift`, `FOLLOWUPS.md`.
+
+## engine-cleanup: a wrong race-behaviour comment, and `discard()`'s `markFailed` silent-failure gap closed
+
+Small, unrelated cleanup pass over `MeetingChunkCollector.swift` and the `discard()` gap the
+third review round above left explicitly open, done together only because both were flagged in
+the same pass.
+
+### 1. `MeetingChunkCollector.swift`'s drain doc comment claimed the watcher's stderr log fires when it loses the `retire` race -- it does not
+
+`closeAndDrainSortedSegments()`'s doc comment said the watcher's stderr log "still fires too,
+redundantly but harmlessly, for whichever side loses the `retire` race." Checked against
+`MeetingEngine.swift`'s actual watcher code (the mic and system chunk-rotation watchers, each
+built as `guard self.<collector>.retire(id:segments:persistenceFailures:) else { return }`
+followed by the `fputs(...)` stderr log): when `retire` loses the race and returns `false`, that
+`guard` returns immediately, before the watcher ever reaches its own `fputs` call. The log does
+NOT fire on the losing side -- only on the winning side, where `retire` succeeded and the guard
+fell through.
+
+**Fix:** reworded the comment to state that the watcher's stderr log does NOT also fire when it
+loses the race, and to explain why that loss is fine rather than merely asserting it is: the
+failure is not silently dropped, it reaches the caller through the `persistenceFailures` this
+drain call returns, which flows into `MeetingEngineResult.persistenceFailures` -- only the
+redundant stderr line is missing, never the information itself. Comment-only change; no
+behaviour touched.
+
+### 2. `discard()`'s `markFailed` could leave a meeting row silently stuck in `.recording`/`.paused`
+
+**Before:** `discard()` ran `Task { try? await persistence.markFailed(meetingHandle) }`. If that
+one write threw, the `try?` discarded the error with nothing to see it: the row stayed on
+whatever `MeetingState` it held when `discard()` ran, forever, and there was no report anywhere
+that the write had even been attempted, let alone that it failed. A later reader (meeting
+history, a support investigation) would see an apparently-abandoned in-progress meeting with no
+signal it was actually a deliberate, handled discard.
+
+**Design considered and rejected:** letting the failure propagate (`discard()` is a cleanup path
+callers use precisely because they want out; it must not throw back at them), and leaving it as
+a bare `try?` with nothing else (a stuck row that lies about meeting state is not an acceptable
+steady state, and this exact gap was already flagged and deliberately left open by the PR #12
+review round above -- see this file's entry just above and `FOLLOWUPS.md`).
+
+**After:** a new private `markMeetingFailedAfterDiscard(_:)` retries `persistence.markFailed`
+up to `MeetingEngine.discardMarkFailedMaxAttempts` (3) times, 200ms apart, before giving up.
+Only if every attempt fails does it report the final error -- with the meeting handle and the
+underlying error -- on the same stderr channel `MeetingChunkCollector`'s mid-meeting
+retirements already use for failures with no result object to land in. Success on any attempt
+returns immediately with no log line; this is a failure-reporting path, not a new success-path
+log line. `discardMarkFailedMaxAttempts` is `internal` (Swift's default, not `private`) for
+exactly one reason: so `MeetingEngineTests` can assert against it via `@testable import`
+instead of hardcoding a number that could silently drift out of sync with the implementation.
+It is a `let`, read by no production code outside `MeetingEngine` (grep-verified), so widening
+it creates no seam anyone could use to change engine behaviour -- only to read the retry count.
+
+**Disclosed residual, stated in the code itself, not just here:** retrying shrinks the window in
+which a persistently broken store leaves the row stuck on `.recording`/`.paused`; it does not
+close that window. If every attempt genuinely fails -- not a transient blip but a truly broken
+store -- the row ends up exactly where it would have before this fix, except the failure is now
+on stderr instead of nowhere. There is still no `stop()`-style result object for a caller to
+inspect; `discard()` remains non-`async` and returns nothing. `pause()`/`resume()`'s own
+`updateState` calls carry the identical shape of gap and were never in scope for this fix --
+`FOLLOWUPS.md` now tracks that remaining half on its own, since the `discard()` half it used to
+describe is closed.
+
+**Test:** `MeetingEngineTests.discardRetriesMarkFailedOnPersistentFailure`, against a
+`MeetingPersisting` fixture (`AlwaysFailingMarkFailedPersistence`) whose `markFailed` always
+throws and whose call count is tracked by an actor (`MarkFailedCallCounter`). Against the
+pre-fix single-`try?` code the counter can never exceed 1, so asserting it reaches
+`discardMarkFailedMaxAttempts` (3) fails; against the fix it passes because the retry loop
+actually runs 3 attempts. Verified by temporarily reverting just `discard()`'s call site back to
+`Task { try? await persistence.markFailed(meetingHandle) }` and re-running the single test:
+
+```
+MeetingEngineTests.swift:628: Expectation failed: await markFailedCalls.count == MeetingEngine.discardMarkFailedMaxAttempts
+Test case 'MeetingEngineTests/discardRetriesMarkFailedOnPersistentFailure()' failed on 'My Mac - VoiceInk Dev (94935)' (5.594 seconds)
+```
+
+Restoring the fix and re-running the identical test:
+
+```
+Test case 'MeetingEngineTests/discardRetriesMarkFailedOnPersistentFailure()' passed on 'My Mac - VoiceInk Dev (90227)'
+```
+
+(1 passed, 0 failed, per `xcrun xcresulttool get test-results summary` on both runs.)
+
+No upstream file touched, no SPM dependency added. Files changed: `MeetingChunkCollector.swift`,
+`MeetingEngine.swift`, `MeetingEngineTests.swift`, `FOLLOWUPS.md`.

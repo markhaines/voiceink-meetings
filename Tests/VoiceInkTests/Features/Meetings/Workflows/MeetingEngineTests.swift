@@ -354,6 +354,65 @@ private struct RacingChunkPersistence: MeetingPersisting {
     }
 }
 
+/// Thread-safe call counter for `AlwaysFailingMarkFailedPersistence.markFailed`, so a test can
+/// prove `discard()`'s retry loop actually ran the bounded number of attempts it promises, not
+/// just that it swallowed one failure the way the pre-fix `try?` did.
+private actor MarkFailedCallCounter {
+    private(set) var count = 0
+
+    func increment() { count += 1 }
+}
+
+/// A `MeetingPersisting` that behaves like the real `MeetingStore` it wraps except that
+/// `markFailed` always throws -- regression fixture for "`discard()`'s `markMeetingFailedAfter
+/// Discard` can leave a meeting row stuck" (FOLLOWUPS.md / FORK-PATCHES.md). Every other call is
+/// forwarded unchanged so `engine.start()` still persists a real, fetchable `Meeting` row.
+private struct AlwaysFailingMarkFailedPersistence: MeetingPersisting {
+    let store: MeetingStore
+    let markFailedCalls: MarkFailedCallCounter
+
+    @discardableResult
+    func startMeeting(title: String, audioDirectoryPath: String, startDate: Date) async throws -> MeetingHandle {
+        try await store.startMeeting(title: title, audioDirectoryPath: audioDirectoryPath, startDate: startDate)
+    }
+
+    @discardableResult
+    func appendSegment(
+        startOffset: TimeInterval,
+        endOffset: TimeInterval,
+        speakerLabel: String,
+        text: String,
+        sourceChannel: MeetingSegmentChannel,
+        to meeting: MeetingHandle
+    ) async throws -> MeetingSegmentHandle {
+        try await store.appendSegment(
+            startOffset: startOffset,
+            endOffset: endOffset,
+            speakerLabel: speakerLabel,
+            text: text,
+            sourceChannel: sourceChannel,
+            to: meeting
+        )
+    }
+
+    func updateDuration(_ duration: TimeInterval, for meeting: MeetingHandle) async throws {
+        try await store.updateDuration(duration, for: meeting)
+    }
+
+    func updateState(_ state: MeetingState, for meeting: MeetingHandle) async throws {
+        try await store.updateState(state, for: meeting)
+    }
+
+    func finish(_ meeting: MeetingHandle, endDate: Date) async throws {
+        try await store.finish(meeting, endDate: endDate)
+    }
+
+    func markFailed(_ meeting: MeetingHandle) async throws {
+        await markFailedCalls.increment()
+        throw StubPersistenceError(text: "markFailed")
+    }
+}
+
 /// Ordered record of what happened, so "stop() did not return early" is checked as an ORDERING
 /// fact after the run rather than only as a snapshot taken during it.
 private actor EventLog {
@@ -532,6 +591,41 @@ struct MeetingEngineTests {
         #expect(meeting?.state == .failed)
         #expect(try fetchSegments(from: container).isEmpty)
         #expect(mic.cancelCalls == 1)
+    }
+
+    /// Regression test for FOLLOWUPS.md's "`discard()` can leave a meeting row stuck in
+    /// `.recording`/`.paused`": before the fix, `discard()`'s `Task { try? await persistence
+    /// .markFailed(meetingHandle) }` called `markFailed` exactly once and silently dropped
+    /// whatever it threw, so this test's counter would stop at 1 and never reach
+    /// `discardMarkFailedMaxAttempts`, failing. After the fix, `markMeetingFailedAfterDiscard`
+    /// retries up to `discardMarkFailedMaxAttempts` times before giving up and logging, so the
+    /// counter reaches that bound even though `AlwaysFailingMarkFailedPersistence.markFailed`
+    /// never succeeds.
+    @Test("discard retries markFailed before giving up on a persistently failing store")
+    func discardRetriesMarkFailedOnPersistentFailure() async throws {
+        let container = try makeContainer()
+        let store = MeetingStore(modelContainer: container)
+        let markFailedCalls = MarkFailedCallCounter()
+        let persistence = AlwaysFailingMarkFailedPersistence(store: store, markFailedCalls: markFailedCalls)
+        let mic = FakeMeetingMicRecorder()
+        let system = FakeSystemAudioRecorder()
+        let engine = MeetingEngine(
+            title: "Abandoned with a hostile store",
+            persistence: persistence,
+            retainRecording: false,
+            meetingMicRecorder: mic,
+            systemAudioRecorderOverride: system
+        )
+
+        try await engine.start()
+        engine.discard()
+
+        let deadline = Date().addingTimeInterval(5)
+        while await markFailedCalls.count < MeetingEngine.discardMarkFailedMaxAttempts, Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+
+        #expect(await markFailedCalls.count == MeetingEngine.discardMarkFailedMaxAttempts)
     }
 
     @Test("stop finalizes the meeting and assembles the reconciled transcript")

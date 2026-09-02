@@ -190,6 +190,15 @@ for pin, repo in fetched:
     for k in ("version", "branch"):
         if k in pin["state"]:
             record[k] = pin["state"][k]
+    # Preserve a reviewer's free-text note across --update the same way components already
+    # do (see the "entry.get('note', ...)" below): a package record is otherwise rebuilt from
+    # scratch every run, so an unrelated pin bump elsewhere in the graph would silently drop
+    # this package's note with no failure to catch it. Only carried forward if one already
+    # exists -- this does not force "PENDING REVIEW" onto every package the way components
+    # does, since most plain packages carry no note at all and never need one.
+    prev_pkg = trusted_pkgs.get(identity)
+    if prev_pkg and "note" in prev_pkg:
+        record["note"] = prev_pkg["note"]
     pkg_records.append(record)
 
     if mode == "verify":

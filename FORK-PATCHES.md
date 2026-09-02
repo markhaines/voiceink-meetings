@@ -745,6 +745,222 @@ Recommendation for whichever Stage-1 cluster owns Detection: port
 `MeetingPromptStateMachine.swift` and `MeetingCandidateResolver.swift` together, verbatim, in
 the same change, under the same non-negotiable porting rules (every comment, every branch).
 
+## phase-1-vad-chunking (Stage 1: VAD chunking and transcript assembly)
+
+Ported verbatim into `VoiceInk/Features/Meetings/Transcription/`:
+`StreamingVadController.swift` (donor 225 lines, byte-identical), `TranscriptFormatter.swift`
+(donor 226, only `import MuesliCore` dropped), `TranscriptReconciler.swift` (donor 321, same),
+and `DiarizerRuntimePolicy.swift` (donor 306, one flagged deviation below). This section exists
+even though these files live entirely under `Features/Meetings/` — normally exempt per this
+file's header — because an independent review round required the one deviation below to be
+recorded here explicitly, not just in the file's own header comment.
+
+### `DiarizerRuntimePolicy.swift`: `DiarizerPreloadDiagnostics`'s default `signalSink`
+
+The donor's `DiarizerPreloadDiagnostics.init` (donor `DiarizerRuntimePolicy.swift:176-186`)
+defaults `signalSink` to:
+
+```swift
+signalSink: @escaping SignalSink = { event, parameters in
+    TelemetryDeck.signal(event, parameters: parameters)
+}
+```
+
+This fork has no `TelemetryDeck` dependency (confirmed by grepping `Package.resolved` and
+`project.pbxproj` — 28 pinned packages, none of them TelemetryDeck; VoiceInk has no telemetry
+system at all yet), and adding one is out of scope for this stage: it would mean editing
+`project.pbxproj` (forbidden for this cluster) and `package-trust.json` (owned by a different
+concurrent change). The verbatim default cannot compile as-is.
+
+**First attempt (reverted): a no-op default.** An earlier pass of this file replaced the default
+with `{ _, _ in }`. Independent cross-vendor review correctly flagged this as an unacceptable
+silent behavior change: every production caller that relies on the default (which is every real
+caller — none inject an explicit sink) would silently lose every preload
+started/ready/failed/interrupted diagnostic, with nothing anywhere signaling that anything had
+been dropped. A silent no-op default is not acceptable in any form, per that review.
+
+**Fix applied.** `signalSink` stays a defaulted parameter — same shape as the donor, so no call
+site is forced to change — but the default now logs through this fork's existing `os.Logger`
+facility (`Logger(subsystem: "com.hainesy.voiceinkmeetings", category: "DiarizerPreloadDiagnostics")`,
+the same convention used throughout the rest of the app, e.g. `VoiceInk/App/VoiceInk.swift`)
+instead of calling `TelemetryDeck.signal` or doing nothing. Preload diagnostics remain observable
+in Console.app / `log stream` until a real telemetry backend replaces this default. Every call
+site in the ported test suite (`DiarizerRuntimePolicyTests.swift`) already supplies its own
+explicit `signalSink`, so this default is only ever exercised by production code that hasn't been
+given one — no test behavior depends on it. Everything else in the file, including every comment
+and the M1/macOS-15.1 GPU-avoidance branch (FluidAudio issue #344), remains byte-for-byte
+identical to the donor.
+
+### `MeetingVadStreams.swift` and `ADAPTER-HANDOVER.md`: new fork-owned files, not ports
+
+Added in the same review round, for a different finding: `StreamingVadController.processAudio(_:)`
+takes an untyped `[Float]`, so nothing in this cluster's own code enforced the donor's
+AEC-cleaned-mic-only / raw-system-only split (`MeetingSession.swift:1226-1233` and
+`:1257-1262`) once a later adapter stage started wiring real audio in. `MeetingVadStreams.swift`
+adds `MicVadStream`/`SystemVadStream`, a facade over the (unedited) ported
+`StreamingVadController`, with distinct nominal wrapper types (`RawMicSamples`,
+`RawSystemSamples`) so feeding the wrong stream to the wrong VAD is a compile error. `MicVadStream`
+additionally owns the AEC call itself (`MicEchoCanceller`), so there is no API by which raw mic
+samples can reach the mic VAD un-cancelled: the facade takes raw samples and runs the canceller
+itself, and `AECCleanedMicSamples` is an unforgeable receipt it hands back rather than an input a
+caller constructs. Two earlier designs that instead restricted who could CONSTRUCT that type were
+both defeated (a trapping protocol witness; a cross-file extension initializer assigning an
+internal stored property) -- see that file's header comment for both defeats, and
+`MeetingVadStreamsTests.swift` for the full attack list with each verbatim compiler error. The two
+residual holes are stated there and accepted: passing a no-op canceller, and `unsafeBitCast`.
+`ADAPTER-HANDOVER.md`, alongside it in the same directory, is the self-contained (in-repo, no
+`.tandem/` dependency) handover document for the next stage, covering AEC/VAD wiring, rotation
+inputs/outputs, reconcile-before-format ordering, and diarizer preload/cancellation semantics,
+all cited against donor file/line references.
+
+## phase-1-aec-dtln (Stage 1: Acoustic Echo Cancellation, DTLN path)
+
+Ports the donor's meeting AEC engine, DTLN path only (LocalVQE deferred; Apple Voice Processing
+I/O rejected — both settled by Phase 1 AEC de-risk investigations, whose findings are inlined
+here so they survive without any external report. **VPIO was rejected on the donor's own
+evidence**: Muesli shipped Apple VoiceProcessingIO in commit `75254c93` (2026-04-07) and
+reverted it in `01320aef` about 15 minutes later, with the revert message recording that VPIO's
+AEC "works but reduces speaker volume by 60-80% even at minimum ducking level. Users can't hear
+the meeting without headphones"; the very next donor commit adds the DTLN CoreML path. VPIO has
+no privileged reference for audio it does not itself render, so it compensates by ducking, and
+there is no public API to decouple cancellation from ducking. **LocalVQE was deferred** because
+its ggml dylibs are not in the donor repo and must be built from source
+(`scripts/build_localvqe.sh`); DTLN is the documented stopgap, with the LocalVQE follow-up
+recorded in `FOLLOWUPS.md`): `Capture/MeetingNeuralAec.swift` (donor 796 lines, DTLN-only excision — 4 points: the
+`preload()` LocalVQE-first branch removed, `MeetingAecProcessorSelection` trimmed 3→1 case, the
+`localvqe` special case in `referenceDelaySamples()` dropped, `LocalVQEProcessor.swift`/
+`LocalVQEBridge` never ported at all — delay estimator and buffer/trim machinery kept verbatim,
+load-bearing on DTLN), `Capture/MeetingAecDiagnostics.swift` (extracted from
+`MeetingSessionDiagnostics.swift` donor lines 72-156: `MeetingAecDiagnosticsSnapshot` +
+its `Decodable` extension, `MeetingAecDelayObservation`, `MeetingAecDelayCandidateScore`,
+`MeetingAecDelaySkip` — same donor file as `Capture/AudioSampleStats.swift` (lines 5-52, Stage 0)
+and capture-core's `SystemAudioCaptureDiagnostics.swift` (lines 54-71), three different slices of
+one donor file ported independently by three different agents; the `MeetingSessionDiagnostics`
+aggregator class itself, donor line 158+, is not ported — MeetingSession integration owns it),
+and `Tests/.../MeetingNeuralAecTests.swift` (15 of the donor's 17 `@Test`s; 2 dropped —
+`localVQEBridgeRejectsEmptyModelPath`, `localVQEBridgeReportsMissingLibraryPath` — called the
+`LocalVQEBridge` C target directly and would no longer compile).
+
+Adds `MeetingAecRouteBypassSource`, a small protocol (new, not from the donor — the donor never
+gated meeting AEC on route) letting a headphone-like audio route bypass DTLN per mic chunk;
+seamed for the MeetingSession integration owner to wire to the real `AudioRouteClassifier`
+(ported separately, for dictation today).
+
+### 2. `project.pbxproj`: `dtln-aec-coreml` package reference + `DTLNAecCoreML`/`DTLNAec512` product links (VoiceInk target)
+
+This is an upstream-owned-file touch outside the `Features/Meetings/` slice, so it counts against
+the Phase 1+ budget the note below sets — and, same as section 1's bridging-header entry, it is
+logged here as a deliberate, one-time addition rather than left implicit in a diff.
+
+**Why this one is unavoidable, not a workaround.** Linking a Swift Package product into an Xcode
+target's build graph is not expressible any other way in a plain `.xcodeproj` (this project has
+no root-level `Package.swift` for the app itself — every dependency is an Xcode-managed
+`XCRemoteSwiftPackageReference`/`XCSwiftPackageProductDependency` pair, entirely inside
+`project.pbxproj`). There is no `xcodebuild` verb to add a package reference; only Xcode's GUI or
+a direct pbxproj edit can do it, and both mutate the same bytes. Confirmed empirically before
+touching anything: with `dtln-aec-coreml` pinned in `Package.resolved` and both new Swift files
+in place (picked up automatically via `PBXFileSystemSynchronizedRootGroup`, no pbxproj edit
+needed for those), the *only* build error in the whole log was
+`MeetingNeuralAec.swift:53:8: error: Unable to resolve module dependency: 'DTLNAecCoreML'`.
+
+**Why this Stage-1 cluster specifically, and not left for a later serial merge.** The four
+parallel Stage-1 agents (capture core, mic+route, AEC, VAD chunking) were each told not to touch
+`project.pbxproj`, to avoid a four-way collision on one shared file. Checked before editing: the
+capture-core cluster had already finished and had not touched it; mic+route and vad-chunking were
+both instructed not to and have no reason to (neither adds an SPM dependency). With no live
+collision risk, adding it here — once, minimally — is cheaper than adding a fifth, purely
+mechanical hand-off step whose only job would be this exact 6-hunk edit.
+
+**The edit, and confirmation every hunk was read.** Six additive hunks, no reformatting, no
+`objectVersion`/`preferredProjectObjectVersion` change, modeled directly on the existing
+`swift-huggingface` entry (same `exactVersion` requirement shape) and on `mlx-swift-lm` (same
+one-package/two-products shape, there `MLXLLM`+`MLXLMCommon`, here `DTLNAecCoreML`+`DTLNAec512`):
+
+1. `PBXBuildFile` section: 2 new entries (`DTLNAecCoreML in Frameworks`, `DTLNAec512 in
+   Frameworks`), each `productRef`-linked to its `XCSwiftPackageProductDependency`.
+2. `VoiceInk` target's `Frameworks` build phase `files` list: the same 2 entries appended.
+3. `VoiceInk` target's `packageProductDependencies`: 2 entries appended (test targets and
+   `VoiceInkRefineXPC` untouched — nothing in this port is referenced outside the `VoiceInk`
+   app target; the ported test file uses `@testable import VoiceInk` only, never
+   `import DTLNAecCoreML` directly).
+4. `PBXProject.packageReferences`: 1 entry appended
+   (`XCRemoteSwiftPackageReference "dtln-aec-coreml"`).
+5. `XCRemoteSwiftPackageReference` section: 1 new block, `repositoryURL =
+   "https://github.com/MimicScribe/dtln-aec-coreml.git"`, originally `requirement = { kind =
+   exactVersion; version = 0.7.0; }` — pinned exact, not `upToNextMajorVersion`, since this
+   package is archived and will never publish a compatible newer tag to float onto. **Repinned
+   to `{ kind = revision; revision = ecb641dcb4b152fd10b1261a869aaa1e8acf0174; }` shortly after
+   — see the dedicated subsection below — for a LICENSE fix found during review, not for any
+   code reason.**
+6. `XCSwiftPackageProductDependency` section: 2 new blocks (`DTLNAecCoreML`, `DTLNAec512`), both
+   `package`-linked to the one reference above.
+
+`git diff VoiceInk.xcodeproj/project.pbxproj` was read in full after the edit — all 6 hunks are
+attributable to exactly this package link, nothing else. `xcodebuild -resolvePackageDependencies`
+afterward resolved `DTLNAecCoreML` at `0.7.0` and left `Package.resolved` byte-identical to the
+version already committed (the manual pin added ahead of this edit — see the AEC task report —
+matched exactly what a real Xcode resolution produces). `scripts/verify-package-trust.sh` passed
+unchanged. Debug build and the full local test run (`xcodebuild test`, CI's exact invocation)
+both succeeded afterward. The literal commands were the same `xcodebuild` invocations CI runs
+(see `.github/workflows/ci.yml`); every hunk of the `project.pbxproj` diff was read back
+line by line and confirmed attributable to linking this one package (25 added lines, no
+reformatting, no `objectVersion` bump).
+
+### 3. `dtln-aec-coreml` repinned from tag `0.7.0` to commit `ecb641d`, for a LICENSE fix
+
+The review that produced section 2's pin found that `LICENSE` at tag `0.7.0` read verbatim
+`Copyright (c) 2026 Anthropic` — not MimicScribe, the actual publisher — unchanged since the
+repo's first commit and identical at the donor's older `0.6.0-beta` pin, with the same
+misattribution in `DTLNAecCoreML.podspec` (`s.author`, `s.homepage`, `s.source` all pointing at
+an unrelated `anthropics/` GitHub org). An MIT grant is only worth what the granting party can
+actually grant. The maintainer's very next commit, `ecb641d` — one commit past the `0.7.0` tag,
+and the current archived HEAD — fixes exactly that (LICENSE and podspec renamed to MimicScribe)
+and nothing else functional, and additionally adds the archive notice to the README.
+
+**Verified docs-only before repinning**, so this costs nothing in code: `git diff
+0.7.0..ecb641d --stat` touches exactly 4 files (`DTLNAecCoreML.podspec`,
+`Documentation/GettingStarted.md`, `LICENSE`, `README.md`) — zero changes under `Sources/`, to
+`Package.swift`, under `ThirdPartyLicenses/`, or to any `.mlpackage` resource. Confirmed by git
+object identity, not just diff absence: the `Sources/` tree
+(`9d3f71f8f9ab8ac185c4b79425f913c27edd7067`) and the `Package.swift` blob
+(`e41c9ef8064ee1cd1ad964e9ce23e1dce05f8f07`) are byte-identical at both revisions. Nothing in
+`MeetingNeuralAec.swift` or its tests needed to change.
+
+**The pbxproj edit for the repin** was a single-hunk, one-line-pair change to the existing
+`XCRemoteSwiftPackageReference "dtln-aec-coreml"` block's `requirement`, from `kind =
+exactVersion; version = 0.7.0;` to `kind = revision; revision =
+ecb641dcb4b152fd10b1261a869aaa1e8acf0174;` (pinning a commit rather than a tag requires the
+`revision` requirement kind). Read in full; nothing else in the file changed.
+`xcodebuild -resolvePackageDependencies` resolved `DTLNAecCoreML` at `ecb641d` afterward;
+`scripts/verify-package-trust.sh --update` re-blessed the moved pin; Debug build and the full
+local test run both succeeded again. Full history of the LICENSE finding, kept rather than
+discarded, lives in the `dtln-aec-coreml` entry's `note` field in `package-trust.json` and in
+the AEC task report.
+
+### 4. `scripts/verify-package-trust.sh`: plain-package `note` field now survives `--update`
+
+Found while writing the note above: `--update` already preserves an existing `note` across runs
+for the `components` section (`entry.get("note", "PENDING REVIEW")`), but rebuilds each plain
+package's `graph.packages` record from scratch every time, with no equivalent preservation. A
+`note` manually added to a package (as done here, twice, once for each pin) would be silently
+dropped by the very next `--update` for a completely unrelated pin bump elsewhere in the graph
+— and `verify` mode would keep passing, since it only compares `location`/`revision`/`tree`/
+`manifests`, not `note`, so nobody would notice. Fixed surgically: in the same loop that builds
+each package's record, look up the previously-trusted record for that identity and carry its
+`note` forward if one exists (mirrors the components pattern; does *not* default-inject
+`"PENDING REVIEW"` onto every plain package, since most carry no note and don't need one).
+
+**Proved with a real, reversible test**, not just reasoning about the code: temporarily bumped
+`KeySender`'s pin in `Package.resolved` to a different, real commit on its own repo
+(`bd01c54755b337ea63211656dab916afe7e40357`, an unrelated package to `dtln-aec-coreml`), ran
+`scripts/verify-package-trust.sh --update`, and confirmed both halves of the result: KeySender's
+own record genuinely changed (`~ package keysender: 99584bf1a03a -> bd01c54755b3`, proving this
+was a real re-bless, not a no-op), and `dtln-aec-coreml`'s `note` survived intact (present,
+correct length, revision unchanged) despite having nothing to do with the pin that moved. Then
+reverted KeySender's pin back to its correct committed revision and ran `--update` once more to
+restore the clean, correct final state — confirmed with `scripts/verify-package-trust.sh`
+(verify mode) passing and `git diff --stat` showing no residual KeySender change anywhere.
+
 ## phase-1-mic-route (Stage 1: mic capture and audio route control)
 
 ### 1. `.github/workflows/ci.yml`: `TEST_RUNNER_VOICEINK_CI` added to the "Run test targets" step
@@ -841,4 +1057,50 @@ The instruction for this project caps ongoing upstream touchpoints (outside the 
 top of a clean base — it does not describe Phase 0 itself, whose entire job is editing
 upstream-owned files (identity, signing, Sparkle, delicensing) exactly once, up front, so later
 phases don't have to. This entry is long because Phase 0 is supposed to be long; Phase 1 onward
-should look nothing like this.
+should look nothing like this. Stage 1's own touchpoint count so far: 2 (Stage 0's bridging
+header, this stage's package link) — both one-time additions to a target's build graph, not
+recurring edits, and both logged with the same rationale: confirmed unavoidable, confirmed
+minimal, confirmed no live collision with a parallel agent.
+
+## phase-1-capture-core (Stage 1: system audio capture core)
+
+### 1. `VoiceInk/Info.plist`: `NSAudioCaptureUsageDescription` added
+
+The CoreAudio process-tap path (`CoreAudioSystemRecorder.swift`) triggers the system "would
+like to record audio from other applications" dialog only if `NSAudioCaptureUsageDescription`
+is present in `Info.plist` — otherwise the tap creation call fails outright rather than
+prompting. Key was not already present (`NSMicrophoneUsageDescription`,
+`NSAppleEventsUsageDescription` and `NSScreenCaptureUsageDescription` were; this one wasn't).
+Added, matching the existing string style:
+
+```
+<key>NSAudioCaptureUsageDescription</key>
+<string>VoiceInk captures system audio from other applications during meeting recordings.</string>
+```
+
+This is the ~2nd of the ~6-touchpoint Phase 1+ budget the note above sets. Confirmed against
+the donor's own `scripts/build_native_app.sh` (which injects the same key at build time with
+`$APP_DISPLAY_NAME captures system audio from other applications during meeting recordings.`)
+and `REVIEW.md` ("System audio capture through the CoreAudio tap path uses audio-capture TCC
+(`kTCCServiceAudioCapture`) and does not require Screen Recording") — the permission this key
+gates is `kTCCServiceAudioCapture`, a distinct TCC service from `NSScreenCaptureUsageDescription`
+(Screen Recording), which the app already requests for a different feature (screen context).
+
+### Note: new fork-only file not from the donor
+
+`VoiceInk/Features/Meetings/Capture/SystemAudioCaptureDiagnostics.swift` is new, not upstream —
+no entry needed under the rule at the top of this file ("New code that lives entirely under
+`Features/Meetings/` ... does not need an entry here"). Logged anyway for visibility: it
+extracts `SystemAudioCaptureDiagnosticsSnapshot` and `SystemAudioDiagnosticsProviding` verbatim
+from the donor's `MeetingSessionDiagnostics.swift` (lines 54-70), the same donor file
+`AudioSampleStats.swift` was already extracted from in Stage 0. Both `CoreAudioSystemRecorder.swift`
+and `SystemAudioRecorder.swift` conform to `SystemAudioDiagnosticsProviding` and cannot compile
+without it; the rest of `MeetingSessionDiagnostics.swift` (AEC delay estimation, diarization
+counts, chunk health, the `MeetingSessionDiagnostics` class itself) is NOT ported and remains
+Stage-2/MeetingSession-owned. The extraction was judged in-scope, rather than logged as a
+"Known gap", because those 17 lines are pure declarations (one snapshot value type and one
+protocol) that two ported files cannot compile without, and because Stage 0 set exactly this
+precedent by extracting `AudioSampleStats.swift` from the same donor file. It is distinct from
+the Stage 0 decision NOT to port `MeetingPromptStateMachine.swift`: that would have required
+inventing a placeholder for `MeetingCandidate`, a type belonging to a detection subsystem that
+has not been designed yet, which is a different act from lifting declarations verbatim.

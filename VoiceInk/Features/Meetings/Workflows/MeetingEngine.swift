@@ -157,9 +157,12 @@ struct MeetingEngineResult: Sendable {
     /// about this array it was simply a hole, and a segment could reach `rawTranscript` while
     /// the reason it never reached disk reached nothing but a log line.
     ///
-    /// Still NOT covered, deliberately: `pause()`/`resume()`/`discard()`'s own
-    /// `updateState`/`markFailed` calls, which no finding has scoped in -- see FOLLOWUPS.md's
-    /// entry on `discard()`.
+    /// Still NOT covered, deliberately: `pause()`/`resume()`'s own `updateState` calls, which no
+    /// finding has scoped in. `discard()`'s `markFailed` call is a related but separate gap --
+    /// it is no longer silently dropped (see `discard()`'s doc comment and
+    /// `markMeetingFailedAfterDiscard`), but it still has no `stop()`-style result object to
+    /// report into; a failure there reaches stderr, not this array, because `discard()` itself
+    /// is not `async` and returns nothing for a caller to inspect.
     let persistenceFailures: [Error]
 }
 
@@ -567,6 +570,21 @@ final class MeetingEngine {
     /// state (closer than `finish`, which implies a completed transcript). Flagged here as a
     /// real gap, not a confident modeling choice: a true "discarded" outcome needs a
     /// MeetingStore capability this stage does not add.
+    ///
+    /// THE `markFailed` FAILURE MODE (closed here, see FORK-PATCHES.md for the full record):
+    /// `discard()` is not `async` and returns nothing, so unlike `stop()` there is no result
+    /// object to report a persistence failure into, and this write must not throw back out of a
+    /// path callers use for cleanup. Silently dropping the error with `try?` was rejected too:
+    /// if that single write fails, the row is left exactly as `discard()` found it (`.recording`
+    /// or `.paused`) forever, which is a live meeting state for a meeting nobody is capturing
+    /// anymore -- indistinguishable, to any later reader, from a crash. `markMeetingFailedAfterDiscard`
+    /// below retries a bounded number of times, then reports the final failure on the same
+    /// stderr channel `MeetingChunkCollector`'s mid-meeting retirements already use for failures
+    /// with no result object to land in (see that file's header). DISCLOSED RESIDUAL: if every
+    /// attempt fails (a genuinely broken store, not a transient blip), the row still ends up
+    /// stuck exactly as before this fix -- retrying shrinks that window, it does not close it,
+    /// and there remains no `stop()`-style result object for a caller to inspect. That gap is
+    /// real and is not claimed to be fixed here.
     func discard() {
         let (rawRecorder, systemRecorder) = chunkRotationQueue.sync { () -> (PCMChunkRecorder?, PCMChunkRecorder?) in
             isRecording = false
@@ -601,9 +619,43 @@ final class MeetingEngine {
         micChunkCollector.cancelAll()
         systemChunkCollector.cancelAll()
         if let meetingHandle {
-            Task { try? await persistence.markFailed(meetingHandle) }
+            Task { await markMeetingFailedAfterDiscard(meetingHandle) }
         }
         fputs("[meeting] recording discarded\n", stderr)
+    }
+
+    /// Bounded so a persistently broken store can't spin this loop forever. `internal` (the
+    /// default -- no access modifier), not `private`, for exactly one reason: so
+    /// `MeetingEngineTests` can assert against it via `@testable import` instead of hardcoding
+    /// a number that could silently drift out of sync with this implementation. That is the
+    /// only reason and the only thing this widening buys: it is a `let`, so nothing outside
+    /// this type -- test code included -- can write to it or otherwise change `discard()`'s
+    /// retry behaviour through it, and it is read by no production code outside this type
+    /// (grep confirms the sole outside reference is the test file). Widening a `var`, or
+    /// exposing anything that could redirect what `markMeetingFailedAfterDiscard` actually
+    /// does, would be a different call; a read-only retry-count constant is not that.
+    static let discardMarkFailedMaxAttempts = 3
+
+    /// See `discard()`'s doc comment for why this exists and what it does NOT close. Retries
+    /// `markFailed` up to `discardMarkFailedMaxAttempts` times with a short delay between
+    /// attempts, then -- only if every attempt failed -- reports the final error on stderr with
+    /// enough detail (the meeting handle and the error itself) to act on. Success on any attempt
+    /// returns immediately and logs nothing: this is a failure-reporting path, not a new
+    /// success-path log line.
+    private func markMeetingFailedAfterDiscard(_ meeting: MeetingHandle) async {
+        var lastError: Error?
+        for attempt in 1...Self.discardMarkFailedMaxAttempts {
+            do {
+                try await persistence.markFailed(meeting)
+                return
+            } catch {
+                lastError = error
+                if attempt < Self.discardMarkFailedMaxAttempts {
+                    try? await Task.sleep(nanoseconds: 200_000_000)
+                }
+            }
+        }
+        fputs("[meeting] failed to mark discarded meeting as failed after \(Self.discardMarkFailedMaxAttempts) attempts (meeting=\(meeting), error=\(String(describing: lastError))); the row may still read .recording/.paused instead of .failed\n", stderr)
     }
 
     func stop() async throws -> MeetingEngineResult {

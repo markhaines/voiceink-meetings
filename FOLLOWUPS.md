@@ -195,23 +195,24 @@ Known limitations and handover items surfaced during review, deliberately not fi
 the change that found them. Not a task tracker — just a record so they aren't rediscovered from
 scratch later.
 
-## `discard()` can leave a meeting row stuck in `.recording`/`.paused`
+## `pause()`/`resume()` can still leave a meeting row on the wrong `MeetingState`
 
-Source: `VoiceInk/Features/Meetings/Workflows/MeetingEngine.swift`, `discard()`'s
-`Task { try? await persistence.markFailed(meetingHandle) }`. The `try?` discards
-`markFailed`'s error exactly the way the pre-F3 code discarded every other persistence error.
-If that one write fails, the row keeps whatever state it held when `discard()` ran
-(`.recording` or `.paused`) instead of moving to `.failed`, so a later reader -- meeting
-history, a support investigation -- sees an apparently-abandoned in-progress meeting with no
-signal that it was in fact a deliberate, handled discard.
+Source: `VoiceInk/Features/Meetings/Workflows/MeetingEngine.swift`, `pause()`'s
+`Task { try? await persistence.updateState(.paused, for: meetingHandle) }` and `resume()`'s
+equivalent `.recording` call. Same shape as the `discard()` gap this entry used to describe:
+`try?` discards `updateState`'s error, so if that one write fails the row keeps whatever state
+it held before the call instead of reflecting what actually happened, and neither `pause()` nor
+`resume()` is `async` or returns anything a caller could inspect to notice.
 
-Confirmed accurate by cross-vendor review of the F3 fix rounds, and deliberately NOT fixed
-there: `discard()` is not `async` and has no result object, so surfacing this needs a decision
-about what channel it reports on (a callback, a stored last-error, a retry), which is a design
-question rather than a mechanical fix, and it sits on the same unscoped path as
-`pause()`/`resume()`'s own `updateState` calls. The same review's recommendation stands:
-**fix before Phase 2**, and fix that whole path (`pause`/`resume`/`discard`) together rather
-than one call at a time.
+**`discard()`'s own `markFailed` half of this same original finding IS now fixed** (see
+FORK-PATCHES.md's engine-cleanup entry): it retries a bounded number of times and, only if
+every attempt fails, reports the final error on the existing stderr channel with enough detail
+to act on -- so a caller can no longer lose the error with a single silent `try?`. The residual
+that fix disclosed rather than hid: retrying shrinks the window in which a genuinely broken
+store leaves the row stuck, it does not close it, and there is still no `stop()`-style result
+object for a caller to inspect. `pause()`/`resume()`'s `updateState` calls were never in scope
+for that fix and remain exactly as open as before -- **still worth closing the same way**
+before Phase 2, ideally reusing the same retry-then-report shape rather than re-deriving it.
 
 ## Known limitations to validate
 

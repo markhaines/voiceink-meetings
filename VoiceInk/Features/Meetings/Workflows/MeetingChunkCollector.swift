@@ -165,9 +165,14 @@ final class MeetingChunkCollector {
     /// it, and persistence lives INSIDE that body. So whichever of {this call, the watcher}
     /// observes the result first, persistence itself already ran (or is running) exactly once;
     /// this call awaits that same completion and returns its failures, so the chunk's
-    /// persistence outcome reaches `MeetingEngine.stop()`'s result rather than only the
-    /// watcher's stderr log (which still fires too, redundantly but harmlessly, for whichever
-    /// side loses the `retire` race).
+    /// persistence outcome reaches `MeetingEngine.stop()`'s result. The watcher's stderr log
+    /// does NOT also fire in that case: its `guard ... retire(...) else { return }` (see
+    /// `MeetingEngine.swift`'s mic/system chunk-rotation watchers) returns before reaching that
+    /// log line whenever `retire` loses this race, so this drain path is the only report that
+    /// failure gets. That is not a second loss stacked on the first: the failure still reaches
+    /// the caller, via the `persistenceFailures` this call returns and which flows on into
+    /// `MeetingEngineResult.persistenceFailures` -- only the redundant stderr line is missing,
+    /// never the information itself.
     func closeAndDrainSortedSegments() async -> (segments: [SpeechSegment], persistenceFailures: [Error]) {
         let (tasksToAwait, alreadyCompleted, alreadyCompletedFailures) = lock.withLock { state in
             state.isClosed = true

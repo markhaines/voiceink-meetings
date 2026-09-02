@@ -162,6 +162,10 @@ struct RouteAwareMeetingMicRecorderTests {
         try await waitUntil { samples == [[1], [2]] }
 
         #expect(samples == [[1], [2]])
+        // The retired child is stopped on the async cleanup queue after
+        // promotion; wait for it rather than asserting synchronously (flakes
+        // under CI load otherwise).
+        try await waitUntil { system.stopCalls == 1 }
         #expect(system.stopCalls == 1)
         #expect(system.cancelCalls == 1)
     }

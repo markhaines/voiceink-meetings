@@ -1062,3 +1062,49 @@ should look nothing like this. Stage 1's own touchpoint count so far: 2 (Stage 0
 header, this stage's package link) — both one-time additions to a target's build graph, not
 recurring edits, and both logged with the same rationale: confirmed unavoidable, confirmed
 minimal, confirmed no live collision with a parallel agent.
+
+## turn-normalizers (Stage 1: per-utterance turn timing)
+
+Ported verbatim into `VoiceInk/Features/Meetings/Transcription/`: `MicTurnNormalizer.swift`
+(donor 182 lines, byte-identical beyond the added header — confirmed by `diff`, not eyeballing)
+and `SystemTurnNormalizer.swift` (donor 69 lines, same). Tests ported verbatim into
+`Tests/VoiceInkTests/Features/Meetings/Transcription/`: `MicTurnNormalizerTests.swift` (donor
+159 lines) and `SystemTurnNormalizerTests.swift` (donor 52 lines) — both files' only change is
+`@testable import MuesliNativeApp` → `@testable import VoiceInk`, same convention as every
+prior ported test file in this cluster.
+
+This section exists even though these files live entirely under `Features/Meetings/` —
+normally exempt per this file's header — for the same reason `phase-1-vad-chunking`'s section
+exists: a fork-only extraction that needs recording, plus the fact that these two files turned
+out to be the load-bearing mechanism for meeting-transcript timestamps (never named as such in
+the original project handoff) is worth a pointer here for anyone reading this file top-down.
+
+### `SpeechTranscriptionResult.swift`: new fork-only file, not from the donor
+
+Both normalizers consume `SpeechTranscriptionResult { text: String, segments: [SpeechSegment] }`,
+which in the donor is defined inline in `TranscriptionRuntime.swift:11-14` — a file this fork
+does not port (it is Stage-2/MeetingEngine territory, not built yet). Same situation Stage 1's
+`SystemAudioCaptureDiagnostics.swift` and Stage 0's `AudioSampleStats.swift` were in: two ported
+files cannot compile without a donor type that lives in an unported file. Extracted verbatim
+(same "Extracted verbatim" header convention as those two) into its own file rather than ported
+inline into either normalizer, since both consume it. Its `segments` field is typed
+`[SpeechSegment]`, this fork's existing `VoiceInk/Features/Meetings/Models/SpeechSegment.swift`
+(the shared foundation type both normalizers otherwise already resolve to via same-target
+visibility, no import needed) — not a second, redundant declaration.
+
+Both normalizer files keep the donor's `import FluidAudio`, even though neither file calls a
+FluidAudio symbol directly (`SpeechTranscriptionResult` is donor-app-local, not part of the
+FluidAudio package) — same as the existing precedent in this cluster
+(`TranscriptFormatter.swift`, `TranscriptReconciler.swift`, both keep the same apparently-unused
+import). FluidAudio is already a fork dependency (used extensively elsewhere), so the import is
+inert, not a new touchpoint.
+
+### Known test-coverage gap
+
+The donor's own test suite exercises `isFragmented` and the `sentenceSplit` proportional-timing
+interpolation directly, but never exercises `mergeAdjacentSegments` producing an actual merge:
+every donor test either has segments that don't merge (`preservesPhraseLikeTimings`, gap 0.6s >
+the 0.35s cap, neither segment short) or is fragmented before `mergeAdjacentSegments` is ever
+reached (`collapsesFragmentedShards`, `fragmentedShardsMultiSentence`). No donor test asserts two
+segments actually collapsing into one via the 0.35s gap or the 1.5s short-side cap. Not added
+speculatively here, per this task's instructions — flagged instead so it's visible to review.

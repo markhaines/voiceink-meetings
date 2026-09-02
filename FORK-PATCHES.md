@@ -536,7 +536,13 @@ paths cannot answer it. The grouping below is generated from git, not typed by h
 regenerate it with `git diff --name-status 711297b..HEAD` (that commit is the fork
 point, `git merge-base HEAD upstream/main`) and re-sort into these five groups.
 
-Totals: 60 identity-only edits, 15 behavioural edits, 7 build/project changes, 17 deletions, 8 new fork-only files (107 paths).
+Totals: 60 identity-only edits, 15 behavioural edits, 8 build/project changes, 17 deletions, 10 new fork-only files (110 paths).
+
+This appendix started as a Phase 0 inventory, but it is maintained past Phase 0 for anything
+UPSTREAM-OWNED that a later stage touches -- that is the question it exists to answer at merge
+time, and a later stage quietly editing an upstream file without appearing here would defeat the
+whole point. Files created by this fork under `Features/Meetings/` are still out of scope by this
+file's own rule; `.gitignore` (A3) is the first post-Phase-0 addition.
 
 ### A1. Identity-only edits (60 files)
 
@@ -626,7 +632,7 @@ These changed what the app does. Read the reason before merging upstream changes
 - `VoiceInk/Features/Settings/Views/SettingsView.swift` -- removed the "Show Announcements" toggle and its start/stop wiring
 - `VoiceInkRefineXPC/VoiceInkRefineInferenceEngine.swift` -- dropped `import MLXHuggingFace` and swapped `#huggingFaceTokenizerLoader()` for the fork-owned `HuggingFaceTokenizerLoader()` -- this is what takes the macro out of the build graph (section 6)
 
-### A3. Build and project configuration (7 files)
+### A3. Build and project configuration (8 files)
 
 - `Makefile` -- added `LOCAL_XCODEBUILD_FLAGS ?=` for CI, and pinned the whisper.cpp checkout to `whisper-cpp.rev` instead of `git pull`ing upstream HEAD
 - `README.md` -- fork header, build instructions, upstream attribution
@@ -635,6 +641,7 @@ These changed what the app does. Read the reason before merging upstream changes
 - `VoiceInk/VoiceInk.debug.entitlements` -- same, for the debug configuration
 - `VoiceInk/VoiceInk.entitlements` -- iCloud/CloudKit container entitlements removed
 - `scripts/release.sh` -- notarisation/signing identifiers pointed at the fork
+- `.gitignore` -- five build-scratch ignore lines appended (stage2-models-store escalation round, section 9)
 
 ### A4. Deleted upstream files (17 files)
 
@@ -656,7 +663,7 @@ These changed what the app does. Read the reason before merging upstream changes
 - `VoiceInk/Infrastructure/Licensing/PolarService.swift` -- licensing (section 5)
 - `VoiceInk/Infrastructure/RemoteConfig/AnnouncementsService.swift` -- polled upstream's GitHub Pages host every 4 hours and rendered upstream-supplied content with a clickable link (section 2b)
 
-### A5. New fork-only files (8 files)
+### A5. New fork-only files (10 files)
 
 - `.github/workflows/ci.yml` -- the CI pipeline (section 6)
 - `FORK-PATCHES.md` -- this file
@@ -665,6 +672,7 @@ These changed what the app does. Read the reason before merging upstream changes
 - `package-trust.json` -- the reviewed build-time input: the whole pinned package graph (every pin's location, revision, root tree and manifest blob ids, plus sha256 of `Package.resolved`), and the reviewed macro/build-tool plugin components with their source-tree hashes (section 6)
 - `scripts/assert-fork-identity.sh` -- the fork-identity guard, run against the built app and the project configuration (section 6)
 - `scripts/verify-package-trust.sh` -- enforces `package-trust.json` before anything is built (section 6)
+- `scripts/verify-meeting-store-isolation.sh` + `scripts/negative-controls/` -- source files that MUST NOT COMPILE, re-attacking `MeetingStore`'s isolation boundary on every CI run (stage2-models-store escalation round, section 4)
 - `whisper-cpp.rev` -- the pinned whisper.cpp revision (section 6)
 
 
@@ -1007,6 +1015,37 @@ reverted KeySender's pin back to its correct committed revision and ran `--updat
 restore the clean, correct final state — confirmed with `scripts/verify-package-trust.sh`
 (verify mode) passing and `git diff --stat` showing no residual KeySender change anywhere.
 
+### 2. `Tests/VoiceInkTests/Features/Meetings/Capture/RouteAwareMeetingMicRecorderTests.swift`: deflake `liveRouteChangeWaitsForFirstBuffer`
+
+`RouteAwareMeetingMicRecorder.completePendingHandoff` delivers the promoted buffer via
+`onRawPCMSamplesStorage?(firstSamples)` synchronously, then calls `retireAfterHandoffAsync`,
+which retires the pre-handoff child on `cleanupQueue` — a queue created `.concurrent` — via
+`cleanupQueue.async { ... stop(); cancel(); ... }`. That retirement is fire-and-forget: nothing
+orders it before the test's next line. `liveRouteChangeWaitsForFirstBuffer` asserted
+`system.stopCalls == 1` / `system.cancelCalls == 1` synchronously right after waiting only for
+the promoted samples, so it raced the async cleanup and could flake under load.
+
+The sibling test in the same file, `activeFailureRebuildsSameRoute`, already guards the
+identical race with `try await waitUntil { failed.stopCalls == 1 }` before asserting. This
+entry initially cited a "donor commit `e1f6a227`" as the source of that guard, on the premise
+that some upstream donor had fixed the race there and never carried the fix to this test. That
+premise does not hold: `git log --all --grep="Deflake" -i` and `git cat-file -t e1f6a227` both
+come up empty across every branch and remote in this clone, and `git blame` shows the entire
+file — both tests, guard included — was introduced in a single fork commit, `895dedc55`
+("Phase 1 Stage 1: mic capture and audio route control"). There is no separate donor fix to
+have missed; this was simply an inconsistency within that one commit, where one test in the
+file used the wait-then-assert pattern and its sibling did not.
+
+Fix: add the same `try await waitUntil { system.stopCalls == 1 }` before the assertions in
+`liveRouteChangeWaitsForFirstBuffer`, matching the sibling's comment and style verbatim. Test
+file only; no production code touched. Verified load-bearing (not cosmetic) by temporarily
+patching the test's `FakeMeetingMicRecorder.stop()` to sleep before incrementing `stopCalls`:
+with the old unguarded form the test failed in ~12ms with `Expectation failed: (system.stopCalls
+→ 0) == 1`; with the wait restored, the same delayed stub passed in ~310ms (waiting out the
+delay). The stub patch was reverted before committing. Landed byte-identical on both
+`phase-1-mic-route` and `phase-1-integration` (cherry-pick) since this test file exists on both
+branches and both reach `main`.
+
 ## Architecture budget note
 
 The instruction for this project caps ongoing upstream touchpoints (outside the new
@@ -1144,6 +1183,628 @@ Donor test original for reference: `native/MuesliNative/Tests/MuesliTests/Meetin
 
 No upstream (`Beingpax/VoiceInk`) file touched, no SPM package added — same as the original
 port. Still not wired into any engine.
+
+## stage2-models-store (Stage 2a: meeting data layer)
+
+Adds `Meeting.swift`, `MeetingSegment.swift` (both `Models/`), `MeetingSegmentPersistenceActor.swift`
+(`Models/`, renamed from `MeetingSegmentPersistenceService.swift` in the fix round below) and
+`MeetingState.swift` (`State/`) — all new, entirely under `Features/Meetings/`, so none of them
+need an entry here under this file's own rule. This section covers the upstream-file touches
+this stage makes: `VoiceInk/App/VoiceInk.swift` here, and `.gitignore` added in the escalation
+round below (section 9). Two in total. Nothing else upstream-owned is edited by this stage.
+
+### 1. `VoiceInk/App/VoiceInk.swift`: a 4th SwiftData store, `meetings.store`
+
+Follows the existing three-store pattern (`default.store` / `dictionary.store` / `stats.store`,
+`createPersistentContainer`/`createInMemoryContainer` around lines 211-274) exactly, rather than
+inventing a new one:
+
+- `Meeting.self` and `MeetingSegment.self` appended to the top-level `schema` array passed to
+  `ModelContainer(for:configurations:...)`, after `SessionMetric.self` — same "append new models
+  after synced entities" ordering the existing comment there already asks for.
+- A fourth `ModelConfiguration("meetings", schema: Schema([Meeting.self, MeetingSegment.self]),
+  url: meetingsStoreURL, cloudKitDatabase: .none)` in `createPersistentContainer`, `meetingsStoreURL`
+  = `<AppSupport>/meetings.store`, sibling of the other three store files. `.none` for CloudKit,
+  matching `statsConfig`/`transcriptConfig` (this fork has no iCloud container yet — see the
+  Phase 0 "iCloud container removed" section above; `dictionaryConfig` is the one exception, and
+  that exception is itself already logged there).
+- The matching in-memory `ModelConfiguration("meetings", schema: ..., isStoredInMemoryOnly: true)`
+  added to `createInMemoryContainer`, and both `ModelContainer(for:configurations:...)` calls
+  updated to pass the new config — so the existing in-memory-fallback-with-alert behavior (an
+  `NSAlert` warning the user their data won't persist, wired in `init()`, not touched by this
+  change) applies to meetings storage exactly the same way it already does to the other three.
+
+Why a fourth store rather than folding `Meeting`/`MeetingSegment` into `default.store`
+(`Transcription`'s store): meeting audio and metadata are a structurally separate concern from
+dictation transcripts (see `MeetingRuntimePaths.swift`'s header on why meeting audio already
+lives in a sibling directory, exempt from both of VoiceInk's audio-cleanup mechanisms), and a
+separate store keeps that separation true at the persistence layer too — a future retention or
+export policy for meetings can target `meetings.store` without needing a predicate that
+distinguishes model types within a shared store.
+
+No other upstream file was touched. `Meeting.self`/`MeetingSegment.self` join the `VoiceInk` and
+`VoiceInkTests` targets automatically via the existing synchronized root groups, same as every
+other Stage 1 addition under `Features/Meetings/`.
+
+### Note: `MeetingState` is intentionally not `RecordingState`
+
+`VoiceInk/Features/Meetings/State/MeetingState.swift` is a new, separate enum — it does not
+extend, wrap, or otherwise touch `VoiceInk/Core/Recording/RecordingState.swift` or
+`VoiceInkEngine`. See that file's own header comment for the reasoning: `RecordingState` is
+upstream's flat 6-case dictation lifecycle, consumed exhaustively elsewhere, and a meeting
+recording's lifecycle (pausable; a distinct "finalizing" step) doesn't map onto it cleanly
+enough to be worth the collision risk of adding cases to a type six call sites already switch
+over exhaustively.
+
+### Note: unit tests need no `TEST_RUNNER_VOICEINK_CI` gating
+
+`Tests/VoiceInkTests/Features/Meetings/Models/MeetingModelTests.swift` and
+`MeetingSegmentPersistenceActorTests.swift` run entirely against an in-memory SwiftData
+`ModelContainer` (`ModelConfiguration(isStoredInMemoryOnly: true)`) — no `AVAudioEngine`, no
+`AudioQueueRef`, no CoreAudio device enumeration, nothing that touches the hardware inventory
+`AudioGraphExceptionBridgeTests.swift`'s CI-only skip (`phase-1-mic-route` section above) exists
+to work around. Confirmed by running the full local suite with `TEST_RUNNER_VOICEINK_CI` both
+set and unset: identical pass/fail results either way. No new gating was added.
+
+## stage2-models-store fix round (review response)
+
+Independent review of the PR above returned CHANGES-REQUIRED on one blocking issue
+(concurrency safety was contractual, not enforced) and one test-honesty issue (the
+"crash loses nothing" test proved cross-context object visibility inside one live container,
+not durability across a process death). Both are fixed here, in the same two files this
+stage already owned (`MeetingSegmentPersistenceService.swift`, renamed to
+`MeetingSegmentPersistenceActor.swift`, and its test file, likewise renamed, plus a new
+`MeetingSegmentPersistenceActorDurabilityTests.swift`). No third upstream-file touch was
+needed; `VoiceInk/App/VoiceInk.swift` is unchanged from the entry above, and the reviewer's own
+correction — that listing `Meeting.self`/`MeetingSegment.self` in both the aggregate `Schema`
+and `meetingsConfig` does NOT create store ambiguity, because the aggregate schema isn't a
+store assignment mechanism — is recorded here so it isn't re-litigated: that wiring is
+untouched, and should stay untouched.
+
+### 1. Concurrency: `MeetingSegmentPersistenceService` (struct wrapping a caller-supplied
+`ModelContext`) → `MeetingSegmentPersistenceActor` (`@ModelActor`, `PersistentIdentifier` in
+and out)
+
+The struct's real defect: it accepted any `ModelContext` and exposed synchronous methods
+taking/returning managed `Meeting` objects, with only a doc comment telling callers to "hop to
+the context's own actor" first — a documented contract, not a structural one, and the project's
+own hard-won lesson (two earlier "safe" type boundaries elsewhere in this codebase were each
+defeated in one line by review because the guarantee was documented rather than compiler-
+enforced) says that doesn't count as fixed.
+
+**Fix.** `@ModelActor actor MeetingSegmentPersistenceActor` — SwiftData's purpose-built tool for
+this exact problem (<https://developer.apple.com/documentation/swiftdata/modelactor>). The
+macro synthesizes the actor's own `ModelContext` from a `ModelContainer` passed to the generated
+`init(modelContainer:)`, so the type is now constructed from a container, never handed someone
+else's context, matching the reviewer's explicit direction. Every public method takes and
+returns `PersistentIdentifier` (`Sendable`, `Hashable`, `Codable`) instead of a managed
+`Meeting`/`MeetingSegment` — no managed object of either type ever crosses the actor boundary.
+
+**The property this structurally guarantees, verified by attacking it, verbatim.** Per the
+brief's instruction, three deliberate violations were written against this file in a scratch
+test file (`Tests/VoiceInkTests/Features/Meetings/Models/ScratchAttack.swift`), built, the exact
+compiler output captured below, then the scratch file deleted — it is not part of this PR's
+diff:
+
+```swift
+// ATTACK 1: pass a managed `Meeting` object where a `PersistentIdentifier` is required.
+func attackPassManagedObjectAcrossBoundary(
+    actor: MeetingSegmentPersistenceActor, meeting: Meeting
+) async throws {
+    try await actor.appendSegment(
+        startOffset: 0, endOffset: 1, speakerLabel: "You", text: "x",
+        sourceChannel: .mic, to: meeting
+    )
+}
+
+// ATTACK 2: call an actor-isolated method synchronously, without `await`.
+func attackCallWithoutAwait(actor: MeetingSegmentPersistenceActor, id: PersistentIdentifier) throws {
+    try actor.updateState(.paused, for: id)
+}
+
+// ATTACK 3 (expected, per older SwiftData write-ups, to compile — it did NOT, see below):
+func attackReachThroughNonisolatedModelContext(actor: MeetingSegmentPersistenceActor, meeting: Meeting) {
+    actor.modelContext.insert(meeting)
+}
+```
+
+Verbatim `xcodebuild build-for-testing` output (Xcode 26.6, macOS SDK):
+
+```
+ScratchAttack.swift:13:34: error: cannot convert value of type 'Meeting' to expected argument type 'PersistentIdentifier'
+    sourceChannel: .mic, to: meeting
+                             ^
+ScratchAttack.swift:19:15: error: call to actor-isolated instance method 'updateState(_:for:)' in a synchronous nonisolated context
+    try actor.updateState(.paused, for: id)
+              ^
+VoiceInk.MeetingSegmentPersistenceActor.updateState:2:15: note: calls to instance method 'updateState(_:for:)' from outside of its actor context are implicitly asynchronous
+internal func updateState(_ state: VoiceInk.MeetingState, for meetingID: PersistentIdentifier) throws}
+              ^
+ScratchAttack.swift:25:11: error: actor-isolated property 'modelContext' can not be referenced from a nonisolated context
+    actor.modelContext.insert(meeting)
+          ^
+```
+
+**No residual hole, and this was checked rather than assumed — a correction to the brief's own
+premise.** The brief (correctly describing older SwiftData documentation) expected attack 3 to
+compile clean, exposing `AnyModelActor.modelContext`'s documented `nonisolated` declaration as
+an unclosable framework gap. It does not compile on this project's actual toolchain: reading
+`/Applications/Xcode-26.6.0.app/.../SwiftData.framework/.../arm64e-apple-macos.swiftinterface`
+directly shows `extension ModelActor { public var modelContext: ModelContext { get } }` with
+**no** `nonisolated` modifier, which makes it actor-isolated by default on this SDK — and attack
+3's compiler error confirms it empirically, not just from reading the interface. So: no
+disclosed hole here, because there genuinely isn't one on this SDK. (A future SDK could in
+principle change this back; if `attackReachThroughNonisolatedModelContext`-shaped code ever
+starts compiling clean, that is the signal something regressed.)
+
+### 2. A second, worse crash found by attacking the actor's own identifier lookup
+
+Writing the "unknown identifier" test (`unknownIdentifierThrows`, an identifier from a
+different `ModelContainer` passed into a legitimate actor call) surfaced a real production bug,
+not just a test gap: SwiftData's own identifier-lookup APIs are not safe against a foreign
+`PersistentIdentifier`, in two different ways, both proven with real crash evidence rather than
+inferred:
+
+- **`ModelContext.model(for:)`** returns a plain `any PersistentModel` (no `Optional`), so
+  `modelContext.model(for: id) as? Meeting` looks like a normal nil-on-miss check. It isn't:
+  touching the returned fault crashes the process outright —
+  `SwiftData/BackingData.swift:1057: Fatal error: This model instance was invalidated because
+  its backing data could no longer be found the store` — reproduced against a `startMeeting`'d
+  meeting from one in-memory `ModelContainer`, looked up through a second, unrelated
+  `ModelContainer`'s context.
+- **`ModelActor`'s own built-in `self[id, as: Meeting.self]` subscript** — the framework's
+  purpose-built, `Optional`-returning lookup for exactly this situation — was tried as the
+  natural replacement for a hand-rolled fallback, and is WORSE: it does not return `nil` for a
+  foreign identifier, it returns a non-nil but invalid `Meeting`. The `guard let` in
+  `meeting(for:)` then passes, and the crash only happens on the NEXT property mutation. Caught
+  by the full local test suite (not by inspection): `~/Library/Logs/DiagnosticReports/VoiceInk
+  Dev-2026-09-02-083842.ips`, `EXC_BREAKPOINT`/`SIGTRAP`, symbolicated stack bottoming out at
+  `Meeting.duration.setter` → SwiftData's `Observation` machinery → `_assertionFailure`, from
+  `MeetingSegmentPersistenceActorTests.unknownIdentifierThrows()` calling
+  `actor.updateDuration(10, for: foreignID)`. This is a strictly worse failure mode than
+  `model(for:)`'s: it defers the crash past the "did I find it" check into whatever mutation
+  happens to run next, so a naive `guard let ... else { throw }` around it looks correct and
+  isn't.
+
+**Fix, verified as the one approach that survives being attacked.**
+`MeetingSegmentPersistenceActor.meeting(for:)` uses neither: `modelContext.registeredModel(for:
+id)` first (a pure in-memory lookup, no store access — this actor's own context always has a
+`Meeting` registered the instant `startMeeting` creates it, so every legitimate call in a single
+actor's lifetime hits this branch), falling back to a `FetchDescriptor<Meeting>(predicate:
+#Predicate { $0.persistentModelID == id })` for an identifier the context hasn't seen yet (a
+real store query — an absent row is an empty result, not a fault to materialize, so it degrades
+to "throw `.meetingNotFound`" instead of crashing). Verified against all three call shapes: a
+foreign-container identifier (throws, no crash), a same-session identifier the actor's own
+context already has registered (works, as before), and — new coverage — a same-session
+identifier the actor's context has NOT yet registered
+(`MeetingSegmentPersistenceActorTests.unknownIdentifierThrows` no longer crashes; the durability
+tests below exercise the "not yet registered" fetch path directly, since a freshly reopened
+container never has anything registered).
+
+### 3. The durability test now proves the actual guarantee, against a real on-disk store
+
+`MeetingSegmentPersistenceActorDurabilityTests.swift` (new file) replaces the previous
+in-memory-only "crash loses nothing" coverage. It writes a meeting and five segments through a
+`ModelConfiguration(schema:url:)` (a real temp-directory SQLite file), lets the writing
+`ModelContainer`/actor go completely out of scope with **no** `finish` call (standing in for a
+crash mid-meeting), then opens a **brand-new** `ModelContainer` against the same file and
+asserts every segment is present, in the correct order (`startOffset`, then `orderIndex`
+tiebreak), and still attached to its meeting. A second test does the same for `updateDuration`
++ `finish`. Runs on a CI runner with no audio hardware — only a temp-directory file, cleaned up
+in a `defer`.
+
+**A second empirical finding, this one about test-writing, not the actor.**
+`readContext.model(for: meetingID)` on the freshly reopened container hit the exact same
+`SwiftData/BackingData.swift` crash class described in section 2 above — this time not because
+the identifier was foreign, but because a brand-new context has nothing registered yet, and
+`model(for:)`'s crash-on-fault behavior doesn't care why the row can't be resolved through that
+path. Fixed the same way as the actor: `readContext.fetch(FetchDescriptor<Meeting>())` instead.
+
+**A third finding, more consequential for whoever builds MeetingEngine's crash recovery.** The
+first version of this test also asserted `reread.persistentModelID == meetingID` (the identifier
+captured before teardown, compared against the identifier of the row read back after reopening).
+That assertion FAILED — reliably, not flakily — even though the store UUID, entity name, and
+primary key all matched in the debug description. This is not a bug in this PR; it's Apple's own
+documented behavior (`PersistentIdentifier` is valid only for the lifetime of the `ModelContainer`
+that produced it) proven empirically rather than taken on faith. **Implication recorded here so
+it isn't rediscovered the hard way later:** a future MeetingEngine crash-recovery feature that
+needs to find "the still-`.recording` meeting from last session" on relaunch must query for it
+(by `state`, or by this app's own `Meeting.id: UUID`), never by holding onto and reusing a
+`PersistentIdentifier` saved from a previous process. The durability tests now compare
+`Meeting.id` (this app's own stored UUID, captured from a plain read on the still-live container
+before teardown) instead, and use reference equality (`$0.meeting === reread`) for the
+segment-to-meeting relationship check, which is valid because both sides are fetched into the
+same `readContext`.
+
+### Verification
+
+Full local suite (`xcodebuild test`, CI's exact invocation, `-destination 'platform=macOS'`,
+parallel test execution as CI runs it) green twice in a row after the fixes above, plus the
+isolated new-test-only run (non-parallel) used to bisect each crash down to its actual test and
+call site. `scripts/verify-package-trust.sh` passes unchanged (no new dependency). Diagnostic
+report paths for both crash discoveries are cited above rather than only described, so they can
+be re-read if this ever needs re-verifying.
+
+## stage2-models-store escalation round (second review response)
+
+The fix round above was reviewed again and returned CHANGES-REQUIRED on the same property for
+the second time: the `@ModelActor` boundary is structurally defeatable. Everything else that
+round established stands and is untouched — the schema design, the 4-store wiring in
+`VoiceInk/App/VoiceInk.swift` (unchanged in this round), the `registeredModel`-then-fetch
+identifier lookup, and both `PersistentIdentifier` landmines recorded above. This entry covers
+only what changed and why.
+
+This round adds a SECOND upstream touchpoint for this stage, `.gitignore` — recorded as
+section 9 below and in appendix A3, taking the stage from one upstream touch to two. It is
+called out here rather than left to the appendix because an inventory that undercounts itself
+is the exact defect the inventory exists to prevent.
+
+### 1. The defect: a `@ModelActor` conformance IS the leak
+
+The previous round checked whether `actor.modelContext` (the convenience property in
+`extension ModelActor`) was `nonisolated`, read the SDK's `.swiftinterface` to confirm it is
+not, and proved with a compile error that the property could not be reached. All of that was
+correct — and it missed the door next to the one it was watching. `ModelActor` has two
+requirements of its own:
+
+```swift
+public protocol ModelActor : _Concurrency.Actor {
+  nonisolated var modelContainer: SwiftData.ModelContainer { get }
+  nonisolated var modelExecutor: any SwiftData.ModelExecutor { get }
+}
+public protocol ModelExecutor : _Concurrency.Executor {
+  var modelContext: SwiftData.ModelContext { get }
+}
+```
+(`MacOSX26.5.sdk/System/Library/Frameworks/SwiftData.framework/.../arm64e-apple-macos.swiftinterface`,
+lines 120-128.)
+
+`modelExecutor` is `nonisolated` and public; `ModelExecutor.modelContext` is public and, on a
+non-actor conformer such as `DefaultSerialModelExecutor`, plainly non-isolated. So any caller
+can obtain the actor's exact live `ModelContext` synchronously, fetch managed objects from it,
+and mutate them off the actor's executor:
+
+```swift
+func attack<A: ModelActor>(_ actor: A) {
+    let context = actor.modelExecutor.modelContext
+    context.autosaveEnabled = false
+}
+```
+
+Note it is generic over `any ModelActor`, so it does not even name the conforming type. Hiding,
+renaming or documenting the type would have done nothing. **The conformance itself is the
+public surface**, and no amount of care applied to the members we wrote could have closed it.
+
+### 2. The fix: own the executor, conform to nothing, and hand back a receipt
+
+`MeetingSegmentPersistenceActor.swift` → `MeetingStore.swift`. Three types, one file:
+
+- `MeetingStore` — a **`struct`**, the only thing anything outside the file can name. Its
+  methods are all `async`, and take/return `MeetingHandle`/`MeetingSegmentHandle`.
+- `MeetingHandle` / `MeetingSegmentHandle` — `Sendable` value receipts wrapping a
+  `PersistentIdentifier` in a `fileprivate` field.
+- `MeetingPersistenceEngine` — a **`private`** actor that owns the `ModelContext`, and
+  **conforms to nothing**.
+
+The engine is not a `@ModelActor`. That macro's whole substantive output is three lines of
+`init` plus the `ModelActor` conformance, and the conformance is the defect, so the file writes
+the three lines itself:
+
+```swift
+private actor MeetingPersistenceEngine {
+    private let executor: DefaultSerialModelExecutor
+    nonisolated var unownedExecutor: UnownedSerialExecutor { executor.asUnownedSerialExecutor() }
+    private var modelContext: ModelContext { executor.modelContext }
+
+    init(modelContainer: ModelContainer) {
+        let context = ModelContext(modelContainer)
+        context.autosaveEnabled = false
+        executor = DefaultSerialModelExecutor(modelContext: context)
+    }
+}
+```
+
+This is behaviourally identical to `@ModelActor` — a context created from the container, bound
+to a `DefaultSerialModelExecutor` that is also the actor's own executor — minus the two things
+the conformance adds: the `modelExecutor` requirement (the leak) and the `self[id, as:]`
+subscript (the landmine recorded in the previous entry, which returns a non-nil INVALID object
+for a foreign identifier). Losing both is the point, not a side effect.
+
+This is the inversion the project has learned to reach for. The old design accepted "the caller
+will only use the identifier API" and tried to defend that claim against attack. The new one
+removes the alternative: there is no `ModelActor` conformance to reach through, no engine type
+to name, and no context-shaped value in the API at all — only receipts the store issues after
+doing the work itself.
+
+### 3. The property guaranteed, stated exactly
+
+> **G.** The `ModelContext` this component mutates, and every managed `Meeting`/`MeetingSegment`
+> registered in it, are unreachable from any code outside `MeetingStore.swift`, using the
+> language's checked features. Every mutation of a meeting's persisted graph therefore happens
+> on one serial executor, in call order, with one explicit `save()` per mutation.
+
+Scope, stated so it is not over-read: **G** is about *this component's* context. Anyone holding
+the `ModelContainer` can still make their own `ModelContext` over the same rows — that is
+SwiftData's supported model, contexts are independent and conflicts resolve at save. What **G**
+rules out is a second isolation domain mutating the objects *this* executor owns, which is a
+data race on non-`Sendable` reference types rather than an ordinary write conflict.
+
+Four mechanisms enforce it, each closing a route the previous designs left open:
+
+1. **No `ModelActor` conformance** on the exposed type or the engine (§1, §2).
+2. **The engine type is `private` at file scope**, so it cannot be named, extended, or
+   instantiated elsewhere.
+3. **`MeetingStore` is a `struct`.** `ModelActor` refines `Actor`, which only a class or actor
+   can conform to, so the conformance cannot be added back retroactively. The choice of `struct`
+   is load-bearing.
+4. **The engine is a closure capture, never a stored property**, because `Mirror` needs no
+   access and no compiler permission (§5).
+
+### 4. Attack transcript (full `xcodebuild`, verbatim)
+
+Attacks live in `scripts/negative-controls/`, permanently, and are run by
+`scripts/verify-meeting-store-isolation.sh`, which stages each into the **app target** (not the
+test target: `private`/`fileprivate` are file-scoped, so same-module code is the realistic
+attacker, and the MeetingEngine will live in that module), builds with a full `xcodebuild`, and
+fails if the build SUCCEEDS **or if any expected diagnostic goes missing** — a control that
+quietly stops firing still leaves a red build and would otherwise read as green. Wired into CI
+after the test step.
+
+Run: `scripts/verify-meeting-store-isolation.sh --derived-data .ci-test-build`, Xcode 26.6
+(17F113), macOS 15 deployment target, Swift 5 language mode. Every diagnostic below is a hard
+language error, not a strict-concurrency diagnostic, so none of them depends on a build setting
+that could be turned down later. Exit 0 (all controls failed to compile, for the expected
+reasons). `__NegativeControl.swift` is the staged copy of the attack file.
+
+```
+==> MeetingStoreIsolationAttacks.swift
+  --- compiler diagnostics ---
+    __NegativeControl.swift:40:5: error: global function 'a1_genericModelExecutorEscape' requires that 'MeetingStore' conform to 'ModelActor'
+    __NegativeControl.swift:44:33: error: 'MeetingPersistenceEngine' is inaccessible due to 'private' protection level
+    __NegativeControl.swift:48:15: error: 'dispatch' is inaccessible due to 'private' protection level
+    __NegativeControl.swift:53:53: error: 'persistentID' is inaccessible due to 'fileprivate' protection level
+    __NegativeControl.swift:58:9: error: 'async' call in a function that does not support concurrency
+    __NegativeControl.swift:65:34: error: cannot convert value of type 'Meeting' to expected argument type 'MeetingHandle'
+    __NegativeControl.swift:71:44: error: cannot convert value of type 'M' to expected argument type 'MeetingHandle'
+    __NegativeControl.swift:76:5: error: 'MeetingHandle' initializer is inaccessible due to 'fileprivate' protection level
+    __NegativeControl.swift:82:23: error: instance method 'decode(_:from:)' requires that 'MeetingHandle' conform to 'Decodable'
+    __NegativeControl.swift:88:17: error: incorrect argument label in call (have 'modelContext:', expected 'modelContainer:')
+    __NegativeControl.swift:88:32: error: cannot convert value of type 'ModelContext' to expected argument type 'ModelContainer'
+    __NegativeControl.swift:92:13: error: inheritance from non-protocol, non-class type 'MeetingStore'
+    __NegativeControl.swift:97:11: error: value of type 'MeetingStore' has no member 'modelContainer'
+    __NegativeControl.swift:103:5: error: 'dispatch' is inaccessible due to 'private' protection level
+    __NegativeControl.swift:108:11: error: value of type 'MeetingStore' has no member 'modelContext'
+  --- end diagnostics ---
+==> MeetingStoreRetroactiveConformanceAttack.swift
+  --- compiler diagnostics ---
+    __NegativeControl.swift:16:1: error: non-class type 'MeetingStore' cannot conform to class protocol 'Actor'
+    __NegativeControl.swift:16:1: error: non-class type 'MeetingStore' cannot conform to class protocol 'ModelActor'
+  --- end diagnostics ---
+All MeetingStore negative controls still fail to compile, for the expected reasons.
+```
+
+Attack by attack, in the order they appear in the file:
+
+| # | Attack | Line | Outcome |
+|---|---|---|---|
+| A1 | The reviewer's exact attack, generalised: `func attack<A: ModelActor>` reading `actor.modelExecutor.modelContext`, applied to `MeetingStore` | 40 | **blocked** — no `ModelActor` conformance to bite on. The generic function itself still compiles; there is simply no value of ours it accepts. |
+| A2 | Name the engine actor directly | 44 | **blocked** — `private` at file scope |
+| A3 | Read the private dispatch table (member reference) | 48 | **blocked** — `private` |
+| A4 | Add the `ModelActor` conformance back retroactively | 16 (own file) | **blocked** — a `struct` cannot conform to `Actor` |
+| A5 | Extension unwrapping a handle into a `PersistentIdentifier` | 53 | **blocked** — `fileprivate` payload |
+| A6 | Call the store synchronously, no `await` | 58 | **blocked** — every method is `async` |
+| A7 | Pass a managed `Meeting` across the boundary | 65 | **blocked** — no overload accepts one |
+| A8 | The same, laundered through `<M: PersistentModel>` so no model type is named | 71 | **blocked** — same |
+| A9 | Forge a handle from an identifier obtained elsewhere | 76 | **blocked** — `fileprivate` init |
+| A10 | Reconstruct a handle via `Codable` (`PersistentIdentifier` is `Codable`; the handle is deliberately not) | 82 | **blocked** — not `Decodable` |
+| A11 | Hand the store a `ModelContext` somebody else owns | 88 | **blocked** — it only takes a `ModelContainer` |
+| A12 | Subclass to override or expose internals | 92 | **blocked** — `MeetingStore` is a struct |
+| A13 | Read the container back off the store (`@ModelActor` exposes this `nonisolated`) | 97 | **blocked** — no such member |
+| A14 | Key-path route to the dispatch table (a different access mechanism from A3) | 103 | **blocked** — `private` |
+| A15 | Read `store.modelContext` by any name it might expose | 108 | **blocked** — no such member |
+| A16 | `Mirror` recursion from a live store to its context | — | **COMPILES.** Closed by construction, not by the type system: the engine is a closure capture, so the walk terminates at six function values. Proved at runtime by `MeetingStoreIsolationTests`. |
+| A17 | `unsafeBitCast` / raw-memory forgery | — | **COMPILES, and is a disclosed residual hole.** Outside **G** by definition; see FOLLOWUPS.md. |
+| A18 | `Mirror` on a `MeetingHandle` to recover its `PersistentIdentifier` | — | **COMPILES, and is a disclosed residual hole.** Recovers no authority over this store's context; asserted by a test so the disclosure cannot go stale. See FOLLOWUPS.md. |
+
+### 5. The one attack that still compiles, and what closes it: `Mirror`
+
+`Mirror(reflecting:)` walks a value's stored properties regardless of `private`, needs no
+`@testable`, and cannot be refused. If `MeetingStore` held `private let engine: ...`, then
+
+```swift
+Mirror(reflecting: store).children.first!.value          // the engine, as Any
+```
+
+hands it over — and from there `as? DefaultSerialModelExecutor` (a **public** class with a
+public `modelContext`) recovers the live context at runtime, with no compiler involvement at
+all. Access control is a compile-time construct; reflection is not.
+
+So the store holds no engine property. It holds `EngineDispatch`, a struct of six `@Sendable`
+closures, each capturing the engine. `Mirror` reports no children for a closure and there is no
+API that reads a closure's captures, so the walk terminates at six function values.
+
+Proved at runtime, not asserted: `MeetingStoreIsolationTests.swift` does a bounded
+breadth-first `Mirror` walk from a live `MeetingStore` (depth 8, 10k nodes) and fails if any
+reachable value is a `ModelContext`, a `ModelExecutor`, a `ModelActor` or a `PersistentModel` —
+once on a fresh store, and again after it has written a meeting and a segment, because
+`startMeeting` is what causes the context to register managed objects. A third test pins the
+mechanism rather than its effect: every leaf reachable from the store must be a closure, so
+reintroducing a plain stored property fails immediately and by name.
+
+### 6. Autosave is now OFF, which is what makes the durability test mean anything
+
+`MeetingPersistenceEngine.init` sets `context.autosaveEnabled = false`.
+
+The durability test added in the previous round reads as if it pins the "one explicit `save()`
+per mutation" contract. It did not. With autosave left on, SwiftData flushes pending changes on
+its own, so deleting every `try modelContext.save()` from the store would have left the test
+green: it was asserting durability the store was not responsible for.
+
+Proved by doing it. With autosave off, removing the `save()` from `appendSegment`:
+
+```
+MeetingStoreDurabilityTests.swift:118: Expectation failed: (reread.segments.count → 0) == 5
+MeetingStoreDurabilityTests.swift:123: Expectation failed: (ordered.map(\.text) → []) == (expectedTexts → ["minute 0 update", "minute 60 update", "minute 120 update", "minute 180 update", "minute 240 update"])
+** TEST FAILED **
+Failing tests:
+	MeetingStoreDurabilityTests.survivesContainerTeardown()
+```
+
+Zero of the five segments survived the teardown — which is the correct answer for a store that
+never saved them, and was NOT the answer this test gave before autosave was turned off.
+
+Restored, the suite is green again. The check now fails closed: an edit that drops an explicit
+save cannot reach `main`.
+
+Turning autosave off is also correct on its own terms. This component's contract is that each
+finalized segment is durable by the time its call returns; an autosave timer firing at moments
+nothing here chose is at best redundant and at worst hides a missing save.
+
+### 7. Test changes
+
+- `MeetingSegmentPersistenceActorTests.swift` → `MeetingStoreTests.swift`; likewise the
+  durability file. New `MeetingStoreIsolationTests.swift` (§5).
+- **All `ModelContext.model(for:)` calls removed from the test helpers**, flagged non-blocking
+  by review and worth doing: that API fatal-errors the process for an identifier the receiving
+  context has not registered, which is precisely the situation a "read it back through a
+  separate context" helper creates. Every lookup is now a `FetchDescriptor`, which is also the
+  more honest way to ask whether something reached the store.
+- The tests no longer unwrap identifiers, because they cannot: `MeetingHandle`'s payload is
+  `fileprivate`, and the test target gets no more access than production code does. Read-backs
+  fetch by content instead. `foreignHandleThrows` (was `unknownIdentifierThrows`) still passes a
+  handle from a genuinely different container, so the `registeredModel`-then-fetch lookup
+  recorded in the previous entry stays exercised against a foreign identifier.
+
+### 8. Methodology note: an attack file can defeat its own attacks
+
+Worth recording, because it nearly produced a false all-clear in this very round. All fifteen
+attacks started in one file. Two of them — A1 (the generic `modelExecutor` escape, i.e. the
+reviewer's exact attack) and A15 (`store.modelContext`) — compiled **clean**, and a careless
+reading would have reported "no error" for the single most important attack in the set.
+
+The cause was A4, `extension MeetingStore: ModelActor {}`, sitting a few lines below them. Swift
+records a retroactive conformance for the rest of the file even when the conformance itself is
+an error, so A4 handed A1 and A15 the very conformance they were probing for. A4 now lives
+alone in `MeetingStoreRetroactiveConformanceAttack.swift`, and both files say why.
+
+The general rule, now that it has cost something: **one conformance-mutating attack per file**,
+and treat "attack produced no error" as a result to be explained, never as a result to be
+reported.
+
+### 9. UPSTREAM TOUCHPOINT: `.gitignore` (five appended lines)
+
+**This is the second upstream-owned file this stage edits, and the first one added since the
+stage began.** Recorded here as a numbered entry, not left to the appendix, because the whole
+purpose of the touchpoint ledger is defeated by a touchpoint that appears only in a total.
+
+```
++# Derived-data paths used by CI's test step and by
++# scripts/verify-meeting-store-isolation.sh (which reuses the former when given
++# --derived-data, so the negative controls stay a one-file incremental compile).
++.ci-test-build/
++.negative-control-build/
+```
+
+`.gitignore` exists upstream (`git cat-file -e upstream/main:.gitignore` succeeds) and was
+byte-identical to upstream until this change — `git diff upstream/main <previous commit> --
+.gitignore` was empty — so this is a genuinely new divergence that the fork now owns forever,
+not an extension of an existing one.
+
+**Why it is worth that cost.** `.ci-test-build/` is the derived-data path CI's own test step
+already uses; `.negative-control-build/` is this round's verifier default. Neither was ignored,
+so both showed up as untracked directories in every `git status` and were one careless
+`git add -A` away from committing hundreds of megabytes of build scratch. The alternative — leaving them unignored and relying on discipline — is the same
+"documented rather than enforced" pattern this entire stage exists to stamp out.
+
+**Why the merge cost is close to zero.** Five lines appended to the end of an existing list, in
+a file upstream changes rarely and only by appending. That is about the lowest-conflict shape an
+upstream edit can take. It is still a real touchpoint and is counted as one.
+
+Appendix A3 and the appendix totals are updated to match.
+
+### 10. `.github/workflows/ci.yml` is NOT an upstream touchpoint (correcting a review finding)
+
+The review of this round flagged the new negative-control CI step as an unauthorised upstream
+edit. **That premise is wrong, and the correction is recorded here so the ledger does not carry
+it.** Checked, not assumed:
+
+```
+$ git ls-tree -r upstream/main -- .github/
+100644 blob fb5a4517  .github/ISSUE_TEMPLATE/bug_report.md
+100644 blob 130c8d50  .github/ISSUE_TEMPLATE/feature_request.md
+100644 blob faca8729  .github/PULL_REQUEST_TEMPLATE.md
+
+$ git cat-file -e upstream/main:.github/workflows/ci.yml
+fatal: path '.github/workflows/ci.yml' exists on disk, but not in 'upstream/main'
+
+$ git log --oneline --diff-filter=A -- .github/workflows/ci.yml
+8db09790 Phase 0: fork hygiene, delicense, unsigned CI
+```
+
+Upstream's `.github/` holds issue and PR templates only. There is no workflow directory and no
+`ci.yml`; this fork created it in Phase 0. It is fork-owned, like `FORK-PATCHES.md`,
+`FOLLOWUPS.md` and `package-trust.json` — appendix A5 has listed it as such since Phase 0 — and
+editing it carries no merge burden, because upstream has no such file to conflict with. The
+negative-control step stays.
+
+### 11. Hardening: negative-control expectations are line-anchored, not string-matched
+
+A3 (`_ = store.dispatch`) and A14 (`\MeetingStore.dispatch`) produce the *identical* diagnostic,
+`'dispatch' is inaccessible due to 'private' protection level`. The verifier's expectations were
+a flat list of message strings, so **either attack could have started compiling while the other
+kept supplying the text, and the run would have stayed green while silently testing one attack
+instead of two.** Same failure class as §8 — the apparatus quietly stops testing something and
+keeps reporting success — one notch smaller, and caught by review rather than by the apparatus,
+which is itself the point.
+
+Fixed by binding every expectation to a LINE rather than to a string. Each attack now carries a
+`// expect-error: <text>` comment on the line directly above the line the compiler must reject;
+the verifier parses those out of the attack source, so the expectation and the attack cannot
+drift apart. It now asserts four things, and fails on any of them:
+
+1. the build failed;
+2. every marker has its diagnostic **on the exact line the marker sits above**;
+3. every diagnostic emitted lands on a marked line, so a new error cannot stand in for a
+   missing expected one;
+4. the marker COUNT per file matches, so deleting an attack outright is caught too.
+
+**Demonstrated, not asserted.** `_ = store.dispatch` was temporarily changed to `_ = store`
+(compiles) and the verifier re-run:
+
+```
+    ok  line 65: 'MeetingPersistenceEngine' is inaccessible due to 'private' protection level
+    MISSING at line 70: 'dispatch' is inaccessible due to 'private' protection level
+    ok  line 76: 'persistentID' is inaccessible due to 'fileprivate' protection level
+    ...
+    ok  line 133: 'dispatch' is inaccessible due to 'private' protection level
+error: MeetingStoreIsolationAttacks.swift failed to build, but not for exactly the reasons it is supposed to.
+       An attack that stops firing still leaves a red build, so this would otherwise
+       pass unnoticed.
+```
+
+Exit 1. Note line 133 in that same output: A14 is still happily producing the exact string the
+OLD check looked for, which is precisely why the old check would have passed this tree. The
+string appears three times in the failing run's log; the line does not. A3 was restored and the
+verifier re-run green.
+
+### Verification
+
+Local, Xcode 26.6 (17F113):
+
+- Full `xcodebuild test` (CI's exact invocation, `-destination 'platform=macOS'`, parallel):
+  green except `RouteAwareMeetingMicRecorderTests.liveRouteChangeWaitsForFirstBuffer()`, which
+  lives in `Features/Meetings/Capture/`, is untouched by this change, and is the same
+  pre-existing flake the previous round hit and re-ran clean. All 15 tests across the three
+  MeetingStore suites pass.
+- `scripts/verify-meeting-store-isolation.sh --derived-data .ci-test-build`: exit 0, all 15
+  markers matched on their exact lines, no unattributed diagnostics (section 11). Its own
+  failure path demonstrated by neutering A3: exit 1, quoted in section 11.
+- Autosave proof above: save removed -> red, save restored -> green.
+- `scripts/verify-package-trust.sh` unchanged and passing; no new dependency (the fail-closed
+  supply-chain guard is untouched).
+- Upstream touchpoints for this stage: TWO. `VoiceInk/App/VoiceInk.swift` (appendix A2,
+  unchanged this round) and `.gitignore` (appendix A3, section 9 below). `.github/workflows/ci.yml`
+  is NOT one -- it is fork-owned; see section 10. Zero PRs against `Beingpax/VoiceInk`.
 
 ## meeting-detection (Stage 1: meeting detection engine)
 

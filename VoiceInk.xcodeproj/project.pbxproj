@@ -27,6 +27,8 @@
 		E1FA00142FA7000000000001 /* MLXLMCommon in Frameworks */ = {isa = PBXBuildFile; productRef = E1F900112FA6000000000001 /* MLXLMCommon */; };
 		E1FA00162FA7000000000001 /* HuggingFace in Frameworks */ = {isa = PBXBuildFile; productRef = E1F900132FA6000000000001 /* HuggingFace */; };
 		E1FA00172FA7000000000001 /* Tokenizers in Frameworks */ = {isa = PBXBuildFile; productRef = E1F900142FA6000000000001 /* Tokenizers */; };
+		DE9A01390DC6AA6547E93C0A /* DTLNAecCoreML in Frameworks */ = {isa = PBXBuildFile; productRef = DE8798705D84D3A76518F5A4 /* DTLNAecCoreML */; };
+		DEA5154124927A789DCB23AA /* DTLNAec512 in Frameworks */ = {isa = PBXBuildFile; productRef = DE95318BD777612354B1DAE3 /* DTLNAec512 */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -143,6 +145,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				E1342C1F2EB4844800CED8A2 /* Atomics in Frameworks */,
+				DE9A01390DC6AA6547E93C0A /* DTLNAecCoreML in Frameworks */,
+				DEA5154124927A789DCB23AA /* DTLNAec512 in Frameworks */,
 				E1F350112F1D10D600790A2C /* whisper.xcframework in Frameworks */,
 				E1D7EF992E35E16C00640029 /* MediaRemoteAdapter in Frameworks */,
 				E161D4A12F41ECB90086F83D /* CloudKit.framework in Frameworks */,
@@ -261,6 +265,8 @@
 				E1ADD45E2CC544F100303ECB /* Sparkle */,
 				E1D7EF982E35E16C00640029 /* MediaRemoteAdapter */,
 				E1342C1E2EB4844800CED8A2 /* Atomics */,
+				DE8798705D84D3A76518F5A4 /* DTLNAecCoreML */,
+				DE95318BD777612354B1DAE3 /* DTLNAec512 */,
 				E1DD1EE02FA1D7D30020AF3B /* Zip */,
 				E1C0A0012FA8000000000001 /* TranscribeCpp */,
 				E1F511032FA3B47000F00001 /* SelectedTextKit */,
@@ -385,6 +391,7 @@
 				E1ADD45D2CC544F100303ECB /* XCRemoteSwiftPackageReference "Sparkle" */,
 				E1D7EF972E35E16C00640029 /* XCRemoteSwiftPackageReference "mediaremote-adapter" */,
 				E1ECEC142E44590200DFFBA8 /* XCRemoteSwiftPackageReference "Zip" */,
+				DE6E44259703355D8E71EE59 /* XCRemoteSwiftPackageReference "dtln-aec-coreml" */,
 				E1342C1D2EB4844800CED8A2 /* XCRemoteSwiftPackageReference "swift-atomics" */,
 				E1F511022FA3B47000F00001 /* XCRemoteSwiftPackageReference "SelectedTextKit" */,
 				E13461EB2FD1CCCD005B6A81 /* XCRemoteSwiftPackageReference "swift-markdown-ui" */,
@@ -963,6 +970,14 @@
 				version = 1.3.0;
 			};
 		};
+		DE6E44259703355D8E71EE59 /* XCRemoteSwiftPackageReference "dtln-aec-coreml" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/MimicScribe/dtln-aec-coreml.git";
+			requirement = {
+				kind = revision;
+				revision = ecb641dcb4b152fd10b1261a869aaa1e8acf0174;
+			};
+		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -1030,6 +1045,16 @@
 			isa = XCSwiftPackageProductDependency;
 			package = E1F900032FA6000000000001 /* XCRemoteSwiftPackageReference "swift-transformers" */;
 			productName = Tokenizers;
+		};
+		DE8798705D84D3A76518F5A4 /* DTLNAecCoreML */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = DE6E44259703355D8E71EE59 /* XCRemoteSwiftPackageReference "dtln-aec-coreml" */;
+			productName = DTLNAecCoreML;
+		};
+		DE95318BD777612354B1DAE3 /* DTLNAec512 */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = DE6E44259703355D8E71EE59 /* XCRemoteSwiftPackageReference "dtln-aec-coreml" */;
+			productName = DTLNAec512;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

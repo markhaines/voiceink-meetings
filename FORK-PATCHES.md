@@ -1062,3 +1062,29 @@ should look nothing like this. Stage 1's own touchpoint count so far: 2 (Stage 0
 header, this stage's package link) — both one-time additions to a target's build graph, not
 recurring edits, and both logged with the same rationale: confirmed unavoidable, confirmed
 minimal, confirmed no live collision with a parallel agent.
+
+## meeting-recording-writer (Stage 1: retained mixed-recording writer)
+
+`VoiceInk/Features/Meetings/Capture/MeetingRecordingWriter.swift` and its test
+(`Tests/VoiceInkTests/Features/Meetings/Capture/MeetingRecordingWriterTests.swift`) — no entry
+needed under the rule at the top of this file (new code entirely under `Features/Meetings/`).
+Logged anyway for visibility, matching the precedent set by the `SystemAudioCaptureDiagnostics`
+note above.
+
+Ported verbatim from the donor's `MeetingRecordingWriter.swift` (273 lines): mixes mic + system
+PCM16 into one retained WAV, with `persistTemporaryRecordingAsync(...)` transcoding to M4A (or
+moving as-is for WAV) into the app's support directory. This is the retained *mixed* recording
+for later export — distinct from `PCMChunkRecorder` (already ported, per-source transcription
+chunks) and `WavWriter` (already ported, static WAV header helpers). No dependency on any
+unresolved seam: it does not reference `MeetingSession` or any other undesigned type, so it
+carried no out-of-scope surface to extract or defer.
+
+Diff against the donor is empty except the per-file MIT header block (confirmed with `diff`,
+matching the same verbatim precedent as `PCMChunkRecorder.swift`). The test file's only
+non-header change is `@testable import MuesliNativeApp` → `@testable import VoiceInk`, the
+same single-line adaptation `PCMChunkRecorderTests.swift` used. None of the five tests touch
+real audio hardware (they exercise pure file I/O and in-memory mixing), so none needed the
+`TEST_RUNNER_VOICEINK_CI` CI-only guard `AudioGraphExceptionBridgeTests.swift` uses.
+
+Not wired into any engine — `MeetingEngine` does not exist yet and is out of scope for this
+port. The class and its tests land standalone, same as `SystemAudioCaptureDiagnostics` did.

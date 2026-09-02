@@ -165,7 +165,7 @@ struct RouteAwareMeetingMicRecorderTests {
         // The retired child is stopped on the async cleanup queue after
         // promotion; wait for it rather than asserting synchronously (flakes
         // under CI load otherwise).
-        try await waitUntil { system.stopCalls == 1 }
+        try await waitUntil { system.stopCalls == 1 && system.cancelCalls == 1 }
         #expect(system.stopCalls == 1)
         #expect(system.cancelCalls == 1)
     }
@@ -388,6 +388,7 @@ struct RouteAwareMeetingMicRecorderTests {
         system.onRawPCMSamples?([2])
         second.onRawPCMSamples?([3])
         try await waitUntil { recorder.diagnosticsSnapshot().preferredInputDeviceID == 92 }
+        try await waitUntil { samples == [[2], [3]] }
         try await waitUntil { system.stopCalls == 1 }
         first.onRawPCMSamples?([4])
 
@@ -623,6 +624,10 @@ struct RouteAwareMeetingMicRecorderTests {
 
         replacement.onRawPCMSamples?([4, 5, 6])
         try await waitUntil { samples == [[4, 5, 6]] }
+        // The retired child is stopped on the async cleanup queue after
+        // promotion; wait for it rather than asserting synchronously (flakes
+        // under CI load otherwise — same class as liveRouteChangeWaitsForFirstBuffer).
+        try await waitUntil { degraded.stopCalls == 1 }
         #expect(degraded.stopCalls == 1)
     }
 
@@ -697,7 +702,7 @@ struct RouteAwareMeetingMicRecorderTests {
     }
 
     @Test("stop while a recovery candidate is queued never starts the candidate")
-    func stopWithQueuedRecoveryNeverStartsCandidate() throws {
+    func stopWithQueuedRecoveryNeverStartsCandidate() async throws {
         let prepareStarted = DispatchSemaphore(value: 0)
         let allowPrepare = DispatchSemaphore(value: 0)
         let initial = FakeMeetingMicRecorder(kind: .systemDefaultStreaming)
@@ -726,9 +731,11 @@ struct RouteAwareMeetingMicRecorderTests {
 
         // The worker must not proceed to start() after teardown cleared the
         // pending candidate — capture must never begin after meeting end.
-        let quiesced = DispatchSemaphore(value: 0)
-        DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) { quiesced.signal() }
-        #expect(quiesced.wait(timeout: .now() + 2) == .success)
+        // isPendingCandidateCurrent is false from the moment stop() clears
+        // state.pending, so the guard-fail-and-cancel path is a foregone
+        // conclusion regardless of timing: waiting on cancelCalls (rather than
+        // a blind fixed delay) deterministically covers the write.
+        try await waitUntil { candidate.cancelCalls >= 1 }
         #expect(candidate.startCalls == 0)
         #expect(candidate.cancelCalls >= 1)
     }

@@ -51,6 +51,8 @@ struct VoiceInkApp: App {
             VocabularyWord.self,
             WordReplacement.self,
             SessionMetric.self,
+            Meeting.self,
+            MeetingSegment.self,
         ])
         let resolvedContainer: ModelContainer
 
@@ -217,6 +219,7 @@ struct VoiceInkApp: App {
         let defaultStoreURL = appSupportURL.appendingPathComponent("default.store")
         let dictionaryStoreURL = appSupportURL.appendingPathComponent("dictionary.store")
         let statsStoreURL = appSupportURL.appendingPathComponent("stats.store")
+        let meetingsStoreURL = appSupportURL.appendingPathComponent("meetings.store")
 
         let transcriptSchema = Schema([Transcription.self])
         let transcriptConfig = ModelConfiguration(
@@ -245,8 +248,21 @@ struct VoiceInkApp: App {
             cloudKitDatabase: .none
         )
 
+        // Local-only, same as the other three stores (fork has no iCloud container yet — see
+        // FORK-PATCHES.md). Meeting audio itself lives on disk under
+        // `MeetingRuntimePaths.meetingAudioDirectory()`, not in this store; this only holds the
+        // `Meeting`/`MeetingSegment` metadata and transcript rows.
+        let meetingsSchema = Schema([Meeting.self, MeetingSegment.self])
+        let meetingsConfig = ModelConfiguration(
+            "meetings",
+            schema: meetingsSchema,
+            url: meetingsStoreURL,
+            cloudKitDatabase: .none
+        )
+
         do {
-            return try ModelContainer(for: schema, configurations: transcriptConfig, dictionaryConfig, statsConfig)
+            return try ModelContainer(
+                for: schema, configurations: transcriptConfig, dictionaryConfig, statsConfig, meetingsConfig)
         } catch {
             logger.error(
                 "❌ Failed to create persistent ModelContainer:\n\(Self.fullErrorDescription(error), privacy: .public)")
@@ -264,8 +280,12 @@ struct VoiceInkApp: App {
         let statsSchema = Schema([SessionMetric.self])
         let statsConfig = ModelConfiguration("stats", schema: statsSchema, isStoredInMemoryOnly: true)
 
+        let meetingsSchema = Schema([Meeting.self, MeetingSegment.self])
+        let meetingsConfig = ModelConfiguration("meetings", schema: meetingsSchema, isStoredInMemoryOnly: true)
+
         do {
-            return try ModelContainer(for: schema, configurations: transcriptConfig, dictionaryConfig, statsConfig)
+            return try ModelContainer(
+                for: schema, configurations: transcriptConfig, dictionaryConfig, statsConfig, meetingsConfig)
         } catch {
             logger.error(
                 "❌ Failed to create in-memory ModelContainer:\n\(Self.fullErrorDescription(error), privacy: .public)")

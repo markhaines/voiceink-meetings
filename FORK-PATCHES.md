@@ -1062,3 +1062,63 @@ should look nothing like this. Stage 1's own touchpoint count so far: 2 (Stage 0
 header, this stage's package link) — both one-time additions to a target's build graph, not
 recurring edits, and both logged with the same rationale: confirmed unavoidable, confirmed
 minimal, confirmed no live collision with a parallel agent.
+
+## stage2-models-store (Stage 2a: meeting data layer)
+
+Adds `Meeting.swift`, `MeetingSegment.swift` (both `Models/`), `MeetingSegmentPersistenceService.swift`
+(`Models/`) and `MeetingState.swift` (`State/`) — all new, entirely under `Features/Meetings/`,
+so none of them need an entry here under this file's own rule. This section covers the one
+upstream-file touch this stage makes.
+
+### 1. `VoiceInk/App/VoiceInk.swift`: a 4th SwiftData store, `meetings.store`
+
+Follows the existing three-store pattern (`default.store` / `dictionary.store` / `stats.store`,
+`createPersistentContainer`/`createInMemoryContainer` around lines 211-274) exactly, rather than
+inventing a new one:
+
+- `Meeting.self` and `MeetingSegment.self` appended to the top-level `schema` array passed to
+  `ModelContainer(for:configurations:...)`, after `SessionMetric.self` — same "append new models
+  after synced entities" ordering the existing comment there already asks for.
+- A fourth `ModelConfiguration("meetings", schema: Schema([Meeting.self, MeetingSegment.self]),
+  url: meetingsStoreURL, cloudKitDatabase: .none)` in `createPersistentContainer`, `meetingsStoreURL`
+  = `<AppSupport>/meetings.store`, sibling of the other three store files. `.none` for CloudKit,
+  matching `statsConfig`/`transcriptConfig` (this fork has no iCloud container yet — see the
+  Phase 0 "iCloud container removed" section above; `dictionaryConfig` is the one exception, and
+  that exception is itself already logged there).
+- The matching in-memory `ModelConfiguration("meetings", schema: ..., isStoredInMemoryOnly: true)`
+  added to `createInMemoryContainer`, and both `ModelContainer(for:configurations:...)` calls
+  updated to pass the new config — so the existing in-memory-fallback-with-alert behavior (an
+  `NSAlert` warning the user their data won't persist, wired in `init()`, not touched by this
+  change) applies to meetings storage exactly the same way it already does to the other three.
+
+Why a fourth store rather than folding `Meeting`/`MeetingSegment` into `default.store`
+(`Transcription`'s store): meeting audio and metadata are a structurally separate concern from
+dictation transcripts (see `MeetingRuntimePaths.swift`'s header on why meeting audio already
+lives in a sibling directory, exempt from both of VoiceInk's audio-cleanup mechanisms), and a
+separate store keeps that separation true at the persistence layer too — a future retention or
+export policy for meetings can target `meetings.store` without needing a predicate that
+distinguishes model types within a shared store.
+
+No other upstream file was touched. `Meeting.self`/`MeetingSegment.self` join the `VoiceInk` and
+`VoiceInkTests` targets automatically via the existing synchronized root groups, same as every
+other Stage 1 addition under `Features/Meetings/`.
+
+### Note: `MeetingState` is intentionally not `RecordingState`
+
+`VoiceInk/Features/Meetings/State/MeetingState.swift` is a new, separate enum — it does not
+extend, wrap, or otherwise touch `VoiceInk/Core/Recording/RecordingState.swift` or
+`VoiceInkEngine`. See that file's own header comment for the reasoning: `RecordingState` is
+upstream's flat 6-case dictation lifecycle, consumed exhaustively elsewhere, and a meeting
+recording's lifecycle (pausable; a distinct "finalizing" step) doesn't map onto it cleanly
+enough to be worth the collision risk of adding cases to a type six call sites already switch
+over exhaustively.
+
+### Note: unit tests need no `TEST_RUNNER_VOICEINK_CI` gating
+
+`Tests/VoiceInkTests/Features/Meetings/Models/MeetingModelTests.swift` and
+`MeetingSegmentPersistenceServiceTests.swift` run entirely against an in-memory SwiftData
+`ModelContainer` (`ModelConfiguration(isStoredInMemoryOnly: true)`) — no `AVAudioEngine`, no
+`AudioQueueRef`, no CoreAudio device enumeration, nothing that touches the hardware inventory
+`AudioGraphExceptionBridgeTests.swift`'s CI-only skip (`phase-1-mic-route` section above) exists
+to work around. Confirmed by running the full local suite with `TEST_RUNNER_VOICEINK_CI` both
+set and unset: identical pass/fail results either way. No new gating was added.

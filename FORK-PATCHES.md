@@ -2579,3 +2579,183 @@ Test case 'MeetingEngineTests/discardRetriesMarkFailedOnPersistentFailure()' pas
 
 No upstream file touched, no SPM dependency added. Files changed: `MeetingChunkCollector.swift`,
 `MeetingEngine.swift`, `MeetingEngineTests.swift`, `FOLLOWUPS.md`.
+
+## meeting-transcription-coordinator (Stage 2c: the real MeetingTranscriptionCoordinator)
+
+Replaces `NullMeetingTranscriptionCoordinator` as the piece `MeetingEngine` can be constructed
+with in production: `MeetingTranscriptionCoordinator`, an actor conforming to
+`MeetingTranscriptionCoordinating`, implementing `DECISION-transcription-seam.md`'s Option (ii)
+(coordinator sits BESIDE `TranscriptionServiceRegistry`, calls FluidAudio and transcribe-cpp
+directly for real per-segment timing, flat-string sentence-split fallback for everything else).
+
+### Premise verification (STEP 1 of the brief), before anything was built
+
+(a) Confirmed: `MeetingTranscriptionCoordinating.swift` defines the protocol and only
+`NullMeetingTranscriptionCoordinator` implemented it anywhere in the repo (`grep -rl
+"MeetingTranscriptionCoordinating"` — three hits besides the protocol file itself: the protocol
+file, `MeetingEngine.swift`, `MeetingPersisting.swift`, `MeetingEngineTests.swift`; none besides
+the Null stub and this stage's own new type conform).
+
+(b) Confirmed: `MicTurnNormalizer.swift`/`SystemTurnNormalizer.swift` are present in
+`Features/Meetings/Transcription/` and are the code that actually manufactures turn timing —
+`MicTurnNormalizer` runs a three-tier decision (real segment timing if present and not
+"fragmented" -> merge adjacent -> NLTokenizer sentence-split + proportional interpolation);
+`SystemTurnNormalizer` always does the sentence-split tier, never inspects `result.segments`.
+Both ported verbatim in an earlier stage; neither touched here.
+
+(c) Confirmed: `SpeechTranscriptionResult.swift` (`{ text: String, segments: [SpeechSegment] }`)
+is present and is exactly what both normalizers consume.
+
+(d) Confirmed, exact line numbers, quoted:
+`LibWhisper.swift:104-108`:
+```swift
+func getTranscription() -> String {
+    guard let context = context else { return "" }
+    var transcription = ""
+    for i in 0..<whisper_full_n_segments(context) {
+        transcription += String(cString: whisper_full_get_segment_text(context, i))
+```
+`t0`/`t1` are never called anywhere in this function — only segment text is read.
+`FluidAudioTranscriptionService.swift:196`:
+```swift
+return TextNormalizer.shared.normalizeSentence(result.text)
+```
+`result` is FluidAudio's `ASRResult` (from `asrManager.transcribe(...)`); everything on it
+except `.text` — including `tokenTimings` — is discarded at this return.
+
+(e) Confirmed: `MeetingEngine` depends only on the four `MeetingTranscriptionCoordinating`
+methods (`getVadManager()` once at `start()`; `transcribeMeetingChunk(at:)` three call sites,
+final-mic-chunk/final-system-chunk/mid-meeting rotation; `diarizeSystemAudio(at:)` once at
+`stop()`; `transcribeMeeting(at:)` not called anywhere in `MeetingEngine` today, matching the
+protocol file's own note). `MeetingEngine`'s initializer defaults `transcriptionCoordinator` to
+`NullMeetingTranscriptionCoordinator()`, so yes, it already constructs and runs fine without this
+piece — that default is unchanged by this stage.
+
+### What was built
+
+Five new files, all under `Features/Meetings/Transcription/`, no existing file touched:
+
+- `MeetingSegmentTranscribing.swift` — the two small protocols this stage adds
+  (`MeetingSegmentTranscribing`, `MeetingSystemAudioDiarizing`) plus `MeetingTranscriptionBackend`
+  (`.fluidAudio` / `.transcribeCpp` / `.other`).
+- `MeetingTranscriptionCoordinator.swift` — the actor. Constructor-injected: `backend`, an
+  optional transcriber per segment-bearing backend, an optional diarizer, a
+  `fallbackTranscribe: @Sendable (URL) async throws -> String` closure, and a `vadManagerFactory`
+  defaulting to `{ try await VadManager() }`. Routes `transcribeMeetingChunk`/`transcribeMeeting`
+  by `backend`: if the matching transcriber is configured, calls it verbatim; otherwise (or for
+  `.other`) wraps `fallbackTranscribe`'s string in a single zero-duration `SpeechSegment` — the
+  exact shape `MicTurnNormalizer`/`SystemTurnNormalizer` already treat as "no meaningful timing."
+  `getVadManager()` lazily constructs and caches a `VadManager` (and caches a construction
+  *failure* too, so it does not retry every chunk). `diarizeSystemAudio` delegates to the
+  injected diarizer, nil if none configured.
+- `FluidAudioMeetingSegmentTranscriber.swift` — owns its own `AsrManager` and its own Parakeet
+  model load (`AsrModels.load`/`.v3`/`.int8`, same call shape `FluidAudioTranscriptionService`
+  uses), independent of that file (which the brief forbids touching — its `asrManager` is
+  `private`, no seam to reach without an edit). Maps `ASRResult.tokenTimings` to one
+  `SpeechSegment` per token (matching the donor's own `transcribeWithFluidAudio` exactly, per
+  `segment-timing-design.md` §A/§C), falling back to one full-span segment (real `duration`, not
+  zero) only when the backend returns no token timings.
+- `TranscribeCppMeetingSegmentTranscriber.swift` — owns its own `Model`/`Session`, independent of
+  `OfflineTranscribeCppService.swift` for the same reason (that file explicitly opts OUT of
+  timing with `timestamps: .none`, and changing that is an upstream-file edit the brief said to
+  stop and ask about, not make unilaterally). Reads (does not edit)
+  `TranscribeCppModelCatalog.artifact(for:)` to resolve an on-disk model file. Requests
+  `timestamps: .segment` and maps `Transcript.segments` to `[SpeechSegment]` (ms -> seconds).
+  Deliberately does NOT reproduce that file's energy-aware long-file chunking — meeting chunks
+  are already short, VAD-rotated windows, not whole dictation files, so one `session.run` per
+  chunk is the correct scope.
+- `FluidAudioMeetingDiarizer.swift` — `diarizeSystemAudio`'s real implementation: resolves
+  `DiarizerRuntimePolicy.resolve(for: .current())` once and applies `.modelConfiguration`
+  whenever `DiarizerModels` load, per `ADAPTER-HANDOVER.md` §5's explicit requirement. Its load
+  `Task` is typed `Void`, not `DiarizerManager` — `DiarizerManager` is a plain (non-`Sendable`,
+  non-actor) class, and typing the Task's success value as it would fail to compile under this
+  project's concurrency checking; the fix is to assign `self.loadedManager` from inside the
+  actor-isolated Task body instead of returning the manager across a generic boundary that would
+  require it to be `Sendable`.
+
+None of the four new files route audio through `AudioFileProcessor.processAudioToSamples()` (the
+whole-file-into-`[Float]` loader the brief named as forbidden for meeting audio): FluidAudio's
+`AsrManager.transcribe(url:...)` reads/streams the URL itself; the transcribe-cpp and diarizer
+paths use FluidAudio's own `AudioConverter.resampleAudioFile` (the same helper
+`OfflineTranscribeCppService.swift`/`FluidAudioTranscriptionService.swift` already use), a
+distinct type from this fork's `AudioFileProcessor`.
+
+### Which backends land on which path TODAY
+
+Nothing in this repo constructs a non-Null `MeetingTranscriptionCoordinator` yet — no
+composition root exists (that is a UI/settings decision the protocol file's own header says this
+stage does not make: "backend selection ... is a product decision"). So today, in production,
+every meeting still runs on `NullMeetingTranscriptionCoordinator` (empty transcript), unchanged
+by this PR. What this stage adds is the coordinator and its two real segment-bearing adapters,
+ready to be wired in: given `backend: .fluidAudio` with a `FluidAudioMeetingSegmentTranscriber`
+configured, chunks route to real per-token timing; given `.transcribeCpp` with a
+`TranscribeCppMeetingSegmentTranscriber` and an installed catalog model, chunks route to real
+per-segment timing; every other configuration (`.other`, or `.fluidAudio`/`.transcribeCpp` with
+no transcriber wired) routes to the flat-string fallback.
+
+### Tests
+
+`MeetingTranscriptionCoordinatorTests.swift` (12 cases) and
+`FluidAudioMeetingSegmentTranscriberTests.swift` (6 cases), all against real types (fakes only at
+the `MeetingSegmentTranscribing`/`MeetingSystemAudioDiarizing` protocol boundary, never inside
+`SpeechSegment`/`SpeechTranscriptionResult`/`ASRResult`/`TokenTiming`, all of which have public
+initializers and are constructed for real).
+
+The naive-implementation-killing case, `killsNaiveAlwaysSentenceSplit`: a fake FluidAudio
+transcriber returns two real timed segments (`0.2-0.6`, `2.5-3.8`, chunk-relative) for the single
+grammatical sentence "Hi there friend." — chosen so NLTokenizer's `.sentence` unit sees no
+boundary in it, meaning a sentence-split fallback for the *identical text* collapses to exactly
+ONE turn (see the paired control test, `fallbackCollapsesToOneTurn`). Values were derived by hand
+against `MicTurnNormalizer`'s documented tiering before running anything: two segments never trip
+`isFragmented` (`guard segments.count > 3`), and the 1.9s gap between them exceeds both the 0.35s
+merge gap and the 1.5s short-segment gap cap, so they survive as two independent turns at
+`100.2-100.6` and `102.5-103.8` (chunk start 100.0 + each segment's own offset). Run against the
+real `MeetingTranscriptionCoordinator` + the real, unmodified `MicTurnNormalizer`: passes,
+producing exactly those two turns. A coordinator that always flattened to sentence-split
+(ignoring a configured segment-bearing transcriber) would produce ONE turn spanning
+`100.0-104.0` instead — this test fails against that implementation and passes against the real
+one.
+
+`FluidAudioMeetingSegmentTranscriberTests` covers the pure `speechSegments(fromTokenTimings:...)`
+mapping directly against real `TokenTiming`/`ASRResult` values (both have public memberwise
+initializers in the FluidAudio package) — the one segment-bearing adapter this can be done for.
+transcribe-cpp's equivalent mapping (`Transcript.segments -> [SpeechSegment]`) has NO test:
+`Transcript`/`Segment` have no public initializer outside the `TranscribeCpp` package and are not
+`Codable`, so no real value can be constructed from this module. That mapping is exercised only
+by type-checking + the compiled, running build; stated here rather than silently left uncovered.
+
+### What could not be proven / known gaps, stated plainly
+
+- **transcribe-cpp segment mapping has no unit test** (see above) — untestable from this module
+  with the types as they stand.
+- **`FluidAudioMeetingSegmentTranscriber`/`TranscribeCppMeetingSegmentTranscriber`/
+  `FluidAudioMeetingDiarizer`'s real model-loading paths were never run against real audio or
+  real downloaded models** — no Parakeet/transcribe-cpp/diarizer models are present in this
+  environment, and the brief's gates are the local test suite and CI, neither of which downloads
+  multi-hundred-MB models. Verified only: they compile against the real FluidAudio/TranscribeCpp
+  package APIs and pass `xcodebuild build-for-testing`. This is genuinely unverified beyond that.
+- **`FluidAudioMeetingDiarizer` does NOT implement the donor's full three-property diarizer
+  preload semantics** `ADAPTER-HANDOVER.md` §5 describes as needed for "a correct port of this
+  behavior" (an operation deadline independent of a caller's own wait timeout; a cancelled
+  joiner never aborting the shared load for other waiters). It does join an in-flight load
+  Task (the first of those three properties, informally), but not the other two. Out of scope
+  for this stage's brief, which asked for the transcription seam; flagged rather than silently
+  built partial.
+- **Which transcribe-cpp catalog model (`cohereTranscribe` vs. `senseVoiceSmall`) backs
+  meetings, and whether either's installed model artifact actually populates `Transcript
+  .segments` at `.segment` timestamp granularity, is unresolved** — both are real, declared
+  models with unknown per-model timestamp-kind support (`segment-timing-design.md` §B says the
+  same for the donor's own catalog: "I did not cross-check which catalog entries claim which
+  `maxTimestampKind`"). The artifact is constructor-injected, not decided here.
+- **No composition root wires a real coordinator into `MeetingEngine` in production** — see
+  "Which backends land on which path TODAY" above. This stage builds the coordinator and its
+  adapters; wiring them into the app's actual meeting-start flow (and deciding, e.g. via a
+  settings UI, which backend a given meeting uses) is a follow-on, not attempted here.
+
+No upstream file touched (`TranscriptionService.swift`, `TranscriptionServiceRegistry.swift`,
+`LibWhisper.swift`, `FluidAudioTranscriptionService.swift`, `OfflineTranscribeCppService.swift`,
+and every dictation-path file are all read-only in this stage), no SPM dependency added. Files
+changed: `MeetingSegmentTranscribing.swift`, `MeetingTranscriptionCoordinator.swift`,
+`FluidAudioMeetingSegmentTranscriber.swift`, `TranscribeCppMeetingSegmentTranscriber.swift`,
+`FluidAudioMeetingDiarizer.swift`, `MeetingTranscriptionCoordinatorTests.swift`,
+`FluidAudioMeetingSegmentTranscriberTests.swift`, `FORK-PATCHES.md` (this entry).

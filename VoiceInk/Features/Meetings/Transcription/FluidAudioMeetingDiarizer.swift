@@ -59,8 +59,8 @@
 //     Its parameter type cannot express "here is a manager", so a caller cannot supply one,
 //     whatever their intent. `FluidAudioSharedModelAttacks.swift` asserts the old
 //     manager-returning initializer no longer compiles.
-//   * The actor constructs every `DiarizerManager` itself, inside `finishLoad`, from models it
-//     was given. `DiarizerModels` is FluidAudio's own `public struct ... Sendable` whose
+//   * The actor constructs every `DiarizerManager` itself, inside `finishLoad`, on the actor,
+//     from models. `DiarizerModels` is FluidAudio's own `public struct ... Sendable` whose
 //     memberwise initializer is NOT public, so no code in this target can fabricate one either.
 // Consequence: "the manager is reachable from nowhere else" is now true against the available
 // API, not just against current call sites. `injectedLoadStepCannotSupplyTheManagerTheActorResolves`
@@ -68,9 +68,17 @@
 //
 // B3 (round 3, still holds): there is no `extension DiarizerManager: @unchecked Sendable {}` --
 // that was a module-wide promise about a third-party mutable class that every future FluidAudio
-// bump would inherit. Round 3 replaced it with a private box; round 4's redesign removes even
-// that, because `DiarizerModels` is already `Sendable` and the manager is never carried across an
-// isolation boundary at all. There is no `@unchecked` conformance left in this file.
+// bump would inherit. Round 3 replaced it with a private `@unchecked` box, needed because a
+// manager was carried from the load task into the actor. Round 4 removes the box too, by moving
+// the construction onto the actor: the only thing that crosses that boundary now is
+// `DiarizerModels?`, which is already `Sendable`. A `DiarizerManager` is created, stored and read
+// entirely within this actor's isolation and never crosses it. There is no `@unchecked`
+// conformance left in this file.
+//
+// Stated precisely rather than more grandly: the `Result`'s ERROR half is `any Error`, which is
+// not `Sendable`, so errors do cross that hop -- as they do at every `async throws` boundary in
+// this codebase. The claim here is about the manager and the models, which are the values B3 and
+// B4.4 are about, not about the hop carrying nothing at all.
 
 import FluidAudio
 import Foundation
@@ -196,17 +204,13 @@ actor FluidAudioMeetingDiarizer: MeetingSystemAudioDiarizing {
         activeLoadID = id
 
         let load = loadModels
-        let managerConfig = config
         loadTask = Task { [weak self] in
-            let outcome: Result<DiarizerManager, Error>
+            let outcome: Result<DiarizerModels?, Error>
             do {
-                // Constructed HERE, from models, never supplied by a caller (B4.4). This is the
-                // only `DiarizerManager` construction site outside the actor's own state, and the
-                // reference does not outlive this statement: `finishLoad` takes ownership.
-                let models = try await load()
-                let manager = DiarizerManager(config: managerConfig)
-                if let models { manager.initialize(models: models) }
-                outcome = .success(manager)
+                // Only MODELS cross back into the actor, never a manager. `DiarizerModels` is
+                // FluidAudio's own `public struct ... Sendable`, so this hop carries no
+                // non-Sendable value; `finishLoad` builds the manager on the actor itself.
+                outcome = .success(try await load())
             } catch {
                 outcome = .failure(error)
             }
@@ -230,7 +234,7 @@ actor FluidAudioMeetingDiarizer: MeetingSystemAudioDiarizing {
     /// actor already gave up on is dropped, never installed. It ALSO closes the circuit breaker
     /// for that generation, which is the only way `outstandingAbandonedLoads` ever comes back
     /// down: a load that never returns keeps the breaker open, which is the intended behaviour.
-    private func finishLoad(id: UUID, _ outcome: Result<DiarizerManager, Error>) {
+    private func finishLoad(id: UUID, _ outcome: Result<DiarizerModels?, Error>) {
         guard activeLoadID == id else {
             outstandingAbandonedLoads = max(outstandingAbandonedLoads - 1, 0)
             return
@@ -240,7 +244,11 @@ actor FluidAudioMeetingDiarizer: MeetingSystemAudioDiarizing {
         deadlineTask?.cancel()
         deadlineTask = nil
         switch outcome {
-        case .success(let manager):
+        case .success(let models):
+            // The ONE `DiarizerManager` construction site (B4.4), on the actor, from models a
+            // caller could not have supplied. Nothing else in this target can reach it.
+            let manager = DiarizerManager(config: config)
+            if let models { manager.initialize(models: models) }
             loadedManager = manager
             resumeAllWaiters(with: .success(()))
         case .failure(let error):

@@ -23,8 +23,10 @@
 // WHAT THIS ENFORCES, AND WHAT REMAINS CONVENTIONAL -- both stated, because the difference is
 // what round 3 got wrong:
 //   * ENFORCED: nothing reachable through the capability the meeting seam is given can evict,
-//     load, or switch a model. `FluidAudioMeetingSegmentTranscriber` stores this protocol type,
-//     so no member outside it can be named there at all.
+//     load, or switch a model. `FluidAudioMeetingSegmentTranscriber`'s initializer takes this
+//     protocol, so `borrowedAsrManager()` is the only member of the transcription service that
+//     can be NAMED in that file; it then stores the result closed over as a
+//     `MeetingAsrManagerBorrow`, which is narrower still, because a closure has no members.
 //   * CONVENTIONAL: `cleanup()` is still `internal` on `FluidAudioTranscriptionService`, because
 //     it is dictation's own lifecycle API with existing upstream callers and making it `private`
 //     is not an accessor-sized change. Any app-target code that obtains the CONCRETE service --

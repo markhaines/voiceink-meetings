@@ -3305,9 +3305,32 @@ pins the old signature as gone (`extra argument 'loadManager' in call`), and
 `injectedLoadStepCannotSupplyTheManagerTheActorResolves` pins the behaviour at runtime: a manager
 the closure constructs and retains is not the one the actor resolves.
 
-A side effect worth recording: `LoadedDiarizerBox` is gone too. With the manager never crossing
-an isolation boundary and `DiarizerModels` already `Sendable`, there is now **no `@unchecked`
-conformance anywhere in the production meeting-transcription code**.
+A side effect worth recording: `LoadedDiarizerBox` is gone too. Round 3 needed it because a
+manager was carried from the load task into the actor; round 4 moves the construction ONTO the
+actor (`finishLoad`), so the only value crossing that hop is `DiarizerModels?`, which FluidAudio
+already declares `Sendable`. There is now **no `@unchecked` conformance anywhere in the production
+meeting-transcription code**.
+
+Precisely, since this is the kind of clause that has been wrong before: the `Result`'s error half
+is `any Error`, which is not `Sendable`, so errors do cross that hop -- as they do at every
+`async throws` boundary in this codebase. The claim is about the manager and the models, the
+values B3 and B4.4 are actually about, not that the hop carries nothing.
+
+#### Three comment clauses I wrote in this round and then found false
+
+Caught by re-reading my own diff against the code before pushing, in the specific places the bar
+says to look. Recording them because "the comment was wrong" has been the actual bug on this
+branch once already:
+
+1. "`FluidAudioMeetingSegmentTranscriber` stores this protocol type" -- it stores the closure, not
+   the existential, after the isolation fix above. Corrected to say the initializer takes the
+   protocol and the stored form is narrower.
+2. "The actor constructs every `DiarizerManager` itself, inside `finishLoad`" -- as first written
+   it constructed it inside the load TASK, which is not the actor. Rather than correct the comment
+   to match the code, the CODE was changed to match the safer claim, which also removed the last
+   isolation crossing of a non-Sendable value.
+3. "the manager is never carried across an isolation boundary at all" -- true only after fix (2),
+   and still needed the `any Error` qualification above to be honest.
 
 #### An isolation bug found while fixing B4.1, and how
 

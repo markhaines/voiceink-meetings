@@ -173,7 +173,7 @@ run_case() {
 
 run_case MeetingStoreIsolationAttacks.swift 14
 run_case MeetingStoreRetroactiveConformanceAttack.swift 1
-run_case FluidAudioSharedModelAttacks.swift 5
+run_case FluidAudioSharedModelAttacks.swift 10
 
 echo "All negative controls still fail to compile, for the expected reasons,"
 echo "each on the exact line its marker names, with no unattributed diagnostics."

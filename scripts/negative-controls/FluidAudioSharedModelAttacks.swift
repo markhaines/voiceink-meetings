@@ -48,6 +48,51 @@ private func meetingSeamAttacks(service: FluidAudioTranscriptionService) async t
     try await service.ensureNemotronModelsLoaded(named: "anything")
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// ROUND 4. The attacks above all target the CONCRETE service, and they all pass -- which is
+// exactly why the suite missed B4.1. `cleanup()` is `internal`, so `service.cleanup()` compiles
+// fine and the suite that claimed to enforce "no meeting file can evict" never tried it. The fix
+// was to stop handing the meeting seam the concrete service at all. These attacks target what it
+// actually holds now: `any MeetingAsrManagerBorrowing`.
+// ---------------------------------------------------------------------------------------------
+
+@MainActor
+private func capabilityAttacks(borrowing: any MeetingAsrManagerBorrowing) async {
+    // E6. THE ATTACK ROUND 3 SHOULD HAVE CARRIED. `cleanup()` tears down the active dictation
+    // manager. It is still internal on the concrete class -- so the enforcement is that the seam
+    // does not hold the concrete class.
+    // expect-error: value of type 'any MeetingAsrManagerBorrowing' has no member 'cleanup'
+    await borrowing.cleanup()
+
+    // E7. Loading is eviction's other half: `loadModel(for:)` reaches `ensureModelsLoaded`, which
+    // calls `cleanupLoadedManagers()`.
+    // expect-error: value of type 'any MeetingAsrManagerBorrowing' has no member 'loadModel'
+    try? await borrowing.loadModel(for: FluidAudioModel.self as! FluidAudioModel)
+
+    // E8. And the capability must not smuggle the concrete type back out.
+    // expect-error: cannot convert value of type 'any MeetingAsrManagerBorrowing' to specified type 'FluidAudioTranscriptionService'
+    let _: FluidAudioTranscriptionService = borrowing
+}
+
+// E9. B4.2: the dictation-priority check has no default, so a composition root cannot silently
+// build a meeting transcriber with admission control disabled. `@MainActor` so the ONLY thing
+// wrong with the call below is the missing argument, not the isolation of the caller.
+@MainActor
+private func admissionControlIsNotOptional(borrowing: any MeetingAsrManagerBorrowing) {
+    // expect-error: missing argument for parameter 'isDictationActiveOrPending' in call
+    _ = FluidAudioMeetingSegmentTranscriber(borrowing: borrowing)
+}
+
+// E10. B4.4: the injectable diarizer seam must not accept a caller-supplied manager. Round 3's
+// initializer took `() async throws -> DiarizerManager`, which let same-module production code
+// construct a manager, RETAIN it, and hand it in while the actor treated it as exclusively its
+// own. If that initializer ever comes back, this stops being an error.
+private func diarizerSeamCannotAcceptAManager() {
+    // expect-error: extra argument 'loadManager' in call
+    _ = FluidAudioMeetingDiarizer(loadOperationTimeout: 1, loadManager: { DiarizerManager(config: .default) })
+}
+
 // E7 IS DELIBERATELY ABSENT. The obvious companion attack -- "assert `DiarizerManager` is not
 // `Sendable` in this target", to stop B3's retroactive `extension DiarizerManager: @unchecked
 // Sendable {}` coming back -- cannot live here. This target builds in the Swift 5 language mode

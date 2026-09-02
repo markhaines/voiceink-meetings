@@ -47,11 +47,13 @@ private struct ThrowingSegmentTranscriber: MeetingSegmentTranscribing {
     }
 }
 
-/// Stands in for the one condition the coordinator ROUTES on rather than propagating: dictation
-/// has no model loaded, so there was nothing for the meeting seam to borrow (fix round 3, B1).
-private struct NoSharedModelSegmentTranscriber: MeetingSegmentTranscribing {
+/// Stands in for the conditions the coordinator ROUTES on rather than propagating: dictation has
+/// no model loaded (fix round 3, B1), or dictation has priority (fix round 4, B4.2).
+private struct RefusingSegmentTranscriber: MeetingSegmentTranscribing {
+    let reason: MeetingSegmentTranscriberError
+
     func transcribe(chunkAt url: URL) async throws -> SpeechTranscriptionResult {
-        throw MeetingSegmentTranscriberError.sharedModelNotLoaded
+        throw reason
     }
 }
 
@@ -170,7 +172,27 @@ struct MeetingTranscriptionCoordinatorTests {
         }
     }
 
-    @Test("sharedModelNotLoaded degrades to the flat fallback -- the ONE error routed, not propagated")
+    @Test("dictationHasPriority degrades to the flat fallback rather than making dictation wait")
+    func dictationHasPriorityDegradesToFallback() async throws {
+        // B4.2. Yielding costs this chunk its per-token segment timings; `MicTurnNormalizer`
+        // sentence-splits the flat text instead, which is the donor's own behaviour for every
+        // backend except FluidAudio. That is the price, and it is the right way round: making
+        // Mark's dictation queue behind a meeting chunk's inference is not an acceptable one.
+        let coordinator = MeetingTranscriptionCoordinator(
+            backend: .fluidAudio,
+            fluidAudioTranscriber: RefusingSegmentTranscriber(reason: .dictationHasPriority),
+            fallbackTranscribe: { _ in "Hi there friend." }
+        )
+
+        let result = try await coordinator.transcribeMeetingChunk(at: Self.chunkURL)
+
+        #expect(result.text == "Hi there friend.")
+        #expect(result.segments.count == 1)
+        #expect(result.segments.first?.start == 0)
+        #expect(result.segments.first?.end == 0)
+    }
+
+    @Test("sharedModelNotLoaded degrades to the flat fallback -- a routed error, not a propagated one")
     func sharedModelNotLoadedDegradesToFallback() async throws {
         // Paired with `segmentTranscriberFailurePropagates` above, which is the control: these
         // two together are what show the catch is narrow. If the coordinator ever used a blanket
@@ -180,7 +202,7 @@ struct MeetingTranscriptionCoordinatorTests {
         // recording is the hardest kind of wrong to notice.
         let coordinator = MeetingTranscriptionCoordinator(
             backend: .fluidAudio,
-            fluidAudioTranscriber: NoSharedModelSegmentTranscriber(),
+            fluidAudioTranscriber: RefusingSegmentTranscriber(reason: .sharedModelNotLoaded),
             fallbackTranscribe: { _ in "Hi there friend." }
         )
 

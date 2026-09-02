@@ -4,84 +4,97 @@
 // FluidAudio's own `DiarizerManager` directly. `ADAPTER-HANDOVER.md` §5 requires
 // `DiarizerRuntimePolicy.resolve(for:)` be called once and its `.modelConfiguration` applied
 // whenever a `DiarizerManager`'s models are loaded (the M1/macOS-15.1 GPU-avoidance workaround,
-// FluidAudio issue #344) -- the default `loadManager` closure below is that one call site.
+// FluidAudio issue #344) -- the default `loadModels` closure below is that one call site.
 //
-// FIX ROUND 3 (cross-vendor review, B2 and B3). Two earlier designs were defeated here:
+// THE LOAD STATE MACHINE, and the three review rounds that shaped it:
 //
-//   * Round 1 joined an in-flight load with no operation ceiling at all. `diarizeSystemAudio` is
-//     awaited from `MeetingEngine.stop()`, so a hung CoreML load hung meeting completion
-//     indefinitely: Mark ends a 90-minute meeting and the app never finishes it.
-//   * Round 2 added a ceiling built out of `withTaskGroup`, racing the loader against a timeout
-//     child and calling `group.cancelAll()` when the timeout won. Review found that this is not
-//     a ceiling at all. `withTaskGroup` is STRUCTURED concurrency: the group cannot return until
-//     every child task has finished, so leaving the group still awaits the loader. Against a
-//     loader that ignores cooperative cancellation -- which is the only failure mode the ceiling
-//     exists for -- the caller waited exactly as long as it would have with no ceiling. Round 2's
-//     own test appeared to prove otherwise (a "60s" loader finishing in 0.214s against a 0.2s
-//     deadline) because its loader was `try await Task.sleep`, which IS cancellation-aware and
-//     threw the instant `cancelAll()` ran. Real numbers, wrong property: it proved cooperative
-//     cancellation, not a ceiling.
+//   * Round 1 joined an in-flight load with no ceiling. `diarizeSystemAudio` is awaited from
+//     `MeetingEngine.stop()`, so a hung CoreML load hung meeting completion indefinitely: Mark
+//     ends a 90-minute meeting and the app never finishes it.
+//   * Round 2 built a ceiling out of `withTaskGroup` + `group.cancelAll()`. That is not a
+//     ceiling: `withTaskGroup` is STRUCTURED, so leaving the group awaits the loader anyway. Its
+//     test appeared to prove otherwise only because the injected loader was `Task.sleep`, which
+//     IS cancellation-aware and threw the instant cancellation arrived. Real numbers, wrong
+//     property.
+//   * Round 3 replaced it with an UNSTRUCTURED load task and a separate, independently expiring
+//     deadline task. That ceiling is real and is proved against a genuinely cancellation-blind
+//     loader (`FluidAudioMeetingDiarizerTests.hungCancellationBlindLoadIsBoundedByTheCeiling`,
+//     with `roundTwoStructuredCeilingDoesNotBoundABlindLoader` as its control).
+//   * Round 4 fixed what round 3 under-disclosed (B4.3) and a seam it got wrong (B4.4). Both
+//     below.
 //
-// Round 3 makes the ceiling structural. The load runs in an UNSTRUCTURED `Task` that nothing
-// ever awaits, and the deadline is a SEPARATE unstructured `Task` that expires on its own clock.
-// Waiters are resumed by whichever of the two fires first, and neither one awaits the other, so
-// a caller's return time is bounded by the deadline task alone -- independently of whether the
-// loader can be cancelled, or ever finishes:
-//
-//   1. Shared load: a second concurrent caller joins the SAME in-flight load (`activeLoadID`),
-//      never starting a second one.
+// Properties this actor holds:
+//   1. Shared load: concurrent callers join the SAME in-flight generation (`activeLoadID`).
 //   2. Hard operation deadline (`loadOperationTimeout`, default 30s). `expireLoad` resumes every
-//      waiter with `.loadTimedOut` and returns. It cancels the load task best-effort and then
-//      forgets it; it never awaits it. A cancellation-BLIND loader is bounded by this, which is
-//      the property `FluidAudioMeetingDiarizerTests.hungCancellationBlindLoadIsBoundedByTheCeiling`
-//      proves with a loader that blocks on a `DispatchSemaphore` on a detached thread and cannot
-//      be interrupted by `Task.cancel()` at all.
-//   3. Quarantine by load ID: an abandoned load that eventually DOES finish calls `finishLoad`
-//      with its own id, sees it is no longer `activeLoadID`, and drops its result on the floor.
-//      It can never install a manager into a generation that already gave up on it. The abandoned
-//      `DiarizerManager` (if one is ever produced) is simply released.
-//   4. Fresh load, never a dead one: `expireLoad` clears `activeLoadID`, so the NEXT
-//      `diarize`/`resolvedManagerIdentity` starts a brand-new load with a new id rather than
-//      joining the abandoned one. Same for a failed load -- "a failed diarization is recoverable"
-//      (audio and segments are already persisted by the time this runs at `stop()`).
+//      waiter and returns; it never awaits the loader, so a cancellation-BLIND load cannot make a
+//      caller wait past the deadline.
+//   3. Quarantine by load id: a late result from an abandoned generation is dropped, never
+//      installed.
+//   4. Circuit breaker (round 4, B4.3). Round 3 disclosed "one abandoned load alongside its
+//      replacement", which understated it: a PERMANENTLY stuck load is abandoned and every later
+//      `stop()` could start another, accumulating unbounded cancellation-blind CoreML loads. The
+//      id guard prevents stale STATE, not stale RESOURCES. `maxOutstandingAbandonedLoads` (1)
+//      now caps it: while an abandoned load has not returned, a new attempt fails FAST with
+//      `.loadAbandonedAndStillOutstanding` instead of starting another. So at most two loads can
+//      ever be in flight at once -- one live, one abandoned -- regardless of how many meetings
+//      end. The breaker closes by itself when the abandoned load finally returns (including by
+//      throwing, if it cooperates with cancellation); if it never returns, failing fast forever
+//      is the correct outcome, not a regression.
 //   5. Prompt waiter cancellation: a caller whose own Task is cancelled while joining returns
-//      immediately with `CancellationError` via `cancelWaiter`, WITHOUT touching the shared load
-//      or any other waiter.
+//      with `CancellationError` without touching the load or any other waiter.
 //
-// B3: round 2 wrote `extension DiarizerManager: @unchecked Sendable {}`. Review was right that
-// this is a MODULE-WIDE promise about a third-party mutable class that every future FluidAudio
-// bump would silently inherit, regardless of what the comment above it said. It is gone. The
-// only `@unchecked` conformance left is `LoadedDiarizerBox` below: a `private`, single-field
-// wrapper whose entire justification is one hop, from the load task into this actor. Nothing
-// outside this actor is ever handed a `DiarizerManager` -- not even the test seam, which returns
-// an `ObjectIdentifier` (a `Sendable` value type) rather than the manager itself.
+// B4.4 -- WHO CAN SUPPLY A MANAGER. Round 3 said "nothing outside this actor is ever handed a
+// `DiarizerManager`" and backed it with a `private` box. Review found the hole: the injectable
+// initializer took `() async throws -> DiarizerManager`, so any same-module caller (not only a
+// test) could construct a manager, RETAIN it, hand it in, and hold a second reference to
+// something the actor then treated as exclusively its own. This is the third test-only seam on
+// this project that turned out to be a real hole.
+//
+// The fix is the seam's TYPE, not a configuration gate. `#if DEBUG` would not have been
+// sufficient -- the next integrator writes and runs code in Debug, which is exactly how the
+// previous two seams leaked. Instead:
+//   * The stored seam is `() async throws -> DiarizerModels?`.
+//   * The production initializer supplies real `DiarizerModels`.
+//   * The injectable initializer takes `() async throws -> Void` and always yields `nil` models.
+//     Its parameter type cannot express "here is a manager", so a caller cannot supply one,
+//     whatever their intent. `FluidAudioSharedModelAttacks.swift` asserts the old
+//     manager-returning initializer no longer compiles.
+//   * The actor constructs every `DiarizerManager` itself, inside `finishLoad`, from models it
+//     was given. `DiarizerModels` is FluidAudio's own `public struct ... Sendable` whose
+//     memberwise initializer is NOT public, so no code in this target can fabricate one either.
+// Consequence: "the manager is reachable from nowhere else" is now true against the available
+// API, not just against current call sites. `injectedLoadStepCannotSupplyTheManagerTheActorResolves`
+// pins it at runtime as well.
+//
+// B3 (round 3, still holds): there is no `extension DiarizerManager: @unchecked Sendable {}` --
+// that was a module-wide promise about a third-party mutable class that every future FluidAudio
+// bump would inherit. Round 3 replaced it with a private box; round 4's redesign removes even
+// that, because `DiarizerModels` is already `Sendable` and the manager is never carried across an
+// isolation boundary at all. There is no `@unchecked` conformance left in this file.
 
 import FluidAudio
 import Foundation
 
-/// Carries a `DiarizerManager` across exactly one isolation hop: from the unstructured load task
-/// into `FluidAudioMeetingDiarizer.finishLoad(id:_:)`, which stores it in actor-isolated state
-/// and never lets it out again.
-///
-/// `private` on purpose. The `@unchecked` promise is scoped to THIS box and its two use sites in
-/// this file, not to `DiarizerManager`, so it cannot be inherited by any other code in the target
-/// and a future FluidAudio version cannot quietly acquire it. The promise itself is true by
-/// construction: the box is created inside the load task, immediately consumed by the actor, and
-/// the manager it carries is reachable from nowhere else at that moment (the load task's own
-/// reference goes out of scope on the next line).
-private struct LoadedDiarizerBox: @unchecked Sendable {
-    let manager: DiarizerManager
-}
-
 enum FluidAudioMeetingDiarizerError: Error, Equatable {
     case loadTimedOut
     case loadDidNotProduceManager
+    /// The circuit breaker (B4.3): a previous load blew its deadline and has still not returned,
+    /// so this attempt refused to start another rather than accumulate stuck CoreML loads.
+    case loadAbandonedAndStillOutstanding
 }
 
 actor FluidAudioMeetingDiarizer: MeetingSystemAudioDiarizing {
+    /// At most one abandoned (deadline-blown, not yet returned) load may be outstanding. One,
+    /// not a larger number: the failure this bounds is a permanently stuck native load, and a
+    /// second one has never been shown to help where the first did not.
+    private static let maxOutstandingAbandonedLoads = 1
+
     private let audioConverter = AudioConverter()
+    private let config: DiarizerConfig
     private let loadOperationTimeout: TimeInterval
-    private let loadManager: @Sendable () async throws -> DiarizerManager
+    /// Returns the models a new `DiarizerManager` should be initialized with, or `nil` for the
+    /// injectable initializer's model-free manager. It CANNOT return a manager: see B4.4 above.
+    private let loadModels: @Sendable () async throws -> DiarizerModels?
 
     private var loadedManager: DiarizerManager?
     /// Identifies the load generation waiters are currently attached to. `nil` means no load is
@@ -91,32 +104,49 @@ actor FluidAudioMeetingDiarizer: MeetingSystemAudioDiarizing {
     private var loadTask: Task<Void, Never>?
     private var deadlineTask: Task<Void, Never>?
     private var waiters: [UUID: CheckedContinuation<Void, Error>] = [:]
+    /// Generations whose deadline fired and whose loader has not reported back yet. Drives the
+    /// circuit breaker.
+    private var outstandingAbandonedLoads = 0
 
     init(
         config: DiarizerConfig = .default,
         modelsDirectory: URL? = nil,
         loadOperationTimeout: TimeInterval = 30
     ) {
+        self.config = config
         self.loadOperationTimeout = loadOperationTimeout
-        self.loadManager = {
+        self.loadModels = {
             let directory = modelsDirectory ?? DiarizerModels.defaultModelsDirectory()
             let policy = DiarizerRuntimePolicy.resolve(for: .current())
-            let models = try await DiarizerModels.load(
+            return try await DiarizerModels.load(
                 from: directory,
                 configuration: policy.modelConfiguration
             )
-            let manager = DiarizerManager(config: config)
-            manager.initialize(models: models)
-            return manager
         }
     }
 
-    /// Test-only seam: injects the loader directly so a hang (or any other outcome) can be
-    /// simulated deterministically without real CoreML models -- production code always uses
-    /// the initializer above. See `FluidAudioMeetingDiarizerTests.swift`.
-    init(loadOperationTimeout: TimeInterval, loadManager: @escaping @Sendable () async throws -> DiarizerManager) {
+    /// Injectable seam for exercising the load state machine deterministically without real
+    /// CoreML models. `loadStep` decides only WHEN (and whether) a load generation completes --
+    /// hang, throw, succeed. It cannot decide WHAT manager results, because its type has no way
+    /// to carry one; the actor always constructs that itself. That is the whole of B4.4's fix,
+    /// and it is why this initializer being `internal` rather than gated behind `#if DEBUG` is
+    /// safe: a production-module caller gains no capability a test has.
+    ///
+    /// The manager it produces has no models loaded, so it must not be used for inference. That
+    /// is a property of the seam's own contract, not a rule anyone has to remember: `nil` models
+    /// are reachable only through this initializer, and `DiarizerModels`' memberwise initializer
+    /// is not public, so no caller in this target can supply real ones through it.
+    init(
+        loadOperationTimeout: TimeInterval,
+        config: DiarizerConfig = .default,
+        loadStep: @escaping @Sendable () async throws -> Void
+    ) {
+        self.config = config
         self.loadOperationTimeout = loadOperationTimeout
-        self.loadManager = loadManager
+        self.loadModels = {
+            try await loadStep()
+            return nil
+        }
     }
 
     func diarize(fileAt url: URL) async throws -> DiarizationResult? {
@@ -125,14 +155,14 @@ actor FluidAudioMeetingDiarizer: MeetingSystemAudioDiarizing {
         return try manager.performCompleteDiarization(samples)
     }
 
-    /// Test seam for the shared-load/deadline/quarantine state machine, so it can be exercised
-    /// without `diarize(fileAt:)`'s real file I/O (which would need an actual audio file on disk,
-    /// unrelated to what those tests prove).
+    /// Test seam for the shared-load/deadline/quarantine/breaker state machine, so it can be
+    /// exercised without `diarize(fileAt:)`'s real file I/O (which would need an actual audio
+    /// file on disk, unrelated to what those tests prove).
     ///
-    /// It returns the loaded manager's OBJECT IDENTITY, never the manager. That is not a
-    /// stylistic choice: it is what lets B3's fix hold. `ObjectIdentifier` is a `Sendable` value,
-    /// so this seam widens the actor's exclusive ownership of `DiarizerManager` by exactly
-    /// nothing, while still letting a test assert that two calls resolved the SAME instance.
+    /// It returns the loaded manager's OBJECT IDENTITY, never the manager. `ObjectIdentifier` is
+    /// a `Sendable` value, so this seam widens the actor's exclusive ownership by exactly
+    /// nothing, while still letting a test assert that two calls resolved the SAME instance -- or,
+    /// for B4.4, that a manager an injected closure constructed is NOT the one resolved.
     @discardableResult
     func resolvedManagerIdentity() async throws -> ObjectIdentifier {
         ObjectIdentifier(try await resolvedManager())
@@ -140,7 +170,7 @@ actor FluidAudioMeetingDiarizer: MeetingSystemAudioDiarizing {
 
     private func resolvedManager() async throws -> DiarizerManager {
         if let loadedManager { return loadedManager }
-        let generation = startLoadIfNeeded()
+        let generation = try startLoadIfNeeded()
         try await join(generation: generation)
         if let loadedManager { return loadedManager }
         throw FluidAudioMeetingDiarizerError.loadDidNotProduceManager
@@ -153,16 +183,30 @@ actor FluidAudioMeetingDiarizer: MeetingSystemAudioDiarizing {
     /// Both are `Task`, not `withTaskGroup`/`async let`, because both of those are structured and
     /// would reintroduce exactly the "cannot return until the child finishes" property that made
     /// round 2's ceiling fictional.
-    private func startLoadIfNeeded() -> UUID {
+    ///
+    /// Throws rather than starting anything when the circuit breaker is open (B4.3). That throw
+    /// happens before either task is created, so a refused attempt costs nothing and returns
+    /// immediately -- it does not wait out another deadline.
+    private func startLoadIfNeeded() throws -> UUID {
         if let activeLoadID { return activeLoadID }
+        guard outstandingAbandonedLoads < Self.maxOutstandingAbandonedLoads else {
+            throw FluidAudioMeetingDiarizerError.loadAbandonedAndStillOutstanding
+        }
         let id = UUID()
         activeLoadID = id
 
-        let loader = loadManager
+        let load = loadModels
+        let managerConfig = config
         loadTask = Task { [weak self] in
-            let outcome: Result<LoadedDiarizerBox, Error>
+            let outcome: Result<DiarizerManager, Error>
             do {
-                outcome = .success(LoadedDiarizerBox(manager: try await loader()))
+                // Constructed HERE, from models, never supplied by a caller (B4.4). This is the
+                // only `DiarizerManager` construction site outside the actor's own state, and the
+                // reference does not outlive this statement: `finishLoad` takes ownership.
+                let models = try await load()
+                let manager = DiarizerManager(config: managerConfig)
+                if let models { manager.initialize(models: models) }
+                outcome = .success(manager)
             } catch {
                 outcome = .failure(error)
             }
@@ -183,16 +227,21 @@ actor FluidAudioMeetingDiarizer: MeetingSystemAudioDiarizing {
 
     /// Called by the load task when the loader finally returns -- which may be long after this
     /// generation was abandoned. The id guard is the quarantine: a late result from a load the
-    /// actor already gave up on is dropped, never installed.
-    private func finishLoad(id: UUID, _ outcome: Result<LoadedDiarizerBox, Error>) {
-        guard activeLoadID == id else { return }
+    /// actor already gave up on is dropped, never installed. It ALSO closes the circuit breaker
+    /// for that generation, which is the only way `outstandingAbandonedLoads` ever comes back
+    /// down: a load that never returns keeps the breaker open, which is the intended behaviour.
+    private func finishLoad(id: UUID, _ outcome: Result<DiarizerManager, Error>) {
+        guard activeLoadID == id else {
+            outstandingAbandonedLoads = max(outstandingAbandonedLoads - 1, 0)
+            return
+        }
         activeLoadID = nil
         loadTask = nil
         deadlineTask?.cancel()
         deadlineTask = nil
         switch outcome {
-        case .success(let box):
-            loadedManager = box.manager
+        case .success(let manager):
+            loadedManager = manager
             resumeAllWaiters(with: .success(()))
         case .failure(let error):
             resumeAllWaiters(with: .failure(error))
@@ -205,10 +254,12 @@ actor FluidAudioMeetingDiarizer: MeetingSystemAudioDiarizing {
     ///
     /// `loadTask?.cancel()` is honestly best-effort and is not what makes the bound hold: a stuck
     /// CoreML compile may ignore it entirely. It is here so a loader that DOES cooperate stops
-    /// burning CPU, nothing more.
+    /// burning CPU, nothing more. Because it may be ignored, the generation is counted as
+    /// outstanding until it actually reports back -- that count is the circuit breaker.
     private func expireLoad(id: UUID) {
         guard activeLoadID == id else { return }
         activeLoadID = nil
+        outstandingAbandonedLoads += 1
         loadTask?.cancel()
         loadTask = nil
         deadlineTask = nil

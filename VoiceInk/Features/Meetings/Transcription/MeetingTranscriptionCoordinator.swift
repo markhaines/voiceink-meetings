@@ -95,18 +95,20 @@ actor MeetingTranscriptionCoordinator: MeetingTranscriptionCoordinating {
         try await diarizer?.diarize(fileAt: url)
     }
 
-    /// The one error a segment transcriber can raise that this coordinator ROUTES on instead of
-    /// propagating: `MeetingSegmentTranscriberError.sharedModelNotLoaded`, meaning dictation has
-    /// no model loaded so there was nothing to borrow (fix round 3, B1 -- the meeting seam
-    /// deliberately cannot load one itself, because being able to load is what let it evict
-    /// dictation's model mid-transcription). Degrading that chunk to `flatFallback` keeps the
-    /// meeting recording usable instead of failing the chunk outright.
+    /// The two errors a segment transcriber can raise that this coordinator ROUTES on instead of
+    /// propagating, both meaning "this chunk deliberately did not run":
+    ///   * `.sharedModelNotLoaded` -- dictation has no model loaded, so there was nothing to
+    ///     borrow (fix round 3, B1: the meeting seam cannot load one itself, because being able
+    ///     to load is what let it evict dictation's model mid-transcription).
+    ///   * `.dictationHasPriority` -- dictation is active or pending, so the chunk yielded rather
+    ///     than making Mark's dictation queue behind its inference (fix round 4, B4.2).
     ///
-    /// The catch is a typed `catch MeetingSegmentTranscriberError.sharedModelNotLoaded`, NOT a
-    /// blanket `catch`. A real inference failure, a cancellation, or a file error still
-    /// propagates -- a blanket catch here would silently turn every backend fault into a
-    /// plausible-looking flat transcript, which is exactly the failure mode that would be
-    /// hardest to notice in a 90-minute recording.
+    /// Both are caught BY CASE, not by type and not blanket. A real inference failure, a
+    /// cancellation, or a file error still propagates: a blanket catch here would silently turn
+    /// every backend fault into a plausible-looking flat transcript, which in a 90-minute
+    /// recording is the hardest kind of wrong to notice.
+    /// `MeetingTranscriptionCoordinatorTests.segmentTranscriberFailurePropagates` is the standing
+    /// control for exactly that, and would fail if this were ever widened.
     private func route(_ url: URL) async throws -> SpeechTranscriptionResult {
         do {
             switch backend {
@@ -122,6 +124,8 @@ actor MeetingTranscriptionCoordinator: MeetingTranscriptionCoordinating {
                 break
             }
         } catch MeetingSegmentTranscriberError.sharedModelNotLoaded {
+            return try await flatFallback(url)
+        } catch MeetingSegmentTranscriberError.dictationHasPriority {
             return try await flatFallback(url)
         }
         return try await flatFallback(url)

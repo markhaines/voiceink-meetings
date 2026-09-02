@@ -342,29 +342,34 @@ dictation's own model switch block on a meeting.
 **Would need revisiting** if meetings ever become a foreground feature people run for hours
 alongside heavy dictation use, at which point the lease is worth its upstream cost.
 
-## An expired diarizer load keeps running alongside its replacement
+## An expired diarizer load keeps running alongside its replacement -- CAPPED in round 4
 
 Source: `VoiceInk/Features/Meetings/Transcription/FluidAudioMeetingDiarizer.swift`
-(`expireLoad`).
+(`expireLoad`, `finishLoad`, `maxOutstandingAbandonedLoads`).
 
-B2's fix makes the load-operation ceiling real by refusing to await the loader: when the deadline
-fires, waiters are released and the load task is cancelled best-effort and then forgotten. A
-loader that ignores cancellation -- the case the ceiling exists for -- therefore keeps running.
-If a later `diarizeSystemAudio` starts a fresh load (which it must, per the review requirement
-that a subsequent attempt not join a dead one), two model loads can be in flight at once, and the
-abandoned one holds whatever CoreML resources it has acquired until it finally returns. Its
-result is quarantined by load id and dropped, so it can never install a manager or corrupt state
--- the cost is memory and CPU, not correctness.
+**This entry previously said "two model loads can be in flight at once" and that was an
+understatement, which review caught (B4.3).** A PERMANENTLY stuck load is abandoned and never
+returns, so under round 3 every later `MeetingEngine.stop()` could start yet another
+cancellation-blind CoreML load: unbounded accumulation of memory and CPU across a working day of
+meetings. The UUID quarantine prevented stale STATE from being installed; it did nothing about
+stale RESOURCES.
 
-Bounded in practice by how the caller behaves: diarization runs once per meeting, from
-`MeetingEngine.stop()`. There is no retry loop, so "two at once" needs two meetings ending within
-one hung load of each other. Not fixed because every alternative is worse: awaiting the abandoned
-load is the B2 defect itself, and refusing a fresh load leaves diarization permanently poisoned
-for the session.
+**Fixed by a circuit breaker.** `expireLoad` increments `outstandingAbandonedLoads`; a load only
+decrements it by actually reporting back (`finishLoad` with a stale id, whether it succeeded or
+threw). While the count is at `maxOutstandingAbandonedLoads` (1), `startLoadIfNeeded` throws
+`.loadAbandonedAndStillOutstanding` BEFORE creating any task, so a refused attempt costs nothing
+and does not wait out another deadline. At most two loads can ever be in flight: one live, one
+abandoned, no matter how many meetings end.
 
-**Would need revisiting** if a real-hardware measurement (see the smoke-test prerequisite above)
-shows a genuine `DiarizerModels.load` hang is common rather than pathological, in which case the
-right answer is probably a circuit breaker that stops re-attempting, not a different ceiling.
+If the abandoned load never returns, the breaker stays open and diarization fails fast for the
+rest of the session. That is the intended outcome, not a regression: the alternative is the
+unbounded accumulation this fixes, and a failed diarization is recoverable (audio and segments
+are already persisted by the time `stop()` reaches this call).
+
+**Would need revisiting** if real-hardware measurement (see the smoke-test prerequisite above)
+shows genuine `DiarizerModels.load` hangs are common rather than pathological, at which point the
+right answer is probably a user-visible signal that diarization is disabled for the session,
+rather than a different cap.
 
 ## A diarizer waiter cancelled before it registers waits for the ceiling, not for its cancel
 
@@ -379,4 +384,50 @@ Cost is latency, not a hang, and specifically because of B2's fix: the generatio
 `expireLoad` no matter what the loader does, so the worst case is one `loadOperationTimeout`
 (default 30s). Left as is -- a pre-registration cancellation check has its own race and is no
 simpler. Disclosed here so it is a decision rather than an oversight.
+
+## `cleanup()` remains internal on `FluidAudioTranscriptionService`
+
+Source: `VoiceInk/Infrastructure/Providers/Transcription/FluidAudio/FluidAudioTranscriptionService.swift`,
+`VoiceInk/Features/Meetings/Transcription/MeetingAsrSharing.swift`.
+
+Round 3 claimed the meeting seam could not evict dictation's model partly because the
+eviction-capable methods were `private`. Review found that false (B4.1): `cleanup()` is
+`internal`, so any file in the app target could compile `await service.cleanup()`.
+
+Round 4 fixed the seam by capability narrowing rather than by changing upstream: the meeting
+transcriber is handed `any MeetingAsrManagerBorrowing` (one getter) and stores a closed-over
+`@MainActor @Sendable` capability, so `cleanup()`, `loadModel(for:)` and the concrete type are
+not nameable there at all. Five negative-control attacks enforce it.
+
+**What is still CONVENTIONAL, stated as such:** `cleanup()` is unchanged and still `internal`, so
+app-target code that obtains the CONCRETE service (from `TranscriptionServiceRegistry`, say) can
+still call it. Making it `private` would mean changing its existing upstream callers, which is
+larger than the accessor-sized touchpoint that was authorised. What is enforced is that the
+meeting seam is never given that concrete type; what is conventional is that a future meeting
+file does not reach around the capability to fetch the service itself.
+
+**Would need revisiting** if the meeting seam ever grows a second component that needs the
+service, at which point the right move is probably to ask for a third upstream touchpoint and
+make `cleanup()` `private` with an explicit lifecycle owner, rather than widen the capability.
+
+## The dictation-priority check cannot preempt an in-flight meeting chunk
+
+Source: `VoiceInk/Features/Meetings/Transcription/FluidAudioMeetingSegmentTranscriber.swift`
+(`admitAndBorrow`).
+
+B4.2's admission control guarantees a meeting chunk never STARTS inference while dictation is
+active or pending: the priority read and the borrow are two synchronous statements in one
+`@MainActor` step, and `VoiceInkEngine` starts a dictation on `@MainActor`, so there is no window
+between them rather than a narrow one.
+
+It cannot PREEMPT. If dictation starts after `manager.transcribe` is already running for a chunk,
+that dictation queues behind it, because `AsrManager` is an actor and serializes them. The
+exposure is one chunk's inference time, and **that duration has never been measured** on real
+hardware with real models -- it is listed with the other real-audio smoke-test prerequisites
+above. Preempting would need cancellation support inside FluidAudio's own inference, which this
+fork does not have and cannot add from outside.
+
+Also worth stating: the check is only as good as the closure a composition root supplies. There
+is deliberately no default (a negative control asserts that omitting it does not compile), so
+choosing what "dictation is busy" means is a decision someone has to make explicitly.
 

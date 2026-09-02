@@ -1,20 +1,25 @@
-// New for this fork (Stage 2c fix round 3, cross-vendor review finding B2). Not a port.
+// New for this fork (Stage 2c fix rounds 3 and 4). Not a port.
 //
-// WHY THIS FILE WAS REWRITTEN. Round 2's ceiling test looked like a proof and was not one. It
-// injected a loader whose body was `try await Task.sleep(nanoseconds: 60 * 1_000_000_000)` with
-// a comment claiming it "never checks cancellation", raced it against a 0.2s deadline, and
-// reported the caller returning in 0.214s. Those numbers were real. The property they
-// demonstrated was the wrong one: `Task.sleep` IS cancellation-aware, so the moment
-// `group.cancelAll()` ran it threw `CancellationError` and the "60s" loader was finished --
-// which is precisely why the enclosing `withTaskGroup` (structured: it cannot return until every
-// child completes) was able to return at all. The test proved cooperative cancellation works. It
-// could not have failed even if the ceiling were entirely fictional, which it was.
+// WHY THE CEILING FIXTURE LOOKS LIKE THIS. Round 2's ceiling test injected a loader whose body
+// was `try await Task.sleep(nanoseconds: 60 * 1_000_000_000)` with a comment claiming it "never
+// checks cancellation", raced it against a 0.2s deadline, and reported the caller returning in
+// 0.214s. Those numbers were real. The property was wrong: `Task.sleep` IS cancellation-aware, so
+// the moment `group.cancelAll()` ran it threw and the "60s" loader was finished -- which is the
+// only reason the enclosing `withTaskGroup` (structured: it cannot return until every child
+// completes) could return at all. That test could not have failed even if the ceiling were
+// entirely fictional, which it was.
 //
-// The fixture that binds is `CancellationBlindLoader` below: nothing in its path checks
-// `Task.isCancelled`, nothing in it can throw `CancellationError`, and the only thing that can
-// ever complete it is the test calling `release()`. The ceiling test now asserts not just that
-// the caller returned on time, but that at the moment it returned the loader had NOT finished --
-// the assertion whose absence made round 2's evidence non-binding.
+// `CancellationBlindLoader` below is blind for real, and `roundTwoStructuredCeilingDoesNotBoundABlindLoader`
+// is its control: the same fixture against round 2's shape, with the opposite outcome.
+//
+// Round 4 adds two more properties to this file:
+//   * B4.3, the circuit breaker: a permanently stuck load must not let later attempts accumulate
+//     more stuck loads. `abandonedLoadsAreCappedSoTheyCannotAccumulate` proves the cap holds
+//     across repeated attempts, and that a refused attempt is FAST rather than waiting out
+//     another deadline.
+//   * B4.4, the injection seam: `injectedLoadStepCannotSupplyTheManagerTheActorResolves` proves a
+//     manager a caller constructs and retains is never the manager the actor resolves. The seam's
+//     type makes supplying one inexpressible; this pins the behaviour as well.
 
 import FluidAudio
 import Foundation
@@ -29,7 +34,7 @@ struct FluidAudioMeetingDiarizerTests {
     @Test("a cancellation-BLIND load is bounded by the ceiling: the caller returns while the loader is provably still running")
     func hungCancellationBlindLoadIsBoundedByTheCeiling() async throws {
         let loader = CancellationBlindLoader()
-        let diarizer = FluidAudioMeetingDiarizer(loadOperationTimeout: 0.2) { try await loader.load() }
+        let diarizer = FluidAudioMeetingDiarizer(loadOperationTimeout: 0.2) { try await loader.run() }
 
         let started = ContinuousClock.now
         await #expect(throws: FluidAudioMeetingDiarizerError.loadTimedOut) {
@@ -56,77 +61,22 @@ struct FluidAudioMeetingDiarizerTests {
         #expect(loader.observedCancellationOnFinish == true)
     }
 
-    @Test("after the ceiling fires, the next attempt starts a FRESH load rather than joining the abandoned one")
-    func afterTheCeilingFiresTheNextAttemptStartsAFreshLoad() async throws {
-        let loader = CancellationBlindLoader()
-        let diarizer = FluidAudioMeetingDiarizer(loadOperationTimeout: 0.2) { try await loader.load() }
-
-        await #expect(throws: FluidAudioMeetingDiarizerError.loadTimedOut) {
-            try await diarizer.resolvedManagerIdentity()
-        }
-        #expect(loader.startCount == 1)
-
-        await #expect(throws: FluidAudioMeetingDiarizerError.loadTimedOut) {
-            try await diarizer.resolvedManagerIdentity()
-        }
-        // 2, not 1: the second call did not attach itself to the load the first call gave up on.
-        #expect(loader.startCount == 2)
-        #expect(loader.finishCount == 0)
-
-        loader.release()
-        loader.release()
-        try await waitUntil("both abandoned loads drain") { loader.finishCount == 2 }
-    }
-
-    @Test("a late result from an abandoned load is quarantined and never becomes the resolved manager")
-    func lateResultFromAnAbandonedLoadIsQuarantined() async throws {
-        let blind = CancellationBlindLoader()
-        let replacement = UncheckedBox(DiarizerManager(config: .default))
-        let attempts = AttemptCounter()
-
-        let diarizer = FluidAudioMeetingDiarizer(loadOperationTimeout: 0.2) {
-            // Attempt 1 hangs blind until the test releases it; every later attempt resolves
-            // instantly to a DIFFERENT manager, so "which instance won" is observable.
-            attempts.next() == 1 ? try await blind.load() : replacement.value
-        }
-
-        await #expect(throws: FluidAudioMeetingDiarizerError.loadTimedOut) {
-            try await diarizer.resolvedManagerIdentity()
-        }
-        let afterTimeout = try await diarizer.resolvedManagerIdentity()
-        #expect(afterTimeout == ObjectIdentifier(replacement.value))
-
-        // Now let the abandoned generation-1 load finish, late. Its result must be dropped: it
-        // is reported against a load id the actor has already moved past.
-        blind.release()
-        try await waitUntil("the abandoned load finishes late") { blind.finishCount == 1 }
-
-        let afterLateArrival = try await diarizer.resolvedManagerIdentity()
-        #expect(afterLateArrival == ObjectIdentifier(replacement.value))
-        #expect(afterLateArrival == afterTimeout)
-    }
-
     @Test("CONTROL: round 2's withTaskGroup ceiling does NOT bound the same blind loader")
     func roundTwoStructuredCeilingDoesNotBoundABlindLoader() async throws {
         // A test that passes proves nothing unless it could have failed. Round 2's ceiling test
         // passed and the ceiling was fictional, so this control closes that hole from the other
         // side: it runs the SAME cancellation-blind loader against round 2's EXACT racing shape,
         // reproduced below, and asserts that shape does not come back.
-        //
-        // Without this, `hungCancellationBlindLoadIsBoundedByTheCeiling` passing could still mean
-        // the fixture is simply easy. With it, the fixture is shown to defeat the old design and
-        // be survived by the new one -- which is the only thing that makes the new one's pass
-        // meaningful.
         let loader = CancellationBlindLoader()
         let returned = FlagBox()
 
         let raced = Task {
-            _ = await Self.roundTwoRunWithDeadline(timeoutSeconds: 0.2) { try await loader.load() }
+            _ = await Self.roundTwoRunWithDeadline(timeoutSeconds: 0.2) { try await loader.run() }
             returned.set()
         }
 
-        // 2s: ten times the 0.2s deadline round 2 claimed to enforce, and ~3x the wall clock the
-        // new design's equivalent test takes end to end.
+        // 2s: ten times the 0.2s deadline round 2 claimed to enforce, and well past the wall
+        // clock the new design's equivalent test takes end to end.
         try await Task.sleep(nanoseconds: 2_000_000_000)
 
         #expect(loader.isStillRunning)
@@ -145,50 +95,98 @@ struct FluidAudioMeetingDiarizerTests {
         #expect(returned.isSet)
     }
 
-    /// Round 2's `runWithDeadline`, reproduced here with its structure unchanged, purely so the
-    /// control above can attack it: one child running the real load, one child sleeping the
-    /// deadline, `group.next()`, `group.cancelAll()`, return. `withTaskGroup` is structured --
-    /// leaving the group awaits EVERY child -- so `cancelAll()` bounds nothing a child chooses to
-    /// ignore, which is the whole defect.
-    ///
-    /// One deliberate difference from the shipped original: the group's element type is
-    /// `Result<ObjectIdentifier, Error>` rather than `Result<DiarizerManager, Error>`. Round 2
-    /// could write the latter only because it also shipped `extension DiarizerManager: @unchecked
-    /// Sendable {}`, which B3 removed; `TaskGroup` requires a `Sendable` element. The structural
-    /// property under attack -- that leaving the group awaits the loader child -- is identical
-    /// either way.
-    private static func roundTwoRunWithDeadline(
-        timeoutSeconds: TimeInterval,
-        operation: @escaping @Sendable () async throws -> DiarizerManager
-    ) async -> Result<ObjectIdentifier, Error> {
-        await withTaskGroup(of: Result<ObjectIdentifier, Error>.self) { group in
-            group.addTask {
-                do {
-                    return .success(ObjectIdentifier(try await operation()))
-                } catch {
-                    return .failure(error)
-                }
-            }
-            group.addTask {
-                try? await Task.sleep(nanoseconds: UInt64(max(timeoutSeconds, 0) * 1_000_000_000))
-                return .failure(FluidAudioMeetingDiarizerError.loadTimedOut)
-            }
-            let first = await group.next() ?? .failure(FluidAudioMeetingDiarizerError.loadDidNotProduceManager)
-            group.cancelAll()
-            return first
+    // MARK: - B4.3: the circuit breaker on abandoned loads
+
+    @Test("abandoned loads are capped: repeated attempts refuse fast instead of accumulating stuck loads")
+    func abandonedLoadsAreCappedSoTheyCannotAccumulate() async throws {
+        let loader = CancellationBlindLoader()
+        let diarizer = FluidAudioMeetingDiarizer(loadOperationTimeout: 0.2) { try await loader.run() }
+
+        // Attempt 1 blows its deadline and is abandoned while still running.
+        await #expect(throws: FluidAudioMeetingDiarizerError.loadTimedOut) {
+            try await diarizer.resolvedManagerIdentity()
         }
+        #expect(loader.startCount == 1)
+
+        // Five further attempts, standing in for five more meetings ending against a
+        // permanently stuck CoreML load. Round 3 would have started five more loads.
+        for _ in 0..<5 {
+            let started = ContinuousClock.now
+            await #expect(throws: FluidAudioMeetingDiarizerError.loadAbandonedAndStillOutstanding) {
+                try await diarizer.resolvedManagerIdentity()
+            }
+            // Refused BEFORE any task is created, so it does not wait out another deadline.
+            // 0.15s is comfortably under the 0.2s ceiling; a refusal that waited would exceed it.
+            #expect(started.duration(to: .now) < .milliseconds(150))
+        }
+        // The cap held: still exactly ONE load ever started, and it is still the stuck one.
+        #expect(loader.startCount == 1)
+        #expect(loader.finishCount == 0)
+
+        // The breaker closes by itself when the abandoned load finally returns...
+        loader.release()
+        try await waitUntil("the abandoned load reports back") { loader.finishCount == 1 }
+
+        // ...and only then does a fresh load start. Two, not seven. (The second `release()` is
+        // pre-signalled so the fresh load does not park too: `CancellationBlindLoader` parks on
+        // EVERY call, which is what a permanently stuck native load would do.)
+        loader.release()
+        try await diarizer.resolvedManagerIdentity()
+        #expect(loader.startCount == 2)
+    }
+
+    @Test("a late result from an abandoned load is quarantined and never becomes the resolved manager")
+    func lateResultFromAnAbandonedLoadIsQuarantined() async throws {
+        let loader = CancellationBlindLoader()
+        let diarizer = FluidAudioMeetingDiarizer(loadOperationTimeout: 0.2) { try await loader.run() }
+
+        await #expect(throws: FluidAudioMeetingDiarizerError.loadTimedOut) {
+            try await diarizer.resolvedManagerIdentity()
+        }
+
+        // Let the abandoned generation-1 load finish, late. Its manager must be dropped.
+        loader.release()
+        try await waitUntil("the abandoned load finishes late") { loader.finishCount == 1 }
+
+        // If generation 1's result had been installed, this call would return it WITHOUT running
+        // the load step again. A second start is therefore the quarantine proof. (Pre-signalled
+        // so generation 2 does not park as well -- the fixture parks on every call.)
+        loader.release()
+        let resolved = try await diarizer.resolvedManagerIdentity()
+        #expect(loader.startCount == 2)
+
+        // And the generation that did win stays won.
+        let again = try await diarizer.resolvedManagerIdentity()
+        #expect(again == resolved)
+        #expect(loader.startCount == 2)
+    }
+
+    // MARK: - B4.4: the injection seam cannot supply the manager
+
+    @Test("a manager an injected load step constructs and retains is never the manager the actor resolves")
+    func injectedLoadStepCannotSupplyTheManagerTheActorResolves() async throws {
+        // The seam's TYPE already makes supplying a manager inexpressible: `loadStep` returns
+        // Void. This pins the behaviour too, against the exact shape the round-3 seam allowed --
+        // a caller constructing a manager, retaining it, and expecting the actor to adopt it.
+        let retainedByCaller = UncheckedBox(DiarizerManager(config: .default))
+        let diarizer = FluidAudioMeetingDiarizer(loadOperationTimeout: 10) {
+            _ = retainedByCaller.value
+        }
+
+        let resolved = try await diarizer.resolvedManagerIdentity()
+
+        #expect(resolved != ObjectIdentifier(retainedByCaller.value))
     }
 
     // MARK: - Shared-load and waiter-cancellation properties (carried over, still required)
 
-    @Test("two concurrent callers share ONE load -- the loader runs exactly once")
+    @Test("two concurrent callers share ONE load -- the load step runs exactly once")
     func sharedLoadIsJoinedNotDuplicated() async throws {
         let loadCalls = CallCounter()
         let gate = Gate()
         let diarizer = FluidAudioMeetingDiarizer(loadOperationTimeout: 10) {
             await loadCalls.increment()
             await gate.wait()
-            return DiarizerManager(config: .default)
         }
 
         async let first: ObjectIdentifier = diarizer.resolvedManagerIdentity()
@@ -209,7 +207,6 @@ struct FluidAudioMeetingDiarizerTests {
         let gate = Gate()
         let diarizer = FluidAudioMeetingDiarizer(loadOperationTimeout: 10) {
             await gate.wait()
-            return DiarizerManager(config: .default)
         }
 
         let cancelledTask = Task {
@@ -237,7 +234,6 @@ struct FluidAudioMeetingDiarizerTests {
         let loadCalls = CallCounter()
         let diarizer = FluidAudioMeetingDiarizer(loadOperationTimeout: 10) {
             await loadCalls.increment()
-            return DiarizerManager(config: .default)
         }
 
         let first = try await diarizer.resolvedManagerIdentity()
@@ -255,16 +251,50 @@ struct FluidAudioMeetingDiarizerTests {
             let attempt = await loadCalls.count
             await loadCalls.increment()
             if attempt == 0 { throw LoadFailure() }
-            return DiarizerManager(config: .default)
         }
 
         await #expect(throws: LoadFailure.self) { try await diarizer.resolvedManagerIdentity() }
         try await diarizer.resolvedManagerIdentity()
 
+        // A load that FAILS is not an abandoned load: it reported back, so the circuit breaker
+        // never opens and the retry is immediate.
         #expect(await loadCalls.count == 2)
     }
 
     // MARK: - Helpers
+
+    /// Round 2's `runWithDeadline`, reproduced here with its structure unchanged, purely so the
+    /// control above can attack it: one child running the real load, one child sleeping the
+    /// deadline, `group.next()`, `group.cancelAll()`, return. `withTaskGroup` is structured --
+    /// leaving the group awaits EVERY child -- so `cancelAll()` bounds nothing a child chooses to
+    /// ignore, which is the whole defect.
+    ///
+    /// The element type is `Result<Void, Error>` rather than round 2's
+    /// `Result<DiarizerManager, Error>`; round 2 could write the latter only because it also
+    /// shipped `extension DiarizerManager: @unchecked Sendable {}`, which B3 removed. The
+    /// structural property under attack -- that leaving the group awaits the loader child -- is
+    /// identical either way.
+    private static func roundTwoRunWithDeadline(
+        timeoutSeconds: TimeInterval,
+        operation: @escaping @Sendable () async throws -> Void
+    ) async -> Result<Void, Error> {
+        await withTaskGroup(of: Result<Void, Error>.self) { group in
+            group.addTask {
+                do {
+                    return .success(try await operation())
+                } catch {
+                    return .failure(error)
+                }
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(max(timeoutSeconds, 0) * 1_000_000_000))
+                return .failure(FluidAudioMeetingDiarizerError.loadTimedOut)
+            }
+            let first = await group.next() ?? .failure(FluidAudioMeetingDiarizerError.loadDidNotProduceManager)
+            group.cancelAll()
+            return first
+        }
+    }
 
     private func waitUntil(
         _ what: String,
@@ -285,7 +315,7 @@ struct FluidAudioMeetingDiarizerTests {
     }
 }
 
-/// A loader that is genuinely BLIND to cooperative cancellation -- the whole point of this
+/// A load step that is genuinely BLIND to cooperative cancellation -- the whole point of this
 /// fixture, and the thing round 2's `Task.sleep` loader was not.
 ///
 /// Nothing in this path checks `Task.isCancelled` and nothing in it can throw `CancellationError`.
@@ -293,12 +323,12 @@ struct FluidAudioMeetingDiarizerTests {
 /// one stays parked. The only thing that can resume it is `release()`, called by the test. The
 /// blocking wait itself runs on a detached OS thread (`Thread.detachNewThread` +
 /// `DispatchSemaphore.wait()`, a kernel wait `Task.cancel()` cannot interrupt), so the
-/// cooperative thread pool is never blocked -- the loader genuinely keeps running after
+/// cooperative thread pool is never blocked -- the load genuinely keeps running after
 /// cancellation instead of merely appearing to.
 ///
-/// `observedCancellationOnFinish` closes the loop: when the loader finally does return, it
-/// records whether cancellation had been delivered to its task. `true` means the ceiling
-/// cancelled the load, the load ignored it, and the caller had already been let go anyway.
+/// `observedCancellationOnFinish` closes the loop: when it finally does return, it records
+/// whether cancellation had been delivered to its task. `true` means the ceiling cancelled the
+/// load, the load ignored it, and the caller had already been let go anyway.
 private final class CancellationBlindLoader: @unchecked Sendable {
     private let gate = DispatchSemaphore(value: 0)
     private let lock = NSLock()
@@ -311,7 +341,7 @@ private final class CancellationBlindLoader: @unchecked Sendable {
     var observedCancellationOnFinish: Bool? { lock.withLock { _observedCancellationOnFinish } }
     var isStillRunning: Bool { lock.withLock { _startCount > _finishCount } }
 
-    func load() async throws -> DiarizerManager {
+    func run() async throws {
         lock.withLock { _startCount += 1 }
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             let gate = self.gate
@@ -325,17 +355,16 @@ private final class CancellationBlindLoader: @unchecked Sendable {
             _finishCount += 1
             _observedCancellationOnFinish = wasCancelled
         }
-        return DiarizerManager(config: .default)
     }
 
-    /// Releases exactly one parked `load()` call.
+    /// Releases exactly one parked `run()` call.
     func release() { gate.signal() }
 }
 
-/// Lets a test share one non-`Sendable` `DiarizerManager` with a `@Sendable` loader closure.
-/// Test-only, and narrower than what it replaces: round 2 shipped
-/// `extension DiarizerManager: @unchecked Sendable {}` in PRODUCTION code, which promised the
-/// whole target that FluidAudio's mutable class was safe to share.
+/// Test-only, and it exists to be DEFEATED: `injectedLoadStepCannotSupplyTheManagerTheActorResolves`
+/// uses it to retain a manager across the `@Sendable` load-step boundary and then proves the
+/// actor did not adopt it. Production code cannot do the equivalent, because the load step's
+/// return type has nowhere to put a manager.
 private final class UncheckedBox<Value>: @unchecked Sendable {
     let value: Value
     init(_ value: Value) { self.value = value }
@@ -346,12 +375,6 @@ private final class FlagBox: @unchecked Sendable {
     private var flag = false
     var isSet: Bool { lock.withLock { flag } }
     func set() { lock.withLock { flag = true } }
-}
-
-private final class AttemptCounter: @unchecked Sendable {
-    private let lock = NSLock()
-    private var count = 0
-    func next() -> Int { lock.withLock { count += 1; return count } }
 }
 
 /// Deterministic suspend/release point, same shape as `MeetingEngineTests.swift`'s own `Gate` --

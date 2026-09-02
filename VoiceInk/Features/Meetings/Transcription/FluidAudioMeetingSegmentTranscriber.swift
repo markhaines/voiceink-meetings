@@ -1,34 +1,46 @@
 // Fork-owned (no donor equivalent). Not a port.
 //
 // Direct FluidAudio integration for the meeting transcription seam (`DECISION-transcription-seam.md`,
-// Option (ii)). It does NOT load models. It BORROWS the `AsrManager` dictation already has
-// loaded, through `FluidAudioTranscriptionService.borrowedAsrManager()` (FORK-PATCHES.md
-// touchpoint 4).
+// Option (ii)). It does not load models and it does not hold the concrete transcription service.
+// It holds one capability, `MeetingAsrManagerBorrowing` (see `MeetingAsrSharing.swift`), plus a
+// dictation-priority check.
 //
-// FIX ROUND 3 (cross-vendor review, B1). Two earlier designs were defeated here:
+// FOUR ROUNDS OF REVIEW GOT IT HERE, and the history is kept because each round's mistake is a
+// live hazard for whoever edits this next:
 //   * Round 1 loaded its own independent `AsrManager` + Parakeet models, permanently doubling
 //     model memory on Mark's 16GB M2 Pro.
-//   * Round 2 fixed the duplication by calling `sharedAsrManager(for: version)`, which called
-//     `ensureModelsLoaded(for:)`. Review found the real defect that hid behind: a meeting asking
-//     for a version dictation did not have loaded ran `cleanupLoadedManagers()` -- including
+//   * Round 2 fixed the duplication with `sharedAsrManager(for: version)`, which called
+//     `ensureModelsLoaded(for:)`. That let a meeting run `cleanupLoadedManagers()` -- including
 //     `asrManager.cleanup()`, which nils the CoreML models -- underneath a dictation suspended
-//     inside `AsrManager.transcribe`. `@MainActor` initiation does not prevent that: every one
-//     of those methods suspends, so actor reentrancy lets the two flows interleave. The comment
-//     that claimed the calls were "serialized on the same executor" and that this was "not new
-//     eviction behavior" was materially wrong on both counts and has been removed.
+//     inside `AsrManager.transcribe`. Round 2's comment claimed `@MainActor` initiation made the
+//     calls "serialized on the same executor"; it does not, because all of those methods suspend.
+//   * Round 3 removed the version argument and the suspension point, which held. Its third
+//     claimed reason ("it calls nothing ... those remain private") was FALSE: `cleanup()` is
+//     internal, so this file could have compiled `service.cleanup()`. Fixed in round 4 by holding
+//     a capability instead of the class.
+//   * Round 4 also closed what sharing the actor had opened: `AsrManager` is a `public actor`, so
+//     a meeting chunk already inside `transcribe` makes a dictation started a moment later QUEUE
+//     BEHIND it. Not memory this time, latency, against the same thing memory was protecting.
 //
-// Round 3 removes the capability instead of documenting the hazard. This type holds no version,
-// requests no version, and cannot trigger a load: `borrowedAsrManager()` is a synchronous,
-// non-throwing, argument-less getter over two stored properties (see its own doc comment for
-// the full argument, and `scripts/negative-controls/FluidAudioSharedModelAttacks.swift` for the
-// compile-time proof that the eviction-capable methods are unreachable from here).
+// DICTATION-PRIORITY ADMISSION -- what it guarantees, and what it does NOT:
+//   * GUARANTEED: a meeting chunk never STARTS inference while dictation is active or pending.
+//     `admitAndBorrow()` reads the priority check and takes the manager in ONE synchronous
+//     `@MainActor` step, with no `await` between them. `VoiceInkEngine` starts a dictation on
+//     `@MainActor`, so dictation cannot flip from idle to active inside that step. This is not a
+//     narrowed race; there is no window.
+//   * NOT GUARANTEED, and this is the honest limit: it cannot PREEMPT. If dictation starts after
+//     a chunk's `manager.transcribe` is already running, that dictation still queues behind it.
+//     The exposure is one chunk's inference, and its real duration has never been measured on
+//     real hardware with real models -- FOLLOWUPS.md carries that as a smoke-test prerequisite,
+//     not as a number I am guessing at here.
+//   * NOT GUARANTEED: the check is only as good as the closure a composition root supplies. There
+//     is no default, so that is a decision someone has to make, not one this file makes quietly.
 //
-// What that costs, stated plainly: if nothing is loaded, this transcriber throws
-// `MeetingSegmentTranscriberError.sharedModelNotLoaded` and `MeetingTranscriptionCoordinator`
-// degrades that ONE chunk to its flat-fallback path. It never loads a model to rescue itself.
-// Ensuring a model is loaded is dictation's job, via the existing `loadModel(for:)` that
-// `VoiceInkEngine` already calls at recording start; see FOLLOWUPS.md for the composition-root
-// requirement that follows from this.
+// Refusal is cheap on purpose. Both refusal cases raise a `MeetingSegmentTranscriberError` that
+// `MeetingTranscriptionCoordinator` routes to its flat-fallback path, so the cost is losing
+// per-token segment timings for one chunk (which `MicTurnNormalizer` then sentence-splits, the
+// donor's own behaviour for every backend except FluidAudio). Losing that is an acceptable price.
+// Making Mark wait on his own dictation is not.
 //
 // Segment mapping matches the donor's own `transcribeWithFluidAudio`
 // (`segment-timing-design.md` §A/§C exactly): one `SpeechSegment` per FluidAudio `TokenTiming`
@@ -41,26 +53,53 @@
 import FluidAudio
 import Foundation
 
-/// Errors a `MeetingSegmentTranscribing` conformer raises that the coordinator routes on rather
-/// than propagates. Deliberately narrow: `sharedModelNotLoaded` is the ONLY case, so the
-/// coordinator's catch cannot silently swallow a real transcription failure.
+/// The errors `MeetingTranscriptionCoordinator` ROUTES on rather than propagates. Both mean "this
+/// chunk deliberately did not run", never "transcription failed" -- keeping them a closed,
+/// two-case enum is what lets the coordinator's catch stay narrow enough that a real backend
+/// fault still propagates.
 enum MeetingSegmentTranscriberError: Error, Equatable {
-    /// Dictation has no model loaded, so there is nothing to borrow. Never means "loading
-    /// failed" -- the meeting seam does not load.
+    /// Dictation has no model loaded, so there was nothing to borrow. The meeting seam does not
+    /// load: being able to load is what let round 2 evict dictation's model.
     case sharedModelNotLoaded
+    /// Dictation is active or pending. Yielded rather than queueing dictation behind this chunk.
+    case dictationHasPriority
 }
 
 actor FluidAudioMeetingSegmentTranscriber: MeetingSegmentTranscribing {
-    private let sharedService: FluidAudioTranscriptionService
+    private nonisolated let borrow: MeetingAsrManagerBorrow
+    private nonisolated let isDictationActiveOrPending: MeetingDictationPriorityCheck
 
-    init(sharedService: FluidAudioTranscriptionService) {
-        self.sharedService = sharedService
+    /// `@MainActor` because both stored capabilities are `@MainActor` closures and this is where
+    /// the borrow one is formed -- and because the composition root that builds this lives on
+    /// `@MainActor` anyway (`TranscriptionServiceRegistry` is `@MainActor`).
+    ///
+    /// The parameter is `any MeetingAsrManagerBorrowing`, so inside this initializer the only
+    /// member of the transcription service that can be NAMED is `borrowedAsrManager()`. That is
+    /// where B4.1 is enforced: `cleanup()` is not a member of this type.
+    ///
+    /// No default for `isDictationActiveOrPending`, deliberately: a composition root must decide
+    /// what "dictation is busy" means rather than inherit a permissive default that silently
+    /// disables B4.2's admission control.
+    @MainActor
+    init(
+        borrowing: any MeetingAsrManagerBorrowing,
+        isDictationActiveOrPending: @escaping MeetingDictationPriorityCheck
+    ) {
+        self.borrow = { borrowing.borrowedAsrManager() }
+        self.isDictationActiveOrPending = isDictationActiveOrPending
     }
 
     func transcribe(chunkAt url: URL) async throws -> SpeechTranscriptionResult {
-        guard let manager = await borrowLoadedManager() else {
+        let manager: AsrManager
+        switch await admitAndBorrow() {
+        case .dictationHasPriority:
+            throw MeetingSegmentTranscriberError.dictationHasPriority
+        case .noModelLoaded:
             throw MeetingSegmentTranscriberError.sharedModelNotLoaded
+        case .granted(let borrowed):
+            manager = borrowed
         }
+
         var decoderState = TdtDecoderState.make(decoderLayers: await manager.decoderLayerCount)
         // `AsrManager.transcribe(_:decoderState:language:)` reads and (for large files)
         // disk-backs the URL itself -- never routes through `AudioFileProcessor`, which would
@@ -101,15 +140,22 @@ actor FluidAudioMeetingSegmentTranscriber: MeetingSegmentTranscribing {
         }
     }
 
-    /// The ONE line of this file that touches dictation's service. `@MainActor` here is not the
-    /// safety argument (round 2's comment wrongly claimed it was); it just keeps the read on the
-    /// executor every other caller of that class uses. The safety argument is that
-    /// `borrowedAsrManager()` is synchronous and argument-less, so this hop reads whatever is
-    /// loaded and returns, with no suspension point in between and no way to ask for anything
-    /// else. `AsrManager` is a `public actor`, so the borrowed instance serializes a meeting's
-    /// `transcribe` against dictation's own by itself.
+    private enum Admission {
+        case granted(AsrManager)
+        case dictationHasPriority
+        case noModelLoaded
+    }
+
+    /// The whole of this file's contact with dictation's runtime, and the reason the admission
+    /// decision has no race: the priority read and the borrow are two synchronous statements in
+    /// one `@MainActor` step, with no `await` between them, so no dictation can begin in between.
+    /// `borrowedAsrManager()` is itself non-`async` and argument-less, so this step cannot load,
+    /// evict, or switch anything -- and `borrow` is a closed-over capability, not the concrete
+    /// service, so `cleanup()` and friends are not nameable here at all. A closure has no members.
     @MainActor
-    private func borrowLoadedManager() -> AsrManager? {
-        sharedService.borrowedAsrManager()?.manager
+    private func admitAndBorrow() -> Admission {
+        if isDictationActiveOrPending() { return .dictationHasPriority }
+        guard let borrowed = borrow() else { return .noModelLoaded }
+        return .granted(borrowed.manager)
     }
 }

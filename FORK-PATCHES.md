@@ -3178,11 +3178,188 @@ the renamed accessor and pins the no-argument call shape
 (`contains("sharedService.borrowedAsrManager()")`), so a reintroduced parameterised accessor
 fails here as well as failing the negative control.
 
+### Fix round 4 (cross-vendor review of fix round 3: B4.1-B4.4)
+
+Round 3 was validated on the parts that mattered most -- B1 reasons (i) and (ii), B2's ceiling and
+its blind-loader proof, the module-wide `@unchecked Sendable` removal, and the negative-control
+verifier itself. Round 4 fixes two holes in claims round 3 MADE, and two defects review found
+new. The uncomfortable pattern worth stating plainly: both holes were places where a sentence in
+a comment asserted enforcement that the code did not have. That is now the third time on this
+branch, so round 4 spends its effort on making the claims checkable rather than on new prose.
+
+#### B4.1 -- guarantee (iii) was false: `cleanup()` is internal
+
+**The finding, accepted in full.** Round 3's accessor comment said "It calls nothing ... those
+remain `private`", then parenthetically noted `cleanup()` is internal and substituted "is called
+from no meeting file". A convention, inside a paragraph claiming enforcement, for the single most
+dangerous call in the file: `cleanup()` nils the loaded CoreML models out of the active dictation
+manager. Worse, `FluidAudioSharedModelAttacks.swift` never tried it, so a suite named for this
+property did not test it.
+
+**The fix: capability narrowing, not a comment.** `FluidAudioMeetingSegmentTranscriber` no longer
+holds `FluidAudioTranscriptionService`. Its initializer takes `any MeetingAsrManagerBorrowing`
+(one member: `borrowedAsrManager()`), and it stores a closed-over `MeetingAsrManagerBorrow`
+capability -- a `@MainActor @Sendable` closure, which has no members at all. `cleanup()`,
+`loadModel(for:)` and the concrete type are not nameable in that file. Three new attacks enforce
+it, and they fired first time (full verifier output quoted under GATES):
+
+```
+    ok  line 66: value of type 'any MeetingAsrManagerBorrowing' has no member 'cleanup'
+    ok  line 71: value of type 'any MeetingAsrManagerBorrowing' has no member 'loadModel'
+    ok  line 75: cannot convert value of type 'any MeetingAsrManagerBorrowing' to specified type 'FluidAudioTranscriptionService'
+```
+
+**Why the bad state is impossible rather than unlikely:** eviction is not a call the seam is
+allowed to fail to make; it is a call that does not type-check where the seam lives. The
+protocol and the closure are the entire surface, and both are checked by the compiler on every CI
+run rather than by a reviewer reading call sites.
+
+**And what stays CONVENTIONAL, said as such** (this is the clause round 3 got wrong, so it is
+spelled out here and in FOLLOWUPS.md): `cleanup()` is unchanged and still `internal`, because
+making it `private` means changing its existing upstream callers -- larger than the
+accessor-sized touchpoint authorised, so not done. App-target code that obtains the CONCRETE
+service can still call it. ENFORCED: the meeting seam is never given that concrete type.
+CONVENTIONAL: that a future meeting file does not reach around the capability to fetch the
+service itself.
+
+The upstream touchpoint is untouched by this: the protocol and its conformance live in a
+fork-owned file (`MeetingAsrSharing.swift`), so `FluidAudioTranscriptionService.swift` stays at
+the same `47 ++++ / 0 deletions` review has already accepted.
+
+#### B4.2 (new) -- sharing the actor protected memory and exposed latency
+
+**The finding, accepted in full.** `AsrManager` is a `public actor`, so meeting and dictation
+inference are mutually serialized. A dictation Mark starts a moment after a meeting chunk entered
+`transcribe` queues behind that inference. Round 3's comment presented that serialization purely
+as safety. It is both, and the value at risk is the same one the whole task has been protecting,
+one layer down: not memory now, Mark waiting on his own dictation.
+
+**The policy: dictation-priority admission.** `admitAndBorrow()` reads the priority check and
+takes the manager as two synchronous statements in ONE `@MainActor` step. A refusal raises
+`.dictationHasPriority`, which `MeetingTranscriptionCoordinator` routes to its flat-fallback path
+(losing per-token segment timings for that chunk, which `MicTurnNormalizer` then sentence-splits
+-- the donor's own behaviour for every other backend).
+
+**What it GUARANTEES:** a meeting chunk never STARTS inference while dictation is active or
+pending. There is no window rather than a narrow one: `VoiceInkEngine` starts a dictation on
+`@MainActor`, and there is no `await` between the check and the borrow, so dictation cannot flip
+from idle to active inside that step.
+
+**What it does NOT guarantee, stated plainly:**
+- It cannot PREEMPT. A dictation starting after `manager.transcribe` is already running still
+  queues behind that chunk. The exposure is one chunk's inference, and that duration has never
+  been measured on real hardware with real models -- it is in FOLLOWUPS.md with the other
+  real-audio prerequisites rather than guessed at here. Preempting would need cancellation inside
+  FluidAudio's own inference, which this fork cannot add from outside.
+- It is only as good as the closure a composition root supplies. There is deliberately NO
+  default, so the decision cannot be inherited silently; attack E9 asserts that omitting it does
+  not compile (`missing argument for parameter 'isDictationActiveOrPending' in call`).
+
+#### B4.3 -- abandoned loads could accumulate without bound
+
+**The finding, accepted in full.** Round 3 disclosed "one abandoned load alongside its
+replacement". Against a PERMANENTLY stuck load that understates it: every later meeting `stop()`
+could start another cancellation-blind CoreML load. The UUID guard prevents stale STATE, not
+stale RESOURCES.
+
+**The fix: a circuit breaker.** `expireLoad` increments `outstandingAbandonedLoads`; only a load
+actually reporting back decrements it. While the count is at `maxOutstandingAbandonedLoads` (1),
+`startLoadIfNeeded` throws `.loadAbandonedAndStillOutstanding` BEFORE creating either task.
+
+**Why unbounded accumulation is now impossible:** the count is incremented on the same
+actor-isolated step that abandons a generation and checked on the same actor-isolated step that
+would start one, so there is no interleaving in which two abandonments both pass the guard. At
+most two loads exist at once -- one live, one abandoned -- for any number of meetings.
+
+**Proof, using the existing blind-loader fixture** (`abandonedLoadsAreCappedSoTheyCannotAccumulate`):
+one load is abandoned, then FIVE further attempts each fail with
+`.loadAbandonedAndStillOutstanding` while `startCount` stays at 1 and `finishCount` at 0 -- round
+3 would have started five more. Each refusal is asserted to return in under 150ms, i.e. below the
+200ms ceiling, proving it refuses rather than waiting out another deadline. Releasing the stuck
+load then closes the breaker and the next attempt starts load number two, not number seven.
+
+If the abandoned load never returns, the breaker stays open for the session. That is the intended
+outcome, not a regression: a failed diarization is recoverable (audio and segments are persisted
+before `stop()` reaches this call), and the alternative is the accumulation this fixes.
+
+#### B4.4 -- the injectable seam let a caller supply and retain a manager
+
+**The finding, accepted in full**, including the observation that this is the third test-only seam
+on this project that turned out to be a real hole. Round 3's initializer took
+`() async throws -> DiarizerManager`, so any same-module caller could construct a manager, RETAIN
+it, and hand it in while the actor treated it as exclusively its own. "Reachable from nowhere
+else" was false against the available API.
+
+**The fix is the seam's TYPE, not a configuration gate.** `#if DEBUG` was considered and
+rejected on the reasoning already paid for here: the next integrator writes and runs code in
+Debug, which is how the previous seams leaked. Instead the injectable initializer takes
+`loadStep: () async throws -> Void`. It decides only WHEN a generation completes -- hang, throw,
+succeed -- and its type has nowhere to put a manager.
+
+**Why supplying one is now impossible:** the actor constructs every `DiarizerManager` itself,
+inside its own load task, from `DiarizerModels`. `DiarizerModels` is FluidAudio's own
+`public struct ... Sendable` whose memberwise initializer is NOT public, so no code in this
+target can fabricate one either. A production-module caller of the injectable initializer
+therefore gains no capability a test has, which is why leaving it `internal` is safe. Attack E10
+pins the old signature as gone (`extra argument 'loadManager' in call`), and
+`injectedLoadStepCannotSupplyTheManagerTheActorResolves` pins the behaviour at runtime: a manager
+the closure constructs and retains is not the one the actor resolves.
+
+A side effect worth recording: `LoadedDiarizerBox` is gone too. With the manager never crossing
+an isolation boundary and `DiarizerModels` already `Sendable`, there is now **no `@unchecked`
+conformance anywhere in the production meeting-transcription code**.
+
+#### An isolation bug found while fixing B4.1, and how
+
+The first draft of the capability stored `any MeetingAsrManagerBorrowing` on the actor and read
+it from a `@MainActor` method. The build succeeded, but emitted
+`actor-isolated property 'borrowing' can not be referenced from the main actor; this is an error
+in the Swift 6 language mode`. Rather than accept a warning under this target's Swift 5 mode, the
+design was changed to store a `@MainActor @Sendable` closure (`MeetingAsrManagerBorrow`), which
+IS `Sendable`, so the property is honestly `nonisolated`. That was verified directly rather than
+inferred from a quiet build: the shape was type-checked standalone under
+`swiftc -swift-version 5 -strict-concurrency=complete`, which reports the existential version and
+accepts the closure version with no diagnostics. The closure is also strictly narrower than the
+protocol, since a closure has no members at all.
+
 ### GATES
 
 Full local `VoiceInkTests` suite green (`xcodebuild test-without-building`, all suites including
 every new file in this fix round). CI green on PR #16 (see the PR's own checks). Both re-verified
 after this fix round, not just the original round — see the PR conversation for the exact run.
+
+**Fix round 4 gates.** Full local `VoiceInkTests` suite green: **414 test cases passed, 0
+failed**, `** TEST SUCCEEDED **`. Negative controls green with all ten attacks firing on the
+exact lines their markers name, quoted verbatim from
+`scripts/verify-meeting-store-isolation.sh`:
+
+```
+==> FluidAudioSharedModelAttacks.swift
+  --- compiler diagnostics ---
+    __NegativeControl.swift:30:57: error: argument passed to call that takes no arguments
+    __NegativeControl.swift:36:23: error: 'ensureModelsLoaded' is inaccessible due to 'private' protection level
+    __NegativeControl.swift:40:19: error: 'cleanupLoadedManagers' is inaccessible due to 'private' protection level
+    __NegativeControl.swift:44:23: error: 'ensureUnifiedModelsLoaded' is inaccessible due to 'private' protection level
+    __NegativeControl.swift:48:23: error: 'ensureNemotronModelsLoaded' is inaccessible due to 'private' protection level
+    __NegativeControl.swift:66:21: error: value of type 'any MeetingAsrManagerBorrowing' has no member 'cleanup'
+    __NegativeControl.swift:71:26: error: value of type 'any MeetingAsrManagerBorrowing' has no member 'loadModel'
+    __NegativeControl.swift:75:45: error: cannot convert value of type 'any MeetingAsrManagerBorrowing' to specified type 'FluidAudioTranscriptionService'
+    __NegativeControl.swift:84:65: error: missing argument for parameter 'isDictationActiveOrPending' in call
+    __NegativeControl.swift:93:73: error: extra argument 'loadManager' in call
+  --- end diagnostics ---
+All negative controls still fail to compile, for the expected reasons,
+each on the exact line its marker names, with no unattributed diagnostics.
+```
+
+Upstream diff unchanged by round 4: still `47 ++++` / `26 ++++`, **0 deletions**, the same two
+authorised files. The capability protocol and its conformance are fork-owned
+(`MeetingAsrSharing.swift`), so no third upstream file was needed and no STOP-and-report was
+triggered. Files changed in round 4: `MeetingAsrSharing.swift` (new),
+`FluidAudioMeetingSegmentTranscriber.swift`, `MeetingTranscriptionCoordinator.swift`,
+`FluidAudioMeetingDiarizer.swift`, `FluidAudioMeetingDiarizerTests.swift`,
+`MeetingTranscriptionCoordinatorTests.swift`, `SharedModelDuplicationTests.swift`,
+`scripts/negative-controls/FluidAudioSharedModelAttacks.swift`,
+`scripts/verify-meeting-store-isolation.sh`, `FOLLOWUPS.md`, `FORK-PATCHES.md`.
 
 **Fix round 3 gates.** Full local `VoiceInkTests` suite green: 411 test cases passed, 0 failed,
 `** TEST SUCCEEDED **` (`xcodebuild test`, Debug, `platform=macOS`). Structural negative controls

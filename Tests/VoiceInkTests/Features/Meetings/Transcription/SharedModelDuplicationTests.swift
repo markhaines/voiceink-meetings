@@ -52,7 +52,7 @@ struct SharedModelDuplicationTests {
         // no version to pass, so the meeting seam cannot request a switch. Asserting the exact
         // no-argument call shape means reintroducing a parameterised accessor would fail here as
         // well as failing the negative control.
-        #expect(contents.contains("sharedService.borrowedAsrManager()"))
+        #expect(contents.contains("borrowing.borrowedAsrManager()"))
     }
 
     @Test("TranscribeCppMeetingSegmentTranscriber.swift no longer constructs its own native Model or initializes backends itself")
@@ -84,6 +84,31 @@ struct SharedModelDuplicationTests {
         let contents = try Self.readFile("TranscribeCppMeetingSegmentTranscriber.swift")
         #expect(contents.contains("sharedService.borrowModel(for:"))
         #expect(contents.contains("borrowed.release()"))
+    }
+
+    @Test("FluidAudioMeetingSegmentTranscriber.swift holds the narrow capability, never the concrete service")
+    func fluidAudioAdapterHoldsOnlyTheCapability() throws {
+        // B4.1. Round 3's third guarantee ("it calls nothing ... those remain private") was false
+        // while this file stored `FluidAudioTranscriptionService`, because `cleanup()` is
+        // internal. The enforced version of that guarantee is that the adapter is handed
+        // `any MeetingAsrManagerBorrowing` instead, whose surface is one getter -- see
+        // `scripts/negative-controls/FluidAudioSharedModelAttacks.swift`, which is the actual
+        // enforcement. This scan is the cheap tripwire for the storage type going back.
+        let contents = try Self.readFile("FluidAudioMeetingSegmentTranscriber.swift")
+        #expect(contents.contains("borrowing: any MeetingAsrManagerBorrowing"))
+        #expect(contents.contains("private nonisolated let borrow: MeetingAsrManagerBorrow"))
+
+        let offenders = try Self.scanFile("FluidAudioMeetingSegmentTranscriber.swift", forSubstrings: [
+            ": FluidAudioTranscriptionService",
+        ])
+        #expect(
+            offenders.isEmpty,
+            """
+            FluidAudioMeetingSegmentTranscriber.swift stores the concrete transcription service \
+            again, which re-exposes cleanup()/loadModel(for:) to the meeting seam:
+            \(offenders.joined(separator: "\n"))
+            """
+        )
     }
 
     @Test("FluidAudioMeetingDiarizer.swift does not retroactively conform a FluidAudio package type to Sendable")

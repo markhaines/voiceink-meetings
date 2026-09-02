@@ -536,7 +536,13 @@ paths cannot answer it. The grouping below is generated from git, not typed by h
 regenerate it with `git diff --name-status 711297b..HEAD` (that commit is the fork
 point, `git merge-base HEAD upstream/main`) and re-sort into these five groups.
 
-Totals: 60 identity-only edits, 15 behavioural edits, 7 build/project changes, 17 deletions, 8 new fork-only files (107 paths).
+Totals: 60 identity-only edits, 15 behavioural edits, 8 build/project changes, 17 deletions, 10 new fork-only files (110 paths).
+
+This appendix started as a Phase 0 inventory, but it is maintained past Phase 0 for anything
+UPSTREAM-OWNED that a later stage touches -- that is the question it exists to answer at merge
+time, and a later stage quietly editing an upstream file without appearing here would defeat the
+whole point. Files created by this fork under `Features/Meetings/` are still out of scope by this
+file's own rule; `.gitignore` (A3) is the first post-Phase-0 addition.
 
 ### A1. Identity-only edits (60 files)
 
@@ -626,7 +632,7 @@ These changed what the app does. Read the reason before merging upstream changes
 - `VoiceInk/Features/Settings/Views/SettingsView.swift` -- removed the "Show Announcements" toggle and its start/stop wiring
 - `VoiceInkRefineXPC/VoiceInkRefineInferenceEngine.swift` -- dropped `import MLXHuggingFace` and swapped `#huggingFaceTokenizerLoader()` for the fork-owned `HuggingFaceTokenizerLoader()` -- this is what takes the macro out of the build graph (section 6)
 
-### A3. Build and project configuration (7 files)
+### A3. Build and project configuration (8 files)
 
 - `Makefile` -- added `LOCAL_XCODEBUILD_FLAGS ?=` for CI, and pinned the whisper.cpp checkout to `whisper-cpp.rev` instead of `git pull`ing upstream HEAD
 - `README.md` -- fork header, build instructions, upstream attribution
@@ -635,6 +641,7 @@ These changed what the app does. Read the reason before merging upstream changes
 - `VoiceInk/VoiceInk.debug.entitlements` -- same, for the debug configuration
 - `VoiceInk/VoiceInk.entitlements` -- iCloud/CloudKit container entitlements removed
 - `scripts/release.sh` -- notarisation/signing identifiers pointed at the fork
+- `.gitignore` -- five build-scratch ignore lines appended (stage2-models-store escalation round, section 9)
 
 ### A4. Deleted upstream files (17 files)
 
@@ -1069,8 +1076,9 @@ minimal, confirmed no live collision with a parallel agent.
 Adds `Meeting.swift`, `MeetingSegment.swift` (both `Models/`), `MeetingSegmentPersistenceActor.swift`
 (`Models/`, renamed from `MeetingSegmentPersistenceService.swift` in the fix round below) and
 `MeetingState.swift` (`State/`) — all new, entirely under `Features/Meetings/`, so none of them
-need an entry here under this file's own rule. This section covers the one upstream-file touch
-this stage makes.
+need an entry here under this file's own rule. This section covers the upstream-file touches
+this stage makes: `VoiceInk/App/VoiceInk.swift` here, and `.gitignore` added in the escalation
+round below (section 9). Two in total. Nothing else upstream-owned is edited by this stage.
 
 ### 1. `VoiceInk/App/VoiceInk.swift`: a 4th SwiftData store, `meetings.store`
 
@@ -1309,9 +1317,14 @@ be re-read if this ever needs re-verifying.
 The fix round above was reviewed again and returned CHANGES-REQUIRED on the same property for
 the second time: the `@ModelActor` boundary is structurally defeatable. Everything else that
 round established stands and is untouched — the schema design, the 4-store wiring in
-`VoiceInk/App/VoiceInk.swift` (still the only upstream file this stage edits), the
-`registeredModel`-then-fetch identifier lookup, and both `PersistentIdentifier` landmines
-recorded above. This entry covers only what changed and why.
+`VoiceInk/App/VoiceInk.swift` (unchanged in this round), the `registeredModel`-then-fetch
+identifier lookup, and both `PersistentIdentifier` landmines recorded above. This entry covers
+only what changed and why.
+
+This round adds a SECOND upstream touchpoint for this stage, `.gitignore` — recorded as
+section 9 below and in appendix A3, taking the stage from one upstream touch to two. It is
+called out here rather than left to the appendix because an inventory that undercounts itself
+is the exact defect the inventory exists to prevent.
 
 ### 1. The defect: a `@ModelActor` conformance IS the leak
 
@@ -1565,6 +1578,102 @@ The general rule, now that it has cost something: **one conformance-mutating att
 and treat "attack produced no error" as a result to be explained, never as a result to be
 reported.
 
+### 9. UPSTREAM TOUCHPOINT: `.gitignore` (five appended lines)
+
+**This is the second upstream-owned file this stage edits, and the first one added since the
+stage began.** Recorded here as a numbered entry, not left to the appendix, because the whole
+purpose of the touchpoint ledger is defeated by a touchpoint that appears only in a total.
+
+```
++# Derived-data paths used by CI's test step and by
++# scripts/verify-meeting-store-isolation.sh (which reuses the former when given
++# --derived-data, so the negative controls stay a one-file incremental compile).
++.ci-test-build/
++.negative-control-build/
+```
+
+`.gitignore` exists upstream (`git cat-file -e upstream/main:.gitignore` succeeds) and was
+byte-identical to upstream until this change — `git diff upstream/main <previous commit> --
+.gitignore` was empty — so this is a genuinely new divergence that the fork now owns forever,
+not an extension of an existing one.
+
+**Why it is worth that cost.** `.ci-test-build/` is the derived-data path CI's own test step
+already uses; `.negative-control-build/` is this round's verifier default. Neither was ignored,
+so both showed up as untracked directories in every `git status` and were one careless
+`git add -A` away from committing hundreds of megabytes of build scratch. The alternative — leaving them unignored and relying on discipline — is the same
+"documented rather than enforced" pattern this entire stage exists to stamp out.
+
+**Why the merge cost is close to zero.** Five lines appended to the end of an existing list, in
+a file upstream changes rarely and only by appending. That is about the lowest-conflict shape an
+upstream edit can take. It is still a real touchpoint and is counted as one.
+
+Appendix A3 and the appendix totals are updated to match.
+
+### 10. `.github/workflows/ci.yml` is NOT an upstream touchpoint (correcting a review finding)
+
+The review of this round flagged the new negative-control CI step as an unauthorised upstream
+edit. **That premise is wrong, and the correction is recorded here so the ledger does not carry
+it.** Checked, not assumed:
+
+```
+$ git ls-tree -r upstream/main -- .github/
+100644 blob fb5a4517  .github/ISSUE_TEMPLATE/bug_report.md
+100644 blob 130c8d50  .github/ISSUE_TEMPLATE/feature_request.md
+100644 blob faca8729  .github/PULL_REQUEST_TEMPLATE.md
+
+$ git cat-file -e upstream/main:.github/workflows/ci.yml
+fatal: path '.github/workflows/ci.yml' exists on disk, but not in 'upstream/main'
+
+$ git log --oneline --diff-filter=A -- .github/workflows/ci.yml
+8db09790 Phase 0: fork hygiene, delicense, unsigned CI
+```
+
+Upstream's `.github/` holds issue and PR templates only. There is no workflow directory and no
+`ci.yml`; this fork created it in Phase 0. It is fork-owned, like `FORK-PATCHES.md`,
+`FOLLOWUPS.md` and `package-trust.json` — appendix A5 has listed it as such since Phase 0 — and
+editing it carries no merge burden, because upstream has no such file to conflict with. The
+negative-control step stays.
+
+### 11. Hardening: negative-control expectations are line-anchored, not string-matched
+
+A3 (`_ = store.dispatch`) and A14 (`\MeetingStore.dispatch`) produce the *identical* diagnostic,
+`'dispatch' is inaccessible due to 'private' protection level`. The verifier's expectations were
+a flat list of message strings, so **either attack could have started compiling while the other
+kept supplying the text, and the run would have stayed green while silently testing one attack
+instead of two.** Same failure class as §8 — the apparatus quietly stops testing something and
+keeps reporting success — one notch smaller, and caught by review rather than by the apparatus,
+which is itself the point.
+
+Fixed by binding every expectation to a LINE rather than to a string. Each attack now carries a
+`// expect-error: <text>` comment on the line directly above the line the compiler must reject;
+the verifier parses those out of the attack source, so the expectation and the attack cannot
+drift apart. It now asserts four things, and fails on any of them:
+
+1. the build failed;
+2. every marker has its diagnostic **on the exact line the marker sits above**;
+3. every diagnostic emitted lands on a marked line, so a new error cannot stand in for a
+   missing expected one;
+4. the marker COUNT per file matches, so deleting an attack outright is caught too.
+
+**Demonstrated, not asserted.** `_ = store.dispatch` was temporarily changed to `_ = store`
+(compiles) and the verifier re-run:
+
+```
+    ok  line 65: 'MeetingPersistenceEngine' is inaccessible due to 'private' protection level
+    MISSING at line 70: 'dispatch' is inaccessible due to 'private' protection level
+    ok  line 76: 'persistentID' is inaccessible due to 'fileprivate' protection level
+    ...
+    ok  line 133: 'dispatch' is inaccessible due to 'private' protection level
+error: MeetingStoreIsolationAttacks.swift failed to build, but not for exactly the reasons it is supposed to.
+       An attack that stops firing still leaves a red build, so this would otherwise
+       pass unnoticed.
+```
+
+Exit 1. Note line 133 in that same output: A14 is still happily producing the exact string the
+OLD check looked for, which is precisely why the old check would have passed this tree. The
+string appears three times in the failing run's log; the line does not. A3 was restored and the
+verifier re-run green.
+
 ### Verification
 
 Local, Xcode 26.6 (17F113):
@@ -1574,10 +1683,12 @@ Local, Xcode 26.6 (17F113):
   lives in `Features/Meetings/Capture/`, is untouched by this change, and is the same
   pre-existing flake the previous round hit and re-ran clean. All 15 tests across the three
   MeetingStore suites pass.
-- `scripts/verify-meeting-store-isolation.sh --derived-data .ci-test-build`: exit 0, transcript
-  above.
+- `scripts/verify-meeting-store-isolation.sh --derived-data .ci-test-build`: exit 0, all 15
+  markers matched on their exact lines, no unattributed diagnostics (section 11). Its own
+  failure path demonstrated by neutering A3: exit 1, quoted in section 11.
 - Autosave proof above: save removed -> red, save restored -> green.
 - `scripts/verify-package-trust.sh` unchanged and passing; no new dependency (the fail-closed
   supply-chain guard is untouched).
-- `VoiceInk/App/VoiceInk.swift` still the only upstream file this stage edits. Zero PRs against
-  `Beingpax/VoiceInk`.
+- Upstream touchpoints for this stage: TWO. `VoiceInk/App/VoiceInk.swift` (appendix A2,
+  unchanged this round) and `.gitignore` (appendix A3, section 9 below). `.github/workflows/ci.yml`
+  is NOT one -- it is fork-owned; see section 10. Zero PRs against `Beingpax/VoiceInk`.

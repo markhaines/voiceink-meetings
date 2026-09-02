@@ -1871,3 +1871,225 @@ short-side cap from both sides (both the segment-short and previous-short branch
 real timing rather than falling back to a whole-chunk sentence split — the case a "universal
 sentence-split stub" would fail. All 7 new tests passed against the ported code on first write,
 no code changes needed.
+
+## meeting-detection (Stage 1: meeting detection engine)
+
+Ported from Muesli-HQ/muesli into `VoiceInk/Features/Meetings/Detection/`, verbatim (comments,
+branches and constants unchanged, MIT header + minimal import trims only), resolving Stage 0's
+`MeetingPromptStateMachine.swift` gap and completing the Detection cluster as recommended there.
+Zero upstream files touched. Zero new SPM dependencies — CoreAudio, CoreMediaIO, AppKit,
+ApplicationServices and ScriptingBridge are system frameworks already linked by the target.
+
+### Premise check: `MeetingDetector` is dead code in the donor — NOT ported
+
+The task brief for this stage carried an unverified premise from an earlier plan: port
+`MeetingDetector.swift` (349 lines) as "the detection engine" and prove it via
+`MeetingDetectorTests.swift`. Verified false before touching anything:
+
+```
+$ grep -rn "MeetingDetector" native/MuesliNative/Sources/ native/MuesliNative/Tests/
+Sources/MuesliNativeApp/MeetingDetector.swift:62:final class MeetingDetector {
+Tests/MuesliTests/MeetingDetectorTests.swift:6:@Suite("MeetingDetector")
+Tests/MuesliTests/MeetingDetectorTests.swift:7:struct MeetingDetectorTests {
+Tests/MuesliTests/MeetingDetectorTests.swift:9:    private func makeDetector() -> MeetingDetector {
+Tests/MuesliTests/MeetingDetectorTests.swift:10:        let d = MeetingDetector()
+... (three more MeetingDetector.idleResetThreshold references, all in the test file)
+```
+
+Every reference to `MeetingDetector` lives inside its own production file or its own test
+file. No other Sources file constructs or calls it. The donor's real, live engine is
+`MeetingMonitor.swift`, constructed by `MuesliController.swift` (the app's actual wiring), and
+`MeetingMonitor`'s private `MeetingDetectionService` actor builds these directly to decide
+whether a meeting is happening:
+
+```
+private let resolver = MeetingCandidateResolver()
+private let mediaSessionTracker = MeetingMediaSessionTracker()
+private let signalCollector = MeetingSignalCollector()
+private let audioAttributionService = AudioAttributionService()
+private let promptState = MeetingPromptStateMachine()
+private let refreshPolicy = MeetingSignalRefreshPolicy()
+```
+
+`MeetingDetector` and its class are not ported, and its test file is not ported. Porting the
+dead class and shipping its green tests would have looked like proof the feature works while
+the real engine went unported — exactly the trap the task brief called out. Two of
+`MeetingDetector.swift`'s value types are used elsewhere in the live path and are extracted
+(not the class) — see "Extracted value types" below.
+
+### Files ported verbatim (production)
+
+| File | Donor path | Donor lines |
+|---|---|---|
+| `MeetingMonitor.swift` | `Sources/MuesliNativeApp/MeetingMonitor.swift` | 961 |
+| `MeetingCandidateResolver.swift` | `Sources/MuesliNativeApp/MeetingCandidateResolver.swift` | 666 |
+| `MeetingPromptStateMachine.swift` | `Sources/MuesliNativeApp/MeetingPromptStateMachine.swift` | 205 |
+| `AudioProcessAttributionCollector.swift` | `Sources/MuesliNativeApp/AudioProcessAttributionCollector.swift` | 172 |
+| `BrowserMeetingActivityCollector.swift` | `Sources/MuesliNativeApp/BrowserMeetingActivityCollector.swift` | 382 |
+| `MeetingSignalRefreshPolicy.swift` | `Sources/MuesliNativeApp/MeetingSignalRefreshPolicy.swift` | 184 |
+| `ControlCenterSensorAttributionMonitor.swift` | `Sources/MuesliNativeApp/ControlCenterSensorAttributionMonitor.swift` | 178 |
+| `CameraActivityMonitor.swift` | `Sources/MuesliNativeApp/CameraActivityMonitor.swift` | 161 |
+| `MeetingMediaSessionTracker.swift` | `Sources/MuesliNativeApp/MeetingMediaSessionTracker.swift` | 154 |
+| `RunningApplicationStore.swift` | `Sources/MuesliNativeApp/RunningApplicationStore.swift` | 87 |
+
+Only two of these ten (`MeetingMonitor.swift`, `MeetingCandidateResolver.swift`,
+`MeetingPromptStateMachine.swift`, `AudioProcessAttributionCollector.swift`) were named in this
+stage's original file list. The other six were added because `MeetingMonitor.swift` — itself
+in scope, 961 lines, the actual detection engine — does not compile without them. Each is a
+**hard compile-time dependency**, not a completeness addition, confirmed by grepping the
+donor's own `MeetingMonitor.swift` (the exact same construction lines reproduced verbatim in
+the fork copy at the same line numbers):
+
+- `CameraActivityMonitor` — `MeetingMonitor.swift:30` (donor) / `:57` (fork): `private let
+  cameraMonitor = CameraActivityMonitor()`. Provides the CoreMediaIO camera-activity signal the
+  task description itself named as in-scope ("CoreMediaIO camera activity, no polling").
+- `ControlCenterSensorAttributionMonitor` — `:31` / `:58`: `private let sensorAttributionMonitor
+  = ControlCenterSensorAttributionMonitor()`. Supplies `SensorAttributionSnapshot`, consumed
+  directly by `MeetingMediaSignalFilter.apply(...)` inside `MeetingMonitor.swift` itself.
+- `RunningApplicationStore` — `:32` / `:59`: `private let runningApplicationStore =
+  RunningApplicationStore()`. Supplies the running-app/foreground-app snapshot every other
+  detection component (resolver, refresh policy) consumes.
+- `MeetingMediaSessionTracker` — `:363` (donor `MeetingDetectionService`) / `:390` (fork):
+  `private let mediaSessionTracker = MeetingMediaSessionTracker()`. Stabilizes the resolver's
+  raw candidate into a session-scoped one before it ever reaches the prompt state machine —
+  the type the state machine's own suppression tests exercise.
+- `MeetingSignalRefreshPolicy` — `:367` / `:394`: `private let refreshPolicy =
+  MeetingSignalRefreshPolicy()`. Also the sole declaration site of `MeetingDetectionTrigger`,
+  which `MeetingMonitor`'s own public API (`refreshState(trigger:)`) takes as a parameter — so
+  even the public surface of the in-scope file doesn't compile without this one.
+- `BrowserMeetingActivityCollector` — `:889` / `:916`: `private let browserCollector =
+  BrowserMeetingActivityCollector()`. Also the sole declaration site of `RunningAppSnapshot`,
+  which `RunningApplicationStore.snapshot()` (itself required, see above) returns.
+
+None of the six was pulled in "for completeness" — each is named, constructed, and used inside
+the 961-line file this stage was explicitly asked to port, and `MeetingMonitor.swift` fails to
+compile with any one of them absent. No alternative (stub, protocol seam, partial port) was
+available without inventing behaviour the donor doesn't have, which the porting discipline for
+this project rules out. All ten files verified byte-identical to their donor originals via
+`diff` (body only, excluding the added MIT header) except the one identity rename below.
+
+### One narrow identity difference (not a behavioural change)
+
+`MeetingCandidateResolver.swift` line 276, `selfBundleID`'s fallback default (used only when
+`Bundle.main.bundleIdentifier` returns nil, which does not happen in a normal app launch):
+donor `"com.muesli.app"` → fork `"com.hainesy.VoiceInkMeetings"`, matching this fork's existing
+rename convention for donor-branded identity-string fallbacks (`SystemAudioRecorder.swift`,
+`CoreAudioSystemRecorder.swift` from Stage 1's capture-core work). Every other line is
+byte-identical to the donor, confirmed by `diff`.
+
+### Extracted value types (not a full-file port)
+
+`MeetingDetectionTypes.swift` is a **minimal verbatim extraction**, not fork-authored code, of
+two of the five value types `MeetingDetector.swift` declares: `CalendarEventContext` (donor
+lines 27-32) and `RunningAppInfo` (donor lines 35-38) — copied character-for-character,
+comments included. These two are the ones `MeetingCandidateResolver.swift` and
+`MeetingMonitor.swift` actually use; `MeetingSignals`, `MeetingActivitySnapshot` and
+`MeetingDetection` (the other three types in that file) are not referenced anywhere in the
+ported files and are not carried. Same precedent as Stage 0's `AudioSampleStats.swift`
+(extracted from `MeetingSessionDiagnostics.swift`) and `SystemAudioCaptureDiagnostics.swift`
+(extracted from the same file) — lift only the declarations a compiling dependency graph
+actually needs, never the whole donor file and never an invented placeholder.
+
+One field was deliberately dropped, not invented: the donor's `CalendarEventContext` also
+carries `var calendarOccurrence: CalendarOccurrenceReference? = nil`.
+`CalendarOccurrenceReference` lives in the donor's separate `MuesliCore` library
+(`StorageModels.swift`), belongs to a calendar-occurrence-identity/storage subsystem, and is
+never read (`grep` for `.calendarOccurrence` across every ported file: zero hits) by anything
+in `MeetingCandidateResolver.swift`, `MeetingPromptStateMachine.swift`, `MeetingMonitor.swift`
+or their companions. Carrying it would mean pulling in a whole unrelated subsystem for a value
+nothing here reads, which the porting rules for this project explicitly forbid — so it is
+omitted rather than stubbed.
+
+### Tests ported verbatim (adapted only: `@testable import VoiceInk` in place of
+### `@testable import MuesliNativeApp`)
+
+| Test file | Donor path | Donor lines |
+|---|---|---|
+| `MeetingCandidateResolverTests.swift` | `Tests/MuesliTests/MeetingCandidateResolverTests.swift` | 1025 |
+| `MeetingPromptStateMachineTests.swift` | `Tests/MuesliTests/MeetingPromptStateMachineTests.swift` | 349 |
+| `BrowserMeetingActivityCollectorTests.swift` | `Tests/MuesliTests/BrowserMeetingActivityCollectorTests.swift` | 395 |
+| `MeetingMediaSignalFilterTests.swift` | `Tests/MuesliTests/MeetingMediaSignalFilterTests.swift` | 178 |
+| `MeetingMediaSessionTrackerTests.swift` | `Tests/MuesliTests/MeetingMediaSessionTrackerTests.swift` | 152 |
+| `MeetingSignalRefreshPolicyTests.swift` | `Tests/MuesliTests/MeetingSignalRefreshPolicyTests.swift` | 112 |
+| `ControlCenterSensorAttributionMonitorTests.swift` | `Tests/MuesliTests/ControlCenterSensorAttributionMonitorTests.swift` | 42 |
+
+`MeetingDetectorTests.swift` (834 lines) is NOT ported — see the premise-check section above.
+`MeetingMediaSignalFilterTests.swift` targets `MeetingMediaSignalFilter`, which is declared
+inside `MeetingMonitor.swift` in both the donor and this fork (not its own file), so it has no
+matching production file of the same name; noted in that test file's own header comment. Every
+test file diffs identical to its donor original except the one `@testable import` line, and
+every production/test pair confirmed via `diff` (body only, excluding the added MIT header).
+
+### CI hardware guard: nothing in this stage's tests touches real device or camera enumeration
+
+The CI runner has no usable audio input device and this project has already lost a runner to
+~600s hangs on real `AVAudioEngine`/CoreAudio device enumeration (Stage 0/1, see
+`AudioGraphExceptionBridgeTests.swift`'s header and the `phase-1-mic-route` section above).
+This stage's donor tests were checked for the same hazard before porting: none of the seven
+ported test files constructs `CameraActivityMonitor`, `ControlCenterSensorAttributionMonitor`,
+`AudioProcessAttributionCollector`, or `RunningApplicationStore` — the four production types
+that touch real CoreMediaIO/CoreAudio/NSWorkspace device or process enumeration. Grepped for
+confirmation (`AXUIElement`, `SBApplication`, `Process(`, `NSWorkspace`, `CMIOObject`,
+`AudioObjectGetProperty`, `AVCaptureDevice`): zero hits across all seven ported test files.
+Every test in this stage exercises pure logic against injected fakes/providers (see
+`BrowserMeetingActivityCollectorTests.swift`'s constructor-injected
+`focusedDocumentURLProvider`/`activeTabURLProvider`/etc.) or static string-parsing
+(`ControlCenterSensorAttributionMonitorTests.parseSnapshot`). No `.disabled(if: isRunningInCI,
+...)` guard was needed anywhere in this stage — there is nothing hardware-touching to guard.
+**What remains unprotected on CI as a result of this stage:** nothing new. The
+`CameraActivityMonitor`, `ControlCenterSensorAttributionMonitor`, and
+`AudioProcessAttributionCollector` production types themselves are untested on CI (they have no
+donor unit tests to port — the donor validates them only through `MeetingMonitor`'s live
+integration, which itself has no donor test suite), but they are also never constructed by any
+CI-run test, so they cannot hang or flake the runner; they are simply behaviourally
+unverified by this PR's test suite, same as they are in the donor.
+
+### Two known prompt-policy bugs: reviewed, not present as separate live safeguards — REPORT ONLY, no behaviour changed
+
+1. **A dismissal must not suppress a later, mic-confirmed call beyond ~10 minutes.**
+   `MeetingPromptStateMachine.userDismissedSuppressionIDs` (line 63) is a plain `Set<String>`
+   with **no expiry timer at all** — contrast `autoDismissedSuppressionIDs` (line 65), a
+   `[String: Date]` that `expireAutoDismissSuppressions(now:)` (line 200) prunes on every
+   `evaluate()` call. A user-dismissed candidate stays suppressed for the life of the process
+   (or until `markUserDismissed`'s complementary `markRecordingStarted`/new-session path clears
+   it by suppression-ID change) — there is no 10-minute or any other time-boxed release. What
+   *does* limit the blast radius: suppression is keyed by `candidate.suppressionID`, and
+   `MeetingCandidateResolver`'s calendar-fallback path (`MeetingCandidateResolver.swift:387,
+   407, 422`, all `id: "cal:\(calendarEvent.id)"`) and `MeetingMediaSessionTracker`'s
+   session-scoped IDs (`"meeting-session:<key>:<timestamp>"`, minted fresh once the quiet
+   window — default 30s — elapses) mean a *later, distinct* mic-confirmed session for the same
+   physical meeting is very likely to mint a *different* suppression ID than the one the user
+   dismissed, which naturally escapes suppression without needing a timer. But this is a side
+   effect of ID churn, not a designed time-bound safeguard, and the donor's own test suite
+   (`userDismissDoesNotSuppressLaterMeetingSession`, `MeetingPromptStateMachineTests.swift:158`)
+   only proves the ID-changes-so-it-escapes case — it does not construct or assert a scenario
+   where the *same* suppression ID recurs after 10 minutes and check it un-suppresses. **Verdict:
+   the specific ~10-minute time-bound behaviour is not implemented; whether it's needed depends
+   on how often a real call reuses the same suppression ID across a 10+ minute gap, which this
+   port does not attempt to characterize.** Not changed in this PR — fidelity first.
+
+2. **A snoozed calendar prompt must not swallow the live-call prompt for the same meeting.**
+   The only calendar-notification interaction in the ported code is
+   `MeetingPromptStateMachine.evaluate(...)`'s `isCalendarNotificationVisible` guard (declared
+   `MeetingPromptStateMachine.swift:86`, applied at line 107): while true, it **unconditionally**
+   returns `.none`/`.hide` regardless of `candidate` — there is no per-meeting scoping check (no
+   comparison of the calendar notification's own event/candidate identity against the live
+   candidate's `suppressionID`, `id`, or `sourceBundleID`). So today, *any* visible calendar
+   notification suppresses *any* live-call prompt system-wide for as long as it's visible, not
+   just a calendar notification for the same meeting. This is a coarser hazard than "snoozed
+   calendar prompt swallows the same-meeting live-call prompt" — it can suppress a live-call
+   prompt for an *unrelated* meeting too. The donor's own test for this path
+   (`calendarNotificationBlocksDetectionNotification`, `MeetingPromptStateMachineTests.swift:339`)
+   only asserts the global-suppression behaviour; it does not test per-meeting scoping because
+   there is none to test. **Verdict: this bug is real and present, confirmed at
+   `MeetingPromptStateMachine.swift:107` (`guard !isCalendarNotificationVisible else { ... }`)
+   — the guard is unconditional on candidate identity.** Not changed in this PR — fidelity
+   first; a fix belongs in its own follow-up commit against this exact line, clearly labelled,
+   once decided how the state machine should learn the calendar notification's own candidate
+   identity to compare against.
+
+Both findings are report-only per this stage's brief. Detail and reproduction steps for a
+follow-up fix: read `MeetingPromptStateMachine.swift:34-205` and
+`MeetingPromptStateMachineTests.swift` in full before changing either line — the suppression
+sets interact with `markRecordingStarted`, `markAutoDismissed` and `resetVisiblePrompt` in ways
+that are easy to break without matching test coverage.

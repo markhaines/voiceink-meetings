@@ -27,9 +27,12 @@
 //     call sites exactly: `appendMic`/`appendSystem` with RAW samples before AEC,
 //     `markPauseBoundary()` on pause, `stop()`/`cancel()` on teardown) is materially more
 //     faithful than the seam map's proposed stub, so this port does that instead. Gated by a new
-//     `retainRecording: Bool` init parameter (default `true`, no fork settings surface exists to
-//     read a real user preference from yet -- see the seam map's own Seam 1 finding that
-//     `AppConfig` has no fork equivalent). `MeetingRecordingWriter.persistTemporaryRecordingAsync`
+//     `retainRecording: Bool` init parameter with NO DEFAULT -- there is no fork settings
+//     surface yet to read a real user preference from (see the seam map's own Seam 1 finding
+//     that `AppConfig` has no fork equivalent), which is a reason to force every caller to
+//     choose explicitly, not a reason to default to retaining other participants' audio. See
+//     `MeetingEngine.init`'s own `retainRecording` parameter doc for the full reasoning.
+//     `MeetingRecordingWriter.persistTemporaryRecordingAsync`
 //     (the temp-WAV-to-permanent-M4A step) is deliberately NOT called here: donor's own
 //     `MeetingSession.swift` never calls it either -- only `MuesliController.swift` does, which
 //     this dispatch explicitly excludes from this port. `MeetingEngineResult.retainedRecordingURL`
@@ -132,6 +135,20 @@ struct MeetingEngineResult: Sendable {
     /// (e.g. could not open the temp file for writing) -- donor
     /// `retainedRecordingWriterError`/`MeetingSessionResult.retainedRecordingError`.
     let retainedRecordingError: Error?
+    /// Fork addition, no donor equivalent (the donor has no persistence layer to fail). Every
+    /// `MeetingStore` write failure `stop()` encountered while assembling this result --
+    /// per-chunk `appendSegment`/`updateDuration` calls (`persistSegments(_:channel:)`) and the
+    /// terminal `persistence.finish` call -- collected instead of discarded with `try?`. Empty
+    /// means every write this method knows about succeeded. A non-empty array means
+    /// `rawTranscript` above may be more complete than what is actually on disk: the caller
+    /// decides what to do with that (retry, warn the user, log for support), but it must not be
+    /// silently ignored, which is the whole reason this exists -- see `persistSegments`'s doc
+    /// comment for why silent `try?` discard here was reviewed and rejected. Does NOT cover the
+    /// fire-and-forget mid-meeting rotation watchers' own persistence (those have no result
+    /// object to report into by the time they run; they log failures instead, see
+    /// `rotateChunkOnQueue`/`rotateSystemChunkOnQueue`), nor `pause()`/`resume()`/`discard()`'s
+    /// `updateState`/`markFailed` calls, which this finding did not scope in.
+    let persistenceFailures: [Error]
 }
 
 /// Port of the donor's `MeetingSession` -- the serial orchestrator for one meeting's capture:
@@ -189,10 +206,10 @@ final class MeetingEngine {
 
     /// `MeetingStore` handle for this meeting, assigned once `start()`'s
     /// `persistence.startMeeting` call succeeds. Every persistence call after that is a no-op
-    /// (via `try?`) if this is somehow nil -- see `persistSegments(_:channel:)` -- which can
-    /// only happen if a caller invokes `pause()`/`resume()`/`stop()`/`discard()` before
-    /// `start()` ever ran; the donor has no equivalent guard because it has no persistence
-    /// layer at all.
+    /// if this is somehow nil -- see `persistSegments(_:channel:)`'s `guard let meetingHandle`
+    /// -- which can only happen if a caller invokes `pause()`/`resume()`/`stop()`/`discard()`
+    /// before `start()` ever ran; the donor has no equivalent guard because it has no
+    /// persistence layer at all.
     private var meetingHandle: MeetingHandle?
 
     /// Current mic power level for waveform visualization.
@@ -221,10 +238,22 @@ final class MeetingEngine {
     ///   one-field struct would be pure ceremony. Revisit into a struct if backend selection
     ///   adds real fields later.
     /// - Parameter retainRecording: donor's `config.meetingRecordingSavePolicy != .never` gate
-    ///   on `setupRetainedRecordingWriterIfNeeded()`. Defaults `true`: there is no fork settings
-    ///   surface yet to read a real user preference from (Seam 1), and the writer itself is
+    ///   on `setupRetainedRecordingWriterIfNeeded()`. NO DEFAULT, deliberately: this gates
+    ///   whether a recording of the OTHER PARTICIPANTS in the meeting is written to disk and
+    ///   kept, which is a decision about someone else's audio, not this engine's to make on a
+    ///   caller's behalf. There is no fork settings surface yet to read a real user preference
+    ///   from (Seam 1) -- which is exactly why this cannot silently default to `true`: with no
+    ///   settings surface, `true` would mean every caller that simply omits the parameter is
+    ///   choosing, unknowingly, to record and retain other people's conversations. A prior
+    ///   revision of this port defaulted this to `true` for the opposite reason ("the writer is
     ///   already landed and tested, so defaulting it off would silently disable a working
-    ///   feature for no reason tied to this stage's own scope.
+    ///   feature") -- reviewed and rejected: an unreviewed retention default is not "a working
+    ///   feature," it is an undecided one, and the absence of a settings surface is a reason to
+    ///   force the choice at the call site, not a reason to pick `true` for it. Every current
+    ///   call site is in `MeetingEngineTests.swift`, none of which exercises retained-recording
+    ///   behavior, so they all pass `false` explicitly; the first real (non-test) caller is
+    ///   where this decision actually needs making, once a settings surface exists to make it
+    ///   from.
     /// - Parameter systemAudioRecorderOverride: test-only seam, NOT present in the donor (its
     ///   `MeetingSession.init` hardcodes the same `useCoreAudioTap` switch with no injection
     ///   point either -- verified). Added here because this stage's brief requires verifying
@@ -236,7 +265,7 @@ final class MeetingEngine {
         persistence: MeetingStore,
         transcriptionCoordinator: MeetingTranscriptionCoordinating = NullMeetingTranscriptionCoordinator(),
         useCoreAudioTap: Bool = true,
-        retainRecording: Bool = true,
+        retainRecording: Bool,
         meetingMicRecorder: MeetingMicRecording = RouteAwareMeetingMicRecorder(),
         systemAudioRecorderOverride: SystemAudioCapturing? = nil
     ) {
@@ -557,6 +586,11 @@ final class MeetingEngine {
         let endTime = Date()
         var micSegments: [SpeechSegment] = []
         var systemSegments: [SpeechSegment] = []
+        // Every persistence failure collected below reaches `MeetingEngineResult
+        // .persistenceFailures` rather than being discarded with `try?`, so a caller can tell
+        // "returned a transcript" apart from "everything in it also reached disk." See
+        // `persistSegments(_:channel:)`'s doc comment.
+        var persistenceFailures: [Error] = []
 
         micVad?.stop()
         micVad = nil
@@ -606,7 +640,7 @@ final class MeetingEngine {
             isFinalChunk: true
         )
         micSegments.append(contentsOf: finalMicSegments)
-        await persistSegments(finalMicSegments, channel: .mic)
+        persistenceFailures.append(contentsOf: await persistSegments(finalMicSegments, channel: .mic))
 
         if let lastSystemChunkURL {
             let chunkOffset = lastSystemChunkTiming?.startTimeSeconds ?? 0
@@ -620,7 +654,7 @@ final class MeetingEngine {
                     endTime: chunkOffset + max(chunkDuration, 0.1)
                 )
                 systemSegments.append(contentsOf: normalizedSegments)
-                await persistSegments(normalizedSegments, channel: .system)
+                persistenceFailures.append(contentsOf: await persistSegments(normalizedSegments, channel: .system))
             } catch {
                 fputs("[meeting] final system chunk transcription failed: \(error)\n", stderr)
             }
@@ -633,7 +667,15 @@ final class MeetingEngine {
             diarizationSegments = diarizationResult.segments
         }
 
-        micSegments.append(contentsOf: await micChunkCollector.closeAndDrainSortedSegments())
+        micSegments.append(contentsOf: await micChunkCollector.closeAndDrainSortedSegments(
+            persistPending: { segments in
+                // A chunk still transcribing when stop() reached this point: its own watcher
+                // Task's `retire` call is now guaranteed to fail (the collector just closed),
+                // so its normal persistence would never run without this. See
+                // MeetingChunkCollector.swift's `closeAndDrainSortedSegments(persistPending:)`.
+                persistenceFailures.append(contentsOf: await self.persistSegments(segments, channel: .mic))
+            }
+        ))
         micSegments.sort { lhs, rhs in
             if lhs.start == rhs.start {
                 return lhs.text < rhs.text
@@ -641,7 +683,11 @@ final class MeetingEngine {
             return lhs.start < rhs.start
         }
 
-        systemSegments.append(contentsOf: await systemChunkCollector.closeAndDrainSortedSegments())
+        systemSegments.append(contentsOf: await systemChunkCollector.closeAndDrainSortedSegments(
+            persistPending: { segments in
+                persistenceFailures.append(contentsOf: await self.persistSegments(segments, channel: .system))
+            }
+        ))
         systemSegments.sort { lhs, rhs in
             if lhs.start == rhs.start {
                 return lhs.text < rhs.text
@@ -673,7 +719,15 @@ final class MeetingEngine {
         )
 
         if let meetingHandle {
-            try? await persistence.finish(meetingHandle, endDate: endTime)
+            do {
+                try await persistence.finish(meetingHandle, endDate: endTime)
+            } catch {
+                // The terminal write: without it the meeting stays `.recording`/`.paused`
+                // forever even though this method is about to return a complete transcript.
+                // Surfaced via `persistenceFailures`, not discarded -- see this method's own
+                // `persistenceFailures` doc comment.
+                persistenceFailures.append(error)
+            }
         }
 
         return MeetingEngineResult(
@@ -684,7 +738,8 @@ final class MeetingEngine {
             rawTranscript: rawTranscript,
             systemRecordingURL: systemAudioURL,
             retainedRecordingURL: retainedRecordingURL,
-            retainedRecordingError: retainedRecordingWriterError
+            retainedRecordingError: retainedRecordingWriterError,
+            persistenceFailures: persistenceFailures
         )
     }
 
@@ -721,21 +776,41 @@ final class MeetingEngine {
     /// has no "update an already-persisted segment's label" operation, so a later diarization
     /// pass cannot retroactively relabel what is already on disk. Disclosed limitation, not
     /// silently accepted: flagged in this port's report.
-    private func persistSegments(_ segments: [SpeechSegment], channel: MeetingSegmentChannel) async {
-        guard let meetingHandle else { return }
+    ///
+    /// Returns every `appendSegment`/`updateDuration` failure instead of discarding them with
+    /// `try?`, so callers can choose to surface them rather than let `stop()` report success on
+    /// a meeting whose segments silently never reached disk. Empty return means every write in
+    /// this call succeeded (or there was nothing to write). Callers decide what "surface" means:
+    /// `stop()` collects these into `MeetingEngineResult.persistenceFailures`; the mid-meeting
+    /// fire-and-forget rotation watchers (which have no result object to attach them to) log
+    /// them instead. Silent discard was reviewed and rejected: a persistence layer whose
+    /// failures are invisible looks healthy when it is not.
+    @discardableResult
+    private func persistSegments(_ segments: [SpeechSegment], channel: MeetingSegmentChannel) async -> [Error] {
+        guard let meetingHandle else { return [] }
         let speakerLabel = channel == .mic ? "You" : "Others"
+        var failures: [Error] = []
         for segment in segments {
-            _ = try? await persistence.appendSegment(
-                startOffset: segment.start,
-                endOffset: segment.end,
-                speakerLabel: speakerLabel,
-                text: segment.text,
-                sourceChannel: channel,
-                to: meetingHandle
-            )
+            do {
+                _ = try await persistence.appendSegment(
+                    startOffset: segment.start,
+                    endOffset: segment.end,
+                    speakerLabel: speakerLabel,
+                    text: segment.text,
+                    sourceChannel: channel,
+                    to: meetingHandle
+                )
+            } catch {
+                failures.append(error)
+            }
         }
-        guard let startTime else { return }
-        try? await persistence.updateDuration(durationSeconds(from: startTime, to: Date()), for: meetingHandle)
+        guard let startTime else { return failures }
+        do {
+            try await persistence.updateDuration(durationSeconds(from: startTime, to: Date()), for: meetingHandle)
+        } catch {
+            failures.append(error)
+        }
+        return failures
     }
 
     private func durationSeconds(from start: Date, to end: Date) -> Double {
@@ -745,14 +820,16 @@ final class MeetingEngine {
     // MARK: - Chunk rotation
 
     private func appendFlushedStreamingMicOnQueue() {
-        let flushed = neuralAec.flushStreamingMic()
         if let micVad {
-            // Route through the facade for consistency with the realtime path, even though
-            // this specific call never drives the wrapped VAD controller (see
-            // MeetingVadStreams.swift's `acceptFlushed(_:)` doc comment).
-            appendCleanedMicSamplesOnQueue(micVad.acceptFlushed(flushed).samples)
+            // `micVad.flushCanceller()` drains `neuralAec` (its `echoCanceller`) itself and
+            // mints the receipt internally -- see MeetingVadStreams.swift's
+            // `flushCanceller()` doc comment. Calling `neuralAec.flushStreamingMic()` here
+            // too, on top of that, would drain the SAME buffered samples twice: the first
+            // drain empties the canceller's buffer, so a second call returns nothing and the
+            // flushed audio is silently lost.
+            appendCleanedMicSamplesOnQueue(micVad.flushCanceller().samples)
         } else {
-            appendCleanedMicSamplesOnQueue(flushed)
+            appendCleanedMicSamplesOnQueue(neuralAec.flushStreamingMic())
         }
     }
 
@@ -791,7 +868,10 @@ final class MeetingEngine {
                 let segments = await task.value
                 guard let self else { return }
                 guard self.micChunkCollector.retire(id: retireID, segments: segments) else { return }
-                await self.persistSegments(segments, channel: .mic)
+                let failures = await self.persistSegments(segments, channel: .mic)
+                if !failures.isEmpty {
+                    fputs("[meeting] failed to persist \(failures.count) mic segment(s): \(failures)\n", stderr)
+                }
                 guard !segments.isEmpty else { return }
                 self.onChunkTranscribed?(segments, "You")
             }
@@ -840,7 +920,10 @@ final class MeetingEngine {
                 let segments = await task.value
                 guard let self else { return }
                 guard self.systemChunkCollector.retire(id: retireID, segments: segments) else { return }
-                await self.persistSegments(segments, channel: .system)
+                let failures = await self.persistSegments(segments, channel: .system)
+                if !failures.isEmpty {
+                    fputs("[meeting] failed to persist \(failures.count) system segment(s): \(failures)\n", stderr)
+                }
                 guard !segments.isEmpty else { return }
                 self.onChunkTranscribed?(segments, "Others")
             }

@@ -195,6 +195,29 @@ private struct FakeTranscriptionCoordinator: MeetingTranscriptionCoordinating {
     func diarizeSystemAudio(at url: URL) async throws -> DiarizationResult? { nil }
 }
 
+/// Regression fixture for the "silent chunk loss on stop()" finding: every mic-chunk
+/// transcription sleeps for `delayNanoseconds` before returning, so a chunk rotated just before
+/// `stop()` is still in flight when `stop()` reaches `micChunkCollector
+/// .closeAndDrainSortedSegments()` -- reproducing the race between that close and the chunk's
+/// own completion-time `retire` call, rather than hoping timing happens to line up.
+private struct DelayedMicChunkTranscriptionCoordinator: MeetingTranscriptionCoordinating {
+    let delayNanoseconds: UInt64
+    let micText: String
+
+    func getVadManager() async -> VadManager? { nil }
+
+    func transcribeMeetingChunk(at url: URL) async throws -> SpeechTranscriptionResult {
+        try? await Task.sleep(nanoseconds: delayNanoseconds)
+        return SpeechTranscriptionResult(text: micText, segments: [])
+    }
+
+    func transcribeMeeting(at url: URL) async throws -> SpeechTranscriptionResult {
+        SpeechTranscriptionResult(text: "", segments: [])
+    }
+
+    func diarizeSystemAudio(at url: URL) async throws -> DiarizationResult? { nil }
+}
+
 @Suite("MeetingEngine", .serialized)
 struct MeetingEngineTests {
     private func makeContainer() throws -> ModelContainer {
@@ -261,6 +284,7 @@ struct MeetingEngineTests {
         let engine = MeetingEngine(
             title: "Weekly sync",
             persistence: store,
+            retainRecording: false,
             meetingMicRecorder: mic,
             systemAudioRecorderOverride: system
         )
@@ -293,6 +317,7 @@ struct MeetingEngineTests {
             title: "Standup",
             persistence: store,
             transcriptionCoordinator: coordinator,
+            retainRecording: false,
             meetingMicRecorder: mic,
             systemAudioRecorderOverride: system
         )
@@ -336,6 +361,7 @@ struct MeetingEngineTests {
             title: "Abandoned",
             persistence: store,
             transcriptionCoordinator: coordinator,
+            retainRecording: false,
             meetingMicRecorder: mic,
             systemAudioRecorderOverride: system
         )
@@ -363,6 +389,7 @@ struct MeetingEngineTests {
             title: "Retro",
             persistence: store,
             transcriptionCoordinator: coordinator,
+            retainRecording: false,
             meetingMicRecorder: mic,
             systemAudioRecorderOverride: system
         )
@@ -388,5 +415,59 @@ struct MeetingEngineTests {
 
         #expect(mic.stopCalls == 1)
         #expect(system.stopCalls == 1)
+    }
+
+    /// Regression test for the "silent chunk loss on stop()" finding. Rotation watchers only
+    /// persist a chunk AFTER a successful `retire`, but `stop()` closes the collector
+    /// (`closeAndDrainSortedSegments`) and drains still-in-flight chunks DIRECTLY, which makes
+    /// their own later `retire` call fail and exit before persisting -- so a chunk still
+    /// transcribing when the user hits stop would appear in the returned transcript while being
+    /// absent from the store. This is a defect the port introduced (the donor has no per-chunk
+    /// persistence watcher to preserve), not donor behavior to keep.
+    ///
+    /// `pause()` rotates a real mic chunk (same mechanism VAD-driven rotation uses) and registers
+    /// its transcription with `micChunkCollector`. `DelayedMicChunkTranscriptionCoordinator`
+    /// makes that transcription take `delayNanoseconds`, so it is still pending in the collector
+    /// when `stop()` -- called immediately after, with no wait in between -- reaches
+    /// `micChunkCollector.closeAndDrainSortedSegments()`. That reproduces the race
+    /// deterministically instead of hoping timing lines up.
+    @Test("stop() does not silently drop a chunk that was still transcribing when it was called")
+    func stopPersistsChunkStillInFlightAtCallTime() async throws {
+        let container = try makeContainer()
+        let store = MeetingStore(modelContainer: container)
+        let mic = FakeMeetingMicRecorder()
+        let system = FakeSystemAudioRecorder()
+        let coordinator = DelayedMicChunkTranscriptionCoordinator(
+            delayNanoseconds: 300_000_000,
+            micText: "in-flight when stop was called"
+        )
+        let engine = MeetingEngine(
+            title: "Race",
+            persistence: store,
+            transcriptionCoordinator: coordinator,
+            retainRecording: false,
+            meetingMicRecorder: mic,
+            systemAudioRecorderOverride: system
+        )
+
+        try await engine.start()
+        mic.onRawPCMSamples?(fakeAudioSamples())
+
+        // Rotates the mic chunk and registers its (slow) transcription with micChunkCollector,
+        // then returns immediately -- the transcription is still running in the background.
+        engine.pause()
+
+        // Called with no wait: the 300ms delayed transcription cannot have completed yet, so
+        // `stop()` is guaranteed to race its own `closeAndDrainSortedSegments()` against that
+        // chunk's still-pending completion.
+        let result = try await engine.stop()
+
+        // The segment reaches the returned transcript either way (this was never in question).
+        #expect(result.rawTranscript.contains("in-flight when stop was called"))
+
+        // The bug: it never reached the store, because the chunk's own watcher Task's `retire`
+        // call raced the collector's close and lost, so persistence was skipped entirely.
+        let segments = try fetchSegments(from: container)
+        #expect(segments.contains { $0.text == "in-flight when stop was called" && $0.sourceChannel == .mic })
     }
 }

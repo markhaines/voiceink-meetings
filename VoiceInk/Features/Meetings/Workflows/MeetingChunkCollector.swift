@@ -1,7 +1,16 @@
-// Ported verbatim from Muesli-HQ/muesli (native/MuesliNative/Sources/MuesliNativeApp/MeetingSession.swift,
+// Ported from Muesli-HQ/muesli (native/MuesliNative/Sources/MuesliNativeApp/MeetingSession.swift,
 // lines 8-92 -- `MeetingChunkCollector` was a top-level type in the donor's MeetingSession.swift,
 // split into its own file here since this fork's MeetingSession port (`MeetingEngine.swift`) is
-// itself a large file. No behavior change; `SpeechSegment` resolves to this fork's own type.
+// itself a large file. `SpeechSegment` resolves to this fork's own type.
+//
+// ONE DELIBERATE DEVIATION FROM THE DONOR: `closeAndDrainSortedSegments(persistPending:)`'s
+// `persistPending` parameter. The donor has no per-chunk persistence layer at all, so it never
+// had this gap: without this parameter, a chunk still transcribing when the caller closes this
+// collector (`MeetingEngine.stop()`) would be included in the segments this method returns
+// while never reaching `MeetingStore`, because its own completion-time `retire(id:segments:)`
+// call is guaranteed to fail post-close. That is a defect the PORT introduced by adding
+// per-chunk persistence on top of this verbatim-ported collector, not a donor behavior to
+// preserve -- see this method's own doc comment, and `MeetingEngine.swift`'s `stop()`.
 //
 // MIT License
 //
@@ -74,7 +83,22 @@ final class MeetingChunkCollector {
         }
     }
 
-    func closeAndDrainSortedSegments() async -> [SpeechSegment] {
+    /// Closes the collector, drains it, and returns every collected segment sorted by start.
+    ///
+    /// - Parameter persistPending: Fork addition (no donor equivalent -- the donor has no
+    ///   per-chunk persistence to preserve here). Called once per still-in-flight task that
+    ///   this close raced: a task registered via `add(_:)` but not yet `retire`d when this
+    ///   method ran. Its own completion-time `retire(id:segments:)` call is guaranteed to fail
+    ///   once `isClosed` is set (see `retire(id:segments:)`), so whatever persistence its
+    ///   caller normally does on a successful retire (`MeetingEngine`'s watcher `Task`) would
+    ///   otherwise never run for it -- the chunk would still appear in this method's returned
+    ///   segments (and so in the final transcript) while being silently absent from the store.
+    ///   Not called for segments that were already retired before this raced them: those were
+    ///   already handed to their own caller's persistence step before `isClosed` was set, so
+    ///   persisting them again here would duplicate them. Not called with an empty array.
+    func closeAndDrainSortedSegments(
+        persistPending: (([SpeechSegment]) async -> Void)? = nil
+    ) async -> [SpeechSegment] {
         let (tasksToAwait, alreadyCompleted) = lock.withLock { state in
             state.isClosed = true
             let tasks = state.pendingTasks.map { $0.task }
@@ -86,7 +110,11 @@ final class MeetingChunkCollector {
 
         var segments = alreadyCompleted
         for task in tasksToAwait {
-            segments.append(contentsOf: await task.value)
+            let pending = await task.value
+            if !pending.isEmpty {
+                await persistPending?(pending)
+            }
+            segments.append(contentsOf: pending)
         }
 
         return segments.sorted { lhs, rhs in

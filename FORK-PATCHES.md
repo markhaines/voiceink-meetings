@@ -1187,11 +1187,17 @@ port. Still not wired into any engine.
 **Correction (`meeting-engine` branch):** the line above is now stale. `MeetingEngine.swift`
 (`Workflows/`) wires this writer in — `appendMic`/`appendSystem` from the realtime capture
 callbacks, `markPauseBoundary()` on pause, `stop()`/`cancel()` on teardown, gated by a new
-`retainRecording: Bool` init parameter (default on). This correction is left here because the
-port that added `MeetingEngine.swift` initially trusted a seam-map document that had itself
-trusted this section's "not wired into any engine" framing to mean the whole *type* was absent,
-not just its wiring — an easy mistake to repeat for the next reader too if this section keeps
-reading as current.
+`retainRecording: Bool` init parameter. This correction is left here because the port that
+added `MeetingEngine.swift` initially trusted a seam-map document that had itself trusted this
+section's "not wired into any engine" framing to mean the whole *type* was absent, not just its
+wiring — an easy mistake to repeat for the next reader too if this section keeps reading as
+current.
+
+**Second correction (PR #12 review response, see "meeting-engine review-fix round" below):**
+"default on" in the line above is now also stale. `retainRecording` originally defaulted to
+`true`; the review response removes the default outright, so this line no longer describes
+current behavior. Left uncorrected in place (rather than edited) for the same reason as the
+first correction: so the next reader sees the history, not just the current state.
 
 ## stage2-models-store (Stage 2a: meeting data layer)
 
@@ -2093,3 +2099,141 @@ follow-up fix: read `MeetingPromptStateMachine.swift:34-205` and
 `MeetingPromptStateMachineTests.swift` in full before changing either line — the suppression
 sets interact with `markRecordingStarted`, `markAutoDismissed` and `resetVisiblePrompt` in ways
 that are easy to break without matching test coverage.
+
+## meeting-engine review-fix round (PR #12)
+
+Fixes four blocking findings from PR #12's review, all in files already fork-owned by the
+`meeting-engine` port (`MeetingEngine.swift`, `MeetingVadStreams.swift`,
+`MeetingChunkCollector.swift`, and their test files) — no upstream (`Beingpax/VoiceInk`) file
+touched, no SPM dependency added.
+
+### 1. `acceptFlushed(_ alreadyCleaned: [Float])` reintroduced the defeated "caller declares
+### cleanliness" shape — inverted instead
+
+`MicVadStream.acceptFlushed(_:)` took arbitrary floats from ANY caller and minted an
+`AECCleanedMicSamples` receipt for them. `AECCleanedMicSamples` itself was never reachable this
+way (its initializer stayed `fileprivate`, see `MeetingVadStreams.swift`'s header, "Why the
+receipt cannot be forged"), but the METHOD was a laundering path around that: a caller supplies
+floats, the method wraps them, nothing checks they ever passed through AEC. This is the same
+shape ("caller declares cleanliness") that was defeated three times on the receipt type itself
+before the file's current inversion held — reopening it via a method instead of the type's
+constructor is the same hole with a different door.
+
+Fixed by extending the same inversion to this call: `MicVadStream.flushCanceller()` replaces
+`acceptFlushed(_:)`, takes no floats parameter at all, and calls
+`echoCanceller.flushStreamingMic()` itself — the canceller this specific `MicVadStream`
+instance already owns. There is no floats parameter for a caller to launder anything through.
+`MeetingEngine.appendFlushedStreamingMicOnQueue()` (the sole call site) is restructured to
+branch on whether `micVad` exists BEFORE calling `flushStreamingMic()`, not after: the previous
+shape called `neuralAec.flushStreamingMic()` unconditionally and then, only if `micVad` existed,
+wrapped that already-computed result via `acceptFlushed`. Preserving that ordering under the
+inversion would have drained the canceller's buffer once in `appendFlushedStreamingMicOnQueue`
+and a second time inside `flushCanceller()`, and `flushStreamingMic()` empties its buffer on
+each call — so the second drain would silently return nothing and the flushed audio would be
+lost. The fix calls it exactly once either way (via `flushCanceller()` when `micVad` exists, via
+`neuralAec.flushStreamingMic()` directly in the `else` branch), matching the original call
+count, not the original code shape.
+
+Attacked from `MeetingVadStreamsTests.swift` (a separate file from `MeetingVadStreams.swift`,
+`@testable import VoiceInk`, full `xcodebuild build-for-testing`, not `swiftc -typecheck` alone)
+as attacks A14-A17 (that file's header carries the full transcript): calling the deleted method
+by its old name; an extension reintroducing the "caller supplies floats" shape via direct
+receipt construction; an extension reaching the `private` `echoCanceller` property directly;
+subclassing the `final` `MicVadStream` to override `flushCanceller()`. All four fail to compile;
+none reduced to a smaller diagnostic than the ones documented. `StubEchoCanceller` (the test
+double) needed a `flushStreamingMic()` implementation added to keep conforming to
+`MicEchoCanceller` — it had fallen out of sync with that protocol gaining the requirement
+earlier in this same review round, and a prior worker's build never got far enough (see the
+`-skipPackagePluginValidation` note below) to catch the resulting non-conformance.
+
+### 2. Silent chunk loss on `stop()` — a chunk still transcribing when the user hits stop could
+### vanish from the store while appearing in the returned transcript
+
+`MeetingChunkCollector`'s rotation watchers only persist a chunk after a successful `retire`.
+`MeetingEngine.stop()` calls `closeAndDrainSortedSegments()`, which sets `isClosed = true` and
+then drains any still-pending task directly, awaiting its result and returning it — but that
+same task's own watcher `Task` (spawned back when the chunk was rotated) is concurrently
+awaiting the identical result and will call `retire(id:segments:)` on it once available, which
+is now guaranteed to fail (`isClosed`). The watcher's `guard ... else { return }` then exits
+before ever calling `persistSegments`. Net effect: the chunk's segments reach the transcript
+`stop()` returns (via the direct drain) but never reach `MeetingStore`.
+
+This is a defect the port introduced, not donor behavior preserved: the donor closes and drains
+the same way, but has no per-chunk persistence watcher for the close to race against in the
+first place, so the donor was traced and confirmed to have nothing equivalent to defend.
+
+Fixed by giving `closeAndDrainSortedSegments` an optional `persistPending` closure, called once
+per still-in-flight task the close raced (i.e. exactly the tasks whose own `retire` is now
+guaranteed to fail), with that task's segments — never called for segments that were already
+retired before the close (those were already persisted by their own watcher, and calling it
+again would duplicate them). `MeetingEngine.stop()` passes a closure that calls
+`persistSegments(_:channel:)` for both the mic and system collectors.
+
+Regression test `MeetingEngineTests.stopPersistsChunkStillInFlightAtCallTime` (new
+`DelayedMicChunkTranscriptionCoordinator` fixture: every mic-chunk transcription sleeps 300ms
+before returning, so a chunk rotated via `pause()` immediately before `stop()` is called is
+still in flight when `stop()` reaches `closeAndDrainSortedSegments()`, reproducing the race
+deterministically instead of hoping timing lines up). Run against the code with `persistPending`
+temporarily omitted (i.e. the pre-fix shape) it failed with:
+```
+Expectation failed: segments.contains { $0.text == "in-flight when stop was called" && $0.sourceChannel == .mic }
+```
+— the segment was in `result.rawTranscript` but absent from the store, exactly the reported
+defect. With `persistPending` wired back in, the same test passes.
+
+### 3. Invisible persistence failures — `stop()` could report success on a meeting that was
+### never actually saved
+
+Every per-chunk `appendSegment`/`updateDuration` call in `persistSegments(_:channel:)`, and the
+terminal `persistence.finish(...)` call in `stop()`, discarded their errors with `try?`. A
+`MeetingStore` write failure anywhere in that path was therefore invisible: `stop()` could
+return a complete `rawTranscript` and mark nothing wrong, while the meeting stayed
+`.recording`/`.paused` forever or was missing segments on disk.
+
+Design chosen: `persistSegments` now returns `[Error]` (empty on full success) instead of
+discarding failures, and `MeetingEngineResult` gains a `persistenceFailures: [Error]` field that
+`stop()` populates from every `persistSegments` call (final chunks, the two collector drains'
+`persistPending` closures) plus the terminal `finish` call. This was chosen over propagating
+(would mean `stop()` throwing over a transcript that is otherwise complete and usable) or a
+bare success/failure flag (loses which of potentially several independent writes failed). Empty
+`persistenceFailures` means every write `stop()` knows about succeeded; a non-empty array means
+the returned transcript may be more complete than what actually reached disk, and it is the
+caller's decision what to do about that (retry, warn, log) — deliberately not this engine's,
+since there is no UI wired to it yet at this stage. The mid-meeting fire-and-forget rotation
+watchers (which run before `stop()` exists to report into) log failures via `fputs` instead,
+matching this file's existing `[meeting] ...` logging convention. `pause()`/`resume()`/
+`discard()`'s own `updateState`/`markFailed` `try?` calls are unchanged — the finding scoped
+this to per-chunk appends and the terminal writes, not every persistence call in the engine.
+
+### 4. `retainRecording` defaulted to `true` — recording and keeping other participants' audio
+### with nobody having decided to
+
+`MeetingEngine.init`'s `retainRecording: Bool = true` meant any caller that simply omitted the
+parameter recorded and retained a mixed mic+system-audio file of the meeting, including
+everyone else in it, without anyone having made that choice — there is no fork settings surface
+yet to read a real user preference from (Seam 1), so "default true" was standing in for a
+decision nobody made. The donor only retains when an explicit save policy says so.
+
+Fixed by removing the default entirely: `retainRecording: Bool` (no `=`), forcing every call
+site to choose explicitly. All four current call sites are in `MeetingEngineTests.swift`, none
+of which exercises retained-recording behavior, so all four now pass `retainRecording: false`
+explicitly. The first real (non-test) caller is where this decision actually needs making, once
+a settings surface exists to make it from — see `MeetingEngine.init`'s `retainRecording`
+parameter doc and this file's header for the full reasoning, including the prior (now
+corrected) note under `meeting-recording-writer` above.
+
+### Verification
+
+Full `xcodebuild build` (Debug, `CODE_SIGN_IDENTITY=""`) after each finding, then
+`xcodebuild test` (Debug, `LocalBuild.xcconfig`, `-skipPackagePluginValidation` --
+`mlx-swift`'s `CudaBuild` build-tool plugin must be explicitly allowed non-interactively for the
+test action or the whole run fails at plugin validation before compiling anything; the plain
+app `build` action does not hit this, only `build-for-testing`/`test` do) against
+`MeetingEngineTests`, `MeetingVadStreamsTests`, `MeetingChunkCollectorTests`,
+`MeetingProcessingStageTests`, and `MeetingEngineRecoveryPolicyTests` — 24 tests, all passing
+with the fixes in place, including the new regression test and a new positive test for
+`flushCanceller()` (`micStreamFlushesOwnCancellerWithoutDrivingVad`).
+
+No change to pause ordering, stop teardown, callback-barrier ordering, or realtime callback
+ordering: every edit here is scoped to the four findings above; nothing else in the retained
+lifecycle/audio paths was touched.

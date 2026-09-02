@@ -3,6 +3,61 @@
 Known gaps deliberately left open, with the reasoning, so they are decisions rather than
 accidents. See each entry for the evidence.
 
+## `retainRecording` stays `false` on `meetings-ui-shell` -- turning it on today would be worse, not better
+
+Source: `VoiceInk/Features/Meetings/Views/MeetingRecordingController.swift`,
+`VoiceInk/Features/Meetings/Workflows/MeetingEngine.swift`. Cross-vendor review of PR #15's
+launch-fix round flagged that `MeetingsView`'s copy implied retained audio while
+`retainRecording: false` means only metadata + an empty transcript survive, and delegated the
+underlying judgement call: should the flag flip to `true` instead of just fixing the wording?
+
+**Decision: no, stays `false`.** Not for the reason originally on the table (no settings surface
+for a real user choice -- still true, but not sufficient on its own): reading
+`MeetingEngine.stop()` shows `MeetingEngineResult.retainedRecordingURL` is only ever the raw
+temp WAV `MeetingRecordingWriter` wrote -- `persistTemporaryRecordingAsync` (the temp-to-
+permanent-M4A step) is explicitly NOT called anywhere in this stage, per `MeetingEngine.swift`'s
+own header: "persisting it permanently is a later stage's (a future app-controller's) job." And
+`MeetingRecordingController.stopMeeting()` discards the whole `MeetingEngineResult` after
+extracting only `persistenceFailures` -- it never reads `retainedRecordingURL` at all.
+
+So flipping the flag today, on this branch, with no other change, would not give Mark a kept
+recording. It would write a temp WAV for the full length of every meeting, then leak that file:
+nothing captures its path, nothing surfaces it in the UI, nothing moves it anywhere durable, and
+nothing cleans it up. That is `NSTemporaryDirectory()` growing unboundedly and invisibly for as
+long as the app runs between reboots -- a worse failure mode than the current honestly-empty
+row, not a better one, and exactly the "audio accumulates on disk undisclosed" risk the review
+raised as the argument against `true`.
+
+**Would need revisiting** together, not separately, with: (a) wiring
+`persistTemporaryRecordingAsync` (or an equivalent) so the file actually reaches permanent
+storage, (b) a place to reference that path from the `Meeting` row (a schema change, since
+`Meeting`/`MeetingSegment` have no audio-path field today), (c) a management/playback surface so
+the retained audio is discoverable and deletable, and (d) UI copy that reflects all of the above
+truthfully. That is Phase 3 (Transcripted-parity export) territory, not a wording fix's scope --
+flipping one `Bool` without the other three pieces trades one honest gap for a hidden one.
+
+## `MeetingsView`'s `@Query` and `MeetingDetailView`'s segment list are both unbounded
+
+Source: `VoiceInk/Features/Meetings/Views/MeetingsView.swift` (`@Query(sort: \Meeting.startDate,
+order: .reverse) private var meetings: [Meeting]`) and
+`VoiceInk/Features/Meetings/Views/MeetingDetailView.swift` (`orderedSegments`, rendered as one
+`SegmentBubble` per segment in a plain `VStack` inside a `ScrollView`, no lazy container).
+Flagged as non-blocking by cross-vendor review of PR #15's launch-fix round.
+
+Both fetch/render everything with no page size and no virtualization. Fine today -- a fresh
+install has zero-to-few meetings, and Stage 2c's transcription is stubbed so every meeting's
+segment count is currently zero regardless of length -- but two things change that:
+
+- A long-lived install accumulates meeting rows with no cap on the `@Query`.
+- Once Stage 2c lands real transcription, a 60-90 minute meeting could produce hundreds of
+  segments, all rendered eagerly in a non-lazy `VStack` rather than a `LazyVStack`.
+
+**Not fixed here**: bounding either one is a real design decision (pagination UI for the list,
+`LazyVStack` + possibly `LazyVStack`-unfriendly bubble-alignment rework for the detail view) that
+deserves its own pass rather than a reactive patch inside a wording/lifecycle fix round.
+**Worth doing before Stage 2c ships real transcription**, at the latest -- that is when segment
+counts per meeting stop being zero.
+
 ## `MeetingStore`'s isolation guarantee excludes raw-memory forgery and `Mirror` on a handle
 
 Source: `VoiceInk/Features/Meetings/Models/MeetingStore.swift`. `MeetingStore` guarantees that

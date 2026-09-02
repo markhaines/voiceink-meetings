@@ -14,10 +14,13 @@ import SwiftData
 import SwiftUI
 
 struct MeetingsView: View {
-    @Environment(\.modelContext) private var modelContext
     @Query(sort: \Meeting.startDate, order: .reverse) private var meetings: [Meeting]
 
-    @StateObject private var recordingController = MeetingRecordingController()
+    // Owned by `ContentView`, not here -- see that file's `meetingRecordingController` comment
+    // for why: this view is destroyed and recreated every time the sidebar selection leaves
+    // and returns to `.meetings`, and an in-progress recording must not be tied to that
+    // lifecycle.
+    @EnvironmentObject private var recordingController: MeetingRecordingController
     @State private var selectedMeetingID: UUID?
     @State private var isPanelPresented = false
 
@@ -55,21 +58,35 @@ struct MeetingsView: View {
                 MeetingDetailView(meeting: selectedMeeting)
             }
         }
-        .onAppear {
-            recordingController.configure(modelContainer: modelContext.container)
-        }
     }
 
     // MARK: - Top bar
 
+    /// What "Start Meeting" actually keeps today, stated plainly and kept next to the control
+    /// itself rather than only in the empty state (which stops being shown the moment a first
+    /// meeting exists, while the retention behavior it describes does not change). Must stay
+    /// truthful against `MeetingRecordingController`'s `retainRecording: false` and the absence
+    /// of a transcription coordinator: no audio, no transcript, metadata only. See that
+    /// controller's own header comment and `FOLLOWUPS.md`'s "`retainRecording` stays false"
+    /// entry for why this is the current tradeoff, not an oversight.
+    static let recordingDisclosureText =
+        "Transcription is unavailable. Audio is captured only while the meeting runs and is " +
+        "not saved; only meeting metadata is kept."
+
     private var topBar: some View {
-        HStack(spacing: 12) {
-            Text("Meetings")
-                .font(.system(size: 15, weight: .semibold))
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 12) {
+                Text("Meetings")
+                    .font(.system(size: 15, weight: .semibold))
 
-            Spacer()
+                Spacer()
 
-            recordButton
+                recordButton
+            }
+
+            Text(Self.recordingDisclosureText)
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
@@ -146,9 +163,8 @@ struct MeetingsView: View {
                 .foregroundColor(.primary)
 
             Text(
-                "Start Meeting records the mic and other participants' audio and keeps a\n"
-                    + "durable record here. Transcription is not built yet, so meetings will\n"
-                    + "show up without transcript text until that lands."
+                "Start Meeting to begin. Meetings are listed here once you stop one, with\n"
+                    + "metadata only -- see the note above the list for what is and isn't kept."
             )
             .font(.system(size: 13))
             .foregroundColor(.secondary)

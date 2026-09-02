@@ -66,19 +66,69 @@ struct MeetingDetailView: View {
         .padding(16)
     }
 
+    /// One message per `MeetingState`, not one message for all of them: the same "this meeting
+    /// recorded without producing transcript text" line previously shown here regardless of
+    /// state was false or premature for `.recording`/`.paused` (nothing has finished yet, so
+    /// "recorded without producing" is a claim about the past that hasn't happened) and
+    /// disclosed nothing about audio (transcription isn't built at all, on this branch, in any
+    /// state -- but only `.completed` is actually "this is everything that will ever exist for
+    /// this meeting"). Every branch states plainly what does and doesn't exist right now.
+    private var noTranscriptContent: (icon: String, title: String, body: String) {
+        switch meeting.state {
+        case .recording:
+            return (
+                "record.circle",
+                "Recording in progress",
+                "Transcription isn't built yet, so no transcript will appear when this " +
+                    "meeting stops. Audio is not being saved for later playback."
+            )
+        case .paused:
+            return (
+                "pause.circle",
+                "Recording paused",
+                "Transcription isn't built yet, so no transcript will appear when this " +
+                    "meeting resumes and stops. Audio is not being saved for later playback."
+            )
+        case .finalizing:
+            return (
+                "hourglass",
+                "Finishing up",
+                "The last audio and segments are being flushed to disk. Transcription " +
+                    "isn't built yet, so no transcript text will appear."
+            )
+        case .completed:
+            return (
+                "text.bubble",
+                "No transcript for this meeting",
+                "This meeting completed without transcript text -- transcription isn't " +
+                    "built yet. Audio was not saved; only this meeting's metadata is kept."
+            )
+        case .failed:
+            return (
+                "exclamationmark.triangle",
+                "This meeting did not finish cleanly",
+                "Recording ended abnormally, so some or all of it may be missing -- check " +
+                    "the duration above. Transcription isn't built yet regardless, so no " +
+                    "transcript would exist either way."
+            )
+        }
+    }
+
     private var noTranscriptView: some View {
-        VStack(alignment: .center, spacing: 8) {
-            Image(systemName: "text.bubble")
+        let content = noTranscriptContent
+        return VStack(alignment: .center, spacing: 8) {
+            Image(systemName: content.icon)
                 .font(.system(size: 24))
                 .foregroundColor(.secondary)
-            Text("No transcript for this meeting")
+            Text(content.title)
                 .font(.system(size: 13, weight: .medium))
                 .foregroundColor(.primary)
-            Text("Transcription is not built yet — this meeting recorded without producing transcript text.")
+            Text(content.body)
                 .font(.system(size: 12))
                 .foregroundColor(.secondary)
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: 360)
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 32)

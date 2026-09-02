@@ -2585,10 +2585,14 @@ No upstream file touched, no SPM dependency added. Files changed: `MeetingChunkC
 Before this branch, `Features/Meetings/Views/` was empty and nothing outside
 `Features/Meetings/` referenced `MeetingEngine`/`MeetingStore`/`MeetingMonitor` (grep-verified):
 the entire meetings subsystem built by every stage above was unreachable from the running app.
-This adds the list + detail screen and wires it into navigation, using the two upstream
-touchpoints the dispatch for this branch budgeted and no others.
+This adds the list + detail screen and wires it into navigation. This section originally
+shipped with three upstream touchpoints; a later section on this same branch ("Launch fix"
+below) adds a fourth. **The branch total, kept accurate here rather than left to whichever
+section a reader opens first, is FOUR upstream files: `ContentView.swift`, `AppSidebar.swift`,
+`AppTheme.swift`, and `Makefile`.** `VoiceInk/VoiceInk.local.entitlements` is touched by the
+Launch fix section below too, but is fork-owned, not an upstream touchpoint (see that section).
 
-### Upstream touchpoints: THREE, not the two this branch was budgeted
+### Upstream touchpoints for this section: THREE, not the two this branch was budgeted
 
 1. **`App/Navigation/ContentView.swift`** (budgeted): added `case meetings = "Meetings"` to
    `ViewType` and `case .meetings: MeetingsView()` to `detailView(for:)`.
@@ -2610,6 +2614,11 @@ touchpoints the dispatch for this branch budgeted and no others.
    `ViewType` changed) — about as low-conflict as an upstream edit gets, but still a real
    upstream file this branch was not originally budgeted to touch, so it is logged here on its
    own rather than folded into touchpoint 2's entry.
+
+**Touchpoint 1 update (cross-vendor review fix round, B3):** `ContentView.swift` gained a
+`MeetingRecordingController` `@StateObject` and an `.environmentObject`/`.onAppear` configure
+call — see this branch's "Cross-vendor review fix round" section below for why. This is the
+same file as touchpoint 1 above, not a new one: the branch total stays at four.
 
 `VoiceInkEngine`, `RecordingState`, and `Features/Recording/Capture/Recorder.swift` are
 untouched — grep-verified after this branch's changes, not just before.
@@ -2682,14 +2691,25 @@ existing note on why `VoiceInkUITests` is skipped there for the same reason). Th
 lifecycle is already covered by `MeetingEngineTests.swift` against fake recorders; this file
 does not duplicate that.
 
-No upstream file touched beyond the two budgeted touchpoints above. No SPM dependency added.
+No upstream file touched beyond the three touchpoints logged above (two budgeted, one accepted
+after being flagged). No SPM dependency added.
 Files changed: `App/Navigation/ContentView.swift`, `App/Navigation/AppSidebar.swift`,
 `DesignSystem/Theme/AppTheme.swift`, `Features/Meetings/Views/MeetingsView.swift`,
 `Features/Meetings/Views/MeetingDetailView.swift`,
 `Features/Meetings/Views/MeetingRecordingController.swift`,
 `Tests/VoiceInkTests/Features/Meetings/Views/MeetingRecordingControllerTests.swift`.
 
-### Launch fix: `make local`'s product built but crashed on launch (two more upstream touchpoints)
+### Launch fix: `make local`'s product built but crashed on launch (one more upstream touchpoint: `Makefile`)
+
+This section touches two files, `VoiceInk/VoiceInk.local.entitlements` and `Makefile`, but only
+one of them counts as an upstream touchpoint in this ledger's sense. `VoiceInk.local.entitlements`
+is fork-owned: phase-0-fork-hygiene's mechanical bundle-id sweep already rewrote it as part of
+that one 71-file pass (not itemized file-by-file there), and this fork is the only thing that
+has edited its meaningful contents since — donor `Beingpax/VoiceInk` does not maintain this
+file's local-build entitlement set as fork-relevant upstream behavior to track drift against.
+`Makefile`, by contrast, IS shared, actively-maintained donor territory (donor's own commit
+history for it runs through `9af36f75`..`54387164` and beyond), so a fork edit to it is a real
+touchpoint against a moving upstream target. That is the fourth for this branch — see below.
 
 `make local` (with the CI-matching flags, see below) built successfully, but the product
 crashed instantly: `EXC_CRASH (SIGABRT)`, DYLD `Library missing`, with the decisive reason
@@ -2754,3 +2774,61 @@ build graph entirely, and that property must hold — see the "Build-time macro 
 note under `phase-0-fork-hygiene`.
 
 Files changed for this fix: `VoiceInk/VoiceInk.local.entitlements`, `Makefile`.
+
+### Cross-vendor review fix round: five blocking findings (B1-B5), zero new upstream touchpoints
+
+Cross-vendor review of the launch fix above returned CHANGES-REQUIRED with five blocking
+findings. None required a new upstream file; the branch total stays at four
+(`ContentView.swift`, `AppSidebar.swift`, `AppTheme.swift`, `Makefile`) — see this section's own
+`ContentView.swift` note under touchpoint 1, above.
+
+- **B1 (UI overstated retention):** `MeetingsView`'s empty-state copy said Start Meeting "keeps
+  a durable record" — true of metadata, false of audio and transcript. Judgement call on
+  whether to flip `retainRecording` to `true` instead: **kept `false`** — see `FOLLOWUPS.md`'s
+  "`retainRecording` stays false" entry for the concrete reason (the temp WAV is never captured
+  or moved to permanent storage on this branch, so `true` today would leak an undisclosed file,
+  not retain a usable one). Added a persistent disclosure line beside the record control
+  (`MeetingsView.recordingDisclosureText`, always visible, not only in the empty state which
+  stops showing once a meeting exists) and reworded the empty state so it no longer contradicts
+  it.
+- **B2 (one message for three states):** `MeetingDetailView`'s empty-transcript message was
+  identical for recording/paused/finalizing/completed/failed, which is false or premature for
+  every state but `.completed`. Now branches per `MeetingState` (`noTranscriptContent`), each
+  stating plainly what does and doesn't exist yet for that state.
+- **B3 (navigating away could kill a live recording — the important one):** `MeetingsView` owned
+  `MeetingRecordingController` as its own `@StateObject`, but `ContentView.detailView(for:)` is a
+  `@ViewBuilder` switch that destroys and recreates `MeetingsView` entirely on every sidebar
+  navigation away from `.meetings` — tearing down the controller (and the `MeetingEngine` it
+  drives) mid-recording, with no `engine.stop()` ever called, leaving the row stuck `.recording`
+  forever with no Stop control left to press. **Fixed structurally, not defensively**: hoisted
+  `MeetingRecordingController` to `ContentView` (`@StateObject`, injected via
+  `.environmentObject`), which is created once by the `WindowGroup` and outlives every
+  `detailView(for:)` switch — only the switch's *content* changes on navigation, not
+  `ContentView` itself. This makes the bad state structurally impossible rather than merely
+  unlikely: there is no code path left in which selecting another sidebar item can deallocate
+  the controller or the engine it owns, because neither is reachable from anything the switch
+  destroys. No fifth upstream touchpoint needed — `ContentView.swift` is touchpoint 1, already
+  logged above; this only extends that same file's diff.
+- **B4 (silent persistence failures):** `MeetingRecordingController.stopMeeting()` discarded
+  `engine.stop()`'s entire result (`_ = try await engine.stop()`), including
+  `MeetingEngineResult.persistenceFailures` — the field an earlier review round added
+  specifically because meetings could be lost silently. A failed terminal `persistence.finish`
+  write left the row stuck `.recording` while the UI returned to idle with no indication
+  anything was wrong. Now inspects the result and surfaces a message via the existing
+  `lastErrorMessage` → error-banner UI when `persistenceFailures` is non-empty.
+- **B5 (the ledger contradicted itself):** this file said "two... and no others," then "THREE,"
+  then "no upstream file touched beyond the two budgeted," then "two more upstream touchpoints"
+  for a launch fix that only added one (`Makefile` — `VoiceInk.local.entitlements` is fork-owned,
+  not a touchpoint, per the reasoning added to that section above). Rewritten throughout so
+  every statement agrees: **four upstream touchpoints total for this branch, no more, no
+  fewer.**
+
+**Non-blocking, recorded rather than fixed this round:** `MeetingsView`'s `@Query` and
+`MeetingDetailView`'s segment rendering are both unbounded — see `FOLLOWUPS.md`'s entry on
+this. Harmless today (fresh installs, stubbed transcription means zero segments regardless of
+meeting length) but worth bounding before Stage 2c ships real transcription.
+
+Files changed for this round: `App/Navigation/ContentView.swift`,
+`Features/Meetings/Views/MeetingsView.swift`,
+`Features/Meetings/Views/MeetingDetailView.swift`,
+`Features/Meetings/Views/MeetingRecordingController.swift`, `FOLLOWUPS.md`, this file.

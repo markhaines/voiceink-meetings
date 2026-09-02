@@ -1,8 +1,5 @@
-// Ported verbatim from Muesli-HQ/muesli (native/MuesliNative/Sources/MuesliNativeApp/SystemTurnNormalizer.swift).
-//
-// `SpeechTranscriptionResult` now resolves to this fork's own declaration
-// (Transcription/MeetingTranscriptionCoordinating.swift) rather than the donor's; same shape,
-// no import needed since both are in the same target. No other change.
+// Ported verbatim from Muesli-HQ/muesli
+// (native/MuesliNative/Sources/MuesliNativeApp/SystemTurnNormalizer.swift). No changes.
 //
 // MIT License
 //

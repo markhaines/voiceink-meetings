@@ -1814,3 +1814,60 @@ Local, Xcode 26.6 (17F113):
 - Upstream touchpoints for this stage: TWO. `VoiceInk/App/VoiceInk.swift` (appendix A2,
   unchanged this round) and `.gitignore` (appendix A3, section 9 below). `.github/workflows/ci.yml`
   is NOT one -- it is fork-owned; see section 10. Zero PRs against `Beingpax/VoiceInk`.
+
+## turn-normalizers (Stage 1: per-utterance turn timing)
+
+Ported verbatim into `VoiceInk/Features/Meetings/Transcription/`: `MicTurnNormalizer.swift`
+(donor 182 lines, byte-identical beyond the added header — confirmed by `diff`, not eyeballing)
+and `SystemTurnNormalizer.swift` (donor 69 lines, same). Tests ported verbatim into
+`Tests/VoiceInkTests/Features/Meetings/Transcription/`: `MicTurnNormalizerTests.swift` (donor
+159 lines) and `SystemTurnNormalizerTests.swift` (donor 52 lines) — both files' only change is
+`@testable import MuesliNativeApp` → `@testable import VoiceInk`, same convention as every
+prior ported test file in this cluster.
+
+This section exists even though these files live entirely under `Features/Meetings/` —
+normally exempt per this file's header — for the same reason `phase-1-vad-chunking`'s section
+exists: a fork-only extraction that needs recording, plus the fact that these two files turned
+out to be the load-bearing mechanism for meeting-transcript timestamps (never named as such in
+the original project handoff) is worth a pointer here for anyone reading this file top-down.
+
+### `SpeechTranscriptionResult.swift`: new fork-only file, not from the donor
+
+Both normalizers consume `SpeechTranscriptionResult { text: String, segments: [SpeechSegment] }`,
+which in the donor is defined inline in `TranscriptionRuntime.swift:11-14` — a file this fork
+does not port (it is Stage-2/MeetingEngine territory, not built yet). Same situation Stage 1's
+`SystemAudioCaptureDiagnostics.swift` and Stage 0's `AudioSampleStats.swift` were in: two ported
+files cannot compile without a donor type that lives in an unported file. Extracted verbatim
+(same "Extracted verbatim" header convention as those two) into its own file rather than ported
+inline into either normalizer, since both consume it. Its `segments` field is typed
+`[SpeechSegment]`, this fork's existing `VoiceInk/Features/Meetings/Models/SpeechSegment.swift`
+(the shared foundation type both normalizers otherwise already resolve to via same-target
+visibility, no import needed) — not a second, redundant declaration.
+
+Both normalizer files keep the donor's `import FluidAudio`, even though neither file calls a
+FluidAudio symbol directly (`SpeechTranscriptionResult` is donor-app-local, not part of the
+FluidAudio package) — same as the existing precedent in this cluster
+(`TranscriptFormatter.swift`, `TranscriptReconciler.swift`, both keep the same apparently-unused
+import). FluidAudio is already a fork dependency (used extensively elsewhere), so the import is
+inert, not a new touchpoint.
+
+### Test-coverage gap (closed) — `MicTurnNormalizerMergeTests.swift`
+
+The donor's own test suite exercises `isFragmented` and the `sentenceSplit` proportional-timing
+interpolation directly, but never exercises `mergeAdjacentSegments` producing an actual merge:
+every donor test either has segments that don't merge (`preservesPhraseLikeTimings`, gap 0.6s >
+the 0.35s cap, neither segment short) or is fragmented before `mergeAdjacentSegments` is ever
+reached (`collapsesFragmentedShards`, `fragmentedShardsMultiSentence`). No donor test asserted two
+segments actually collapsing into one via the 0.35s gap or the 1.5s short-side cap. Left
+unfilled at first per that task's instructions — flagged instead of speculatively filled.
+
+Independent review of PR #10 agreed this gap should be closed even though it wasn't blocking
+("the merge branch is currently the one path unconstrained by the suite"), so a fix round added
+`Tests/VoiceInkTests/Features/Meetings/Transcription/MicTurnNormalizerMergeTests.swift` — a new
+fork-authored test file (not a port; every expected value hand-derived from the ported algorithm,
+not from running the code first). Pins: the 0.35s gap threshold from both sides, the 1.5s
+short-side cap from both sides (both the segment-short and previous-short branches of
+`shouldMerge` independently), and a pair of tests proving the merge tier uses the segments' own
+real timing rather than falling back to a whole-chunk sentence split — the case a "universal
+sentence-split stub" would fail. All 7 new tests passed against the ported code on first write,
+no code changes needed.

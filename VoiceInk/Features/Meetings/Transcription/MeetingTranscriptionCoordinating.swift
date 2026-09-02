@@ -11,18 +11,14 @@
 // compiles, runs, and records real audio end-to-end today, with transcription always empty.
 // Swapping the stub for Stage 2c's real actor requires no change to `MeetingEngine` itself, only
 // to whatever constructs it.
+//
+// `SpeechTranscriptionResult` (the return type below) lives in its own file,
+// `Transcription/SpeechTranscriptionResult.swift`, landed independently by PR #10
+// (`turn-normalizers`) while this port was in flight -- merged from `phase-1-integration`
+// rather than redeclared here.
 
 import FluidAudio
 import Foundation
-
-/// One backend's transcription of one chunk/file. Fork-local re-declaration of the donor's
-/// `SpeechTranscriptionResult` (`TranscriptionRuntime.swift:11-14`) -- same two-field shape, not
-/// copied text (the donor type lived in a module this fork does not have), so it carries no MIT
-/// attribution header. Consumed by `MicTurnNormalizer`/`SystemTurnNormalizer`.
-struct SpeechTranscriptionResult: Sendable {
-    let text: String
-    let segments: [SpeechSegment]
-}
 
 /// The transcription seam `MeetingEngine` is built against.
 ///

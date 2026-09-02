@@ -1,6 +1,31 @@
-// Ported verbatim from Muesli-HQ/muesli (native/MuesliNative/Tests/MuesliTests/MicTurnNormalizerTests.swift).
-// `SpeechTranscriptionResult`/`SpeechSegment` resolve to this fork's own declarations; no other
-// change.
+// Ported verbatim from Muesli-HQ/muesli
+// (native/MuesliNative/Tests/MuesliTests/MicTurnNormalizerTests.swift).
+// Import lines changed: `@testable import MuesliNativeApp` -> `@testable import VoiceInk`
+// (this fork's module name). No other change.
+//
+// MIT License
+//
+// Copyright (c) 2026 Pranav Hari
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+//
+// See NOTICE for full attribution.
 
 import FluidAudio
 import Testing

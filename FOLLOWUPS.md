@@ -431,3 +431,35 @@ Also worth stating: the check is only as good as the closure a composition root 
 is deliberately no default (a negative control asserts that omitting it does not compile), so
 choosing what "dictation is busy" means is a decision someone has to make explicitly.
 
+## B4.2's dictation-priority admission is FluidAudio-only, and transcribe.cpp's exposure is different and unverified
+
+Source: `VoiceInk/Features/Meetings/Transcription/FluidAudioMeetingSegmentTranscriber.swift`
+(admission control) versus `TranscribeCppMeetingSegmentTranscriber.swift` (no admission control).
+Noticed while fixing B4.2; not raised by review, and deliberately NOT "fixed" here, because the
+transcribe-cpp borrow path was reviewed and accepted and changing it would be scope I was not
+given.
+
+The two seams share a model in genuinely different ways, so B4.2's hazard does not transfer:
+
+- **FluidAudio:** `AsrManager` is a `public actor`, so meeting and dictation inference are
+  mutually serialized and a dictation started after a meeting chunk QUEUES behind it. That is the
+  latency defect B4.2 fixes with admission control.
+- **transcribe.cpp:** `OfflineTranscribeCppService.transcribe` holds no lock across inference. It
+  calls `nativeModel.session()` per chunk and runs that session; `Model.session()`
+  (`Transcribe-cpp-swift/Sources/TranscribeCpp/Model.swift:43`) creates a FRESH native session
+  from the shared model pointer on each call. So a meeting and a dictation do not queue behind
+  each other there; they run concurrently.
+
+**What is therefore unverified, and belongs with the real-model smoke tests above:** whether
+running two concurrent sessions against one shared `Model` is thread-safe in this build of
+transcribe.cpp, and what the CPU and memory cost of doing so is on a 16GB M2 Pro. The one-model
+many-sessions API shape is consistent with concurrent use being intended, and the meeting seam
+uses exactly the same `session()`-per-chunk pattern dictation already uses, so this introduces no
+new pattern -- but "the API looks designed for it" is not evidence, and nothing in this
+environment can produce evidence without the real GGUF model present.
+
+**Decide when that smoke test runs:** if concurrent sessions turn out to be unsafe or expensive,
+the fix is the same admission-control shape B4.2 already establishes, applied to
+`TranscribeCppMeetingSegmentTranscriber`. If they are fine, transcribe.cpp is simply the better
+sharing model of the two and no change is needed.
+

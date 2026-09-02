@@ -214,6 +214,25 @@ object for a caller to inspect. `pause()`/`resume()`'s `updateState` calls were 
 for that fix and remain exactly as open as before -- **still worth closing the same way**
 before Phase 2, ideally reusing the same retry-then-report shape rather than re-deriving it.
 
+## Repeated `discard()` calls can start overlapping `markFailed` retry loops
+
+Source: `VoiceInk/Features/Meetings/Workflows/MeetingEngine.swift` (`markMeetingFailedAfterDiscard`).
+Raised as a non-blocking note by cross-vendor review of PR #13 (the round that closed `discard()`'s
+silent `try? markFailed` gap), and accepted rather than fixed there.
+
+`discard()` has no one-shot guard, so calling it more than once can start more than one unstructured
+retry `Task` against the same meeting row. This is not new behaviour introduced by the retry: before
+PR #13 the same repeated calls produced overlapping *single* attempts. What the bounded retry changes
+is the amplitude, not the shape: three attempts per call instead of one, so concurrent loops generate
+more `markFailed` traffic and can emit duplicate final stderr lines for one logical failure.
+
+Not a correctness defect: `markFailed` is idempotent in intent (it drives the row to `.failed`), so
+overlapping loops converge on the same terminal state rather than fighting. The cost is noise and
+wasted work, not a wrong row.
+
+**Fix when `discard()` next gets touched:** give it a one-shot guard so a second call is a no-op
+rather than a second retry loop. Cheap to do at that point; not worth its own round now.
+
 ## Known limitations to validate
 
 ### DTLN AEC delay estimator: fixed 0–800ms candidate grid, no clock-skew compensation

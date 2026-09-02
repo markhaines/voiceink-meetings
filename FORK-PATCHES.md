@@ -2350,3 +2350,147 @@ recorded here for a future round, not fixed now.
 No upstream file touched, no SPM dependency added. Files changed:
 `MeetingChunkCollector.swift`, `MeetingEngine.swift`, `MeetingChunkCollectorTests.swift`,
 `MeetingEngineTests.swift`.
+
+## meeting-engine third review round (PR #12): the failure half of the drain invariant, and the test seam
+
+Second-round review confirmed the completion half was genuinely closed (persistence folded into
+the same `Task` the collector tracks and awaits, no double-write reachable on any interleaving)
+and re-passed F1, F2 and F4 unchanged. It then blocked on four things, all in that same code
+path. None of them is a redesign; the design below builds on the second round's, it does not
+replace it.
+
+### 1. The failure half was still open: a watcher-retired failure reached only stderr
+
+`MeetingChunkCollector.retire(id:segments:)` took the segments and nothing else. So on the
+watcher-wins side of the race -- the chunk's own watcher Task reaches `await task.value` first
+and retires the chunk before `stop()` closes the collector -- the `Outcome`'s
+`persistenceFailures` were dropped at that exact moment. `closeAndDrainSortedSegments()` later
+returned the segments out of `completedSegments` with no failures attached, so
+`MeetingEngineResult.persistenceFailures` said the meeting persisted cleanly while the
+transcript contained a chunk that had never reached disk. Completion was guaranteed; reporting
+was not. The drain-wins side already reported correctly (`await task.value` carries the
+failures), which is exactly why the gap was easy to miss.
+
+**Fix:** `retire(id:segments:persistenceFailures:)`. Failures are stored in a
+`completedPersistenceFailures` bucket beside the segments they belong to, and
+`closeAndDrainSortedSegments()` returns them with the segments it hands back. The watcher's
+stderr log is unchanged and still fires: it remains the only report a mid-meeting failure gets
+at the time it happens, when no `stop()` result object exists yet. This is not a second
+mid-meeting reporting channel; it is the same failure staying attached to its segment until
+someone drains it.
+
+**Reported exactly once, structurally, with no timing dependence.** `retire` and the drain's own
+critical section take the SAME lock, so one runs first and the other observes it: if `retire`
+wins, the task is gone from `pendingTasks` before the drain snapshots it and the failures travel
+in `completedPersistenceFailures`; if the drain wins, `isClosed` is already set, `retire` returns
+`false` having stored nothing, and the failures travel via `await task.value`. Never both, never
+neither. Deliberately there is NO code anywhere that tries to work out whether a given retirement
+was "racing `stop()`" or not: any such test would be a race-detection heuristic, and heuristics
+of that shape are what defeated the two previous rounds.
+
+**Scope, stated plainly rather than assumed.** The brief scoped in "persistence outstanding or
+completing around the time `stop()` runs" and scoped out building mid-meeting failure reporting.
+Holding a failure until the drain means a chunk that failed at minute 40 also lands in
+`persistenceFailures` at minute 90. That is a deliberate, disclosed consequence, taken because
+the invariant the brief set is stated over the segments the drain RETURNS -- "for every segment
+in its returned array... any failure from that attempt is reachable by `stop()`" -- and a
+minute-40 chunk's segments are in that array. The alternative, suppressing old failures, would
+require exactly the racing/not-racing heuristic ruled out above. No new push channel was added:
+nothing reports mid-meeting that did not report mid-meeting before.
+
+### 2. The engine's test seam was reachable from production -- removed, not narrowed
+
+`MeetingEngine.init`'s `persistenceGateForTesting: (@Sendable ([SpeechSegment],
+MeetingSegmentChannel) async -> Void)?` had a `private` stored property but a MODULE-INTERNAL
+initialiser parameter accepting an arbitrary non-returning async closure, so any caller inside
+the app target could suspend persistence -- and `stop()` -- indefinitely, through a hook with no
+production purpose whatsoever.
+
+**It is gone.** `MeetingEngine` now names its persistence dependency by protocol
+(`MeetingPersisting`, new fork-only file) instead of by concrete `MeetingStore`, which conforms
+with no change to `MeetingStore.swift` at all -- its isolation guarantee, its negative controls
+and its file are untouched. Every production call site keeps passing a real `MeetingStore`. Test
+suspension and test failure injection now come from a double in the test target
+(`RacingChunkPersistence`), so the engine carries no test-only parameter.
+
+**What a production caller inside the module can and cannot do with what replaced it.** It can
+pass a hostile conforming persistence implementation and make persistence hang or fail. That
+residual is inherent to dependency injection and is the SAME one the engine already carries for
+its three other injected dependencies -- a hostile `MeetingTranscriptionCoordinating` hangs
+`stop()` just as effectively. What it can no longer do is wedge the engine open through a
+parameter that exists for nothing else: suspending persistence now costs a whole alternative
+persistence implementation, and every caller must supply something here regardless, so the
+injection point reads as a dependency rather than a hidden hook.
+
+`#if DEBUG` was considered and rejected: the test bundle links the app target built in the same
+configuration a developer runs the app in, so a Debug-only seam is present in exactly the build
+the next integrator writes code against. This project has already learned that once.
+
+### 3 and 4. Tests that pin the behaviour, and a race built by signal rather than by sleep
+
+The previous round's engine test asserted waiting and successful storage only -- never a racing
+persistence FAILURE reaching `MeetingEngineResult.persistenceFailures` -- and constructed its
+race with a 100ms `Task.sleep`, which under pre-fix scheduling lets the OLD drain path reach the
+gate too, so it passed either way. Both are fixed:
+
+- **`MeetingEngineTests.stopSurfacesPersistenceFailureOfAlreadyRetiredChunk`** (new) pins the
+  watcher-wins side, the side item 1 above left open. Deterministic with no sleep and no gate:
+  `onChunkTranscribed` is fired by the watcher only AFTER its `retire` call has already
+  succeeded, so waiting on it before calling `stop()` does not make the watcher-wins
+  interleaving likely, it makes the drain-wins one impossible.
+- **`MeetingEngineTests.stopAwaitsRacingChunkPersistenceAndSurfacesItsFailure`** (replaces
+  `stopAwaitsRacingChunkPersistenceBeforeReturning`) pins the drain-wins side and now asserts
+  BOTH halves: `stop()` does not return while that chunk's persistence is outstanding, AND the
+  failure reaches `persistenceFailures`. The race is constructed by awaiting `enteredGate`, a
+  signal the persistence double opens the instant the targeted `appendSegment` is reached, so
+  the chunk's persistence is provably suspended and its task provably still pending before
+  `stop()` is called. The one remaining `Task.sleep` is an OBSERVATION window ("has `stop()`
+  returned yet?"), not part of constructing the race, and an `EventLog` ordering assertion
+  checks the same fact a second way without it.
+- **`MeetingChunkCollectorTests`** gains `drainSurfacesPersistenceFailuresFromRetiredTask`
+  (watcher-wins at the unit level, fully deterministic -- the task is awaited and retired
+  explicitly before the drain is ever called), plus `retiredFailureIsReportedExactlyOnce` and
+  `secondDrainReportsNothingTwice` for the exclusivity and clearing properties.
+
+**Proof, not assertion: each new/changed test demonstrated failing first.** Two temporary,
+targeted reverts were applied, built and run, then restored.
+
+*Revert A -- `retire` drops the failures (item 1's exact pre-fix behaviour, API unchanged so the
+tests still compile):*
+
+```
+Expectation failed: (drained.persistenceFailures.count → 0) == 1
+Expectation failed: (drained.persistenceFailures.first → nil) is (StubError → Optional<Error>)
+    -- MeetingChunkCollectorTests/drainSurfacesPersistenceFailuresFromRetiredTask()
+Expectation failed: (drained.persistenceFailures.count → 0) == 1
+    -- MeetingChunkCollectorTests/retiredFailureIsReportedExactlyOnce()
+Expectation failed: (first.persistenceFailures.count → 0) == 1
+    -- MeetingChunkCollectorTests/secondDrainReportsNothingTwice()
+Expectation failed: result.persistenceFailures.contains { ($0 as? StubPersistenceError)?.text == "retired before stop" }: a chunk retired before stop() lost its persistence failure: the transcript reports it, the store does not have it, and the result says the meeting persisted cleanly
+    -- MeetingEngineTests/stopSurfacesPersistenceFailureOfAlreadyRetiredChunk()
+```
+
+*Revert B -- persistence moved back out of the tracked `Task` and into the watcher after
+`retire`, the shape the second round fixed, to check the rebuilt drain-wins test still catches
+it now that its race is built from a signal rather than a sleep:*
+
+```
+Expectation failed: !(completedWhileGated → <not evaluated>): stop() returned while the racing chunk's persistence was still gated shut
+Expectation failed: await log.events == ["gateOpened", "stopReturned"]
+Expectation failed: result.persistenceFailures.contains { ($0 as? StubPersistenceError)?.text == "gated racing chunk" }
+    -- MeetingEngineTests/stopAwaitsRacingChunkPersistenceAndSurfacesItsFailure()
+```
+
+Revert B also fails `stopPersistsChunkStillInFlightAtCallTime` and
+`stopSurfacesPersistenceFailureOfAlreadyRetiredChunk`, for the same reason the second round
+recorded: all three properties live in one restructured code path, so a revert deep enough to
+demonstrate one necessarily demonstrates the others.
+
+**Disclosed, NOT fixed here (explicitly out of scope, and confirmed accurate by review):**
+`discard()`'s `try? await persistence.markFailed(...)` can leave a meeting row in
+`.recording`/`.paused`. Recorded in `FOLLOWUPS.md` with the recommendation to fix that whole
+path (`pause`/`resume`/`discard`) before Phase 2, rather than one call at a time.
+
+No upstream file touched, no SPM dependency added. Files changed: `MeetingChunkCollector.swift`,
+`MeetingEngine.swift`, `MeetingPersisting.swift` (new, fork-only), `MeetingChunkCollectorTests
+.swift`, `MeetingEngineTests.swift`, `FOLLOWUPS.md`.

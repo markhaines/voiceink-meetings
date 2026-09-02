@@ -108,6 +108,24 @@ Known limitations and handover items surfaced during review, deliberately not fi
 the change that found them. Not a task tracker — just a record so they aren't rediscovered from
 scratch later.
 
+## `discard()` can leave a meeting row stuck in `.recording`/`.paused`
+
+Source: `VoiceInk/Features/Meetings/Workflows/MeetingEngine.swift`, `discard()`'s
+`Task { try? await persistence.markFailed(meetingHandle) }`. The `try?` discards
+`markFailed`'s error exactly the way the pre-F3 code discarded every other persistence error.
+If that one write fails, the row keeps whatever state it held when `discard()` ran
+(`.recording` or `.paused`) instead of moving to `.failed`, so a later reader -- meeting
+history, a support investigation -- sees an apparently-abandoned in-progress meeting with no
+signal that it was in fact a deliberate, handled discard.
+
+Confirmed accurate by cross-vendor review of the F3 fix rounds, and deliberately NOT fixed
+there: `discard()` is not `async` and has no result object, so surfacing this needs a decision
+about what channel it reports on (a callback, a stored last-error, a retry), which is a design
+question rather than a mechanical fix, and it sits on the same unscoped path as
+`pause()`/`resume()`'s own `updateState` calls. The same review's recommendation stands:
+**fix before Phase 2**, and fix that whole path (`pause`/`resume`/`discard`) together rather
+than one call at a time.
+
 ## Known limitations to validate
 
 ### DTLN AEC delay estimator: fixed 0–800ms candidate grid, no clock-skew compensation

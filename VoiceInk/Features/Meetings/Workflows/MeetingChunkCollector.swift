@@ -7,9 +7,13 @@
 // (segments PLUS the persistence attempt's failures), not bare `[SpeechSegment]`. The donor has
 // no per-chunk persistence layer at all, so it never had anything to track here beyond
 // transcription. This fork's persistence is folded into the SAME `Task` the collector tracks
-// (see `add(_:)`/`retire(id:segments:)`), specifically so that `retire` succeeding is a
-// genuine guarantee that persistence for that chunk already ran to completion -- not merely
-// that persistence was *about* to be attempted by some other, unsynchronized caller. See
+// (see `add(_:)`/`retire(id:segments:persistenceFailures:)`), specifically so that `retire`
+// succeeding is a genuine guarantee that persistence for that chunk already ran to completion
+// -- not merely that persistence was *about* to be attempted by some other, unsynchronized
+// caller -- and so that `retire` carries the OUTCOME of that persistence, not just its
+// segments: a retirement that dropped the failures on the floor left the drain returning
+// segments whose persistence failures it could no longer report, the same defect one step
+// further along. See
 // `closeAndDrainSortedSegments()`'s doc comment and `MeetingEngine.swift`'s `stop()` for why
 // that distinction is load-bearing: an earlier version of this file called `retire` BEFORE its
 // caller persisted, which let `stop()` observe a chunk as "already completed" (and so skip
@@ -74,6 +78,10 @@ final class MeetingChunkCollector {
         // accumulate for the full meeting duration.
         var pendingTasks: [PendingTask] = []
         var completedSegments: [SpeechSegment] = []
+        // The persistence failures of retired tasks, held alongside their segments for exactly
+        // as long as those segments are held, so a drain returns BOTH halves of what it hands
+        // back. See `retire(id:segments:persistenceFailures:)`.
+        var completedPersistenceFailures: [Error] = []
         var isClosed = false
     }
 
@@ -92,31 +100,63 @@ final class MeetingChunkCollector {
         return (registered, id)
     }
 
-    /// Move a completed task's segments into the collector and drop the Task reference. Must
-    /// be called from the watcher Task AFTER awaiting the task's value -- which, because
-    /// persistence is bundled into that same value (`Outcome`), means AFTER persistence for
-    /// `segments` has already run to completion. `persistenceFailures` from that same
-    /// `Outcome` are the watcher's own responsibility to report (it has no result object to
-    /// report into mid-meeting, so it logs); this method only tracks segments, matching its
-    /// pre-existing scope.
-    func retire(id: UUID, segments: [SpeechSegment]) -> Bool {
+    /// Move a completed task's segments AND that task's persistence failures into the
+    /// collector, dropping the Task reference. Must be called from the watcher Task AFTER
+    /// awaiting the task's value -- which, because persistence is bundled into that same value
+    /// (`Outcome`), means AFTER persistence for `segments` has already run to completion.
+    ///
+    /// `persistenceFailures` is taken here, not left to the watcher alone, because leaving it
+    /// to the watcher alone was the open half of this file's invariant. The watcher still logs
+    /// them (that is the right and only reporting channel at minute 40, when no `stop()` is in
+    /// sight and there is no result object to report into) -- but a segment and the outcome of
+    /// persisting it must not part company at the moment they are retired, or the drain hands
+    /// back a segment whose failure it can no longer see. Concretely: watcher retires with a
+    /// failure -> drain returns the segment from `completedSegments` -> the failure reached
+    /// stderr and nothing else, while `MeetingEngineResult.persistenceFailures` said the
+    /// meeting persisted cleanly. Holding the failure next to its segment costs one array and
+    /// removes that asymmetry outright, with no timing dependence and nothing to get wrong:
+    /// there is no attempt anywhere in this type to work out whether a given retirement was
+    /// "racing `stop()`" or not, because any such test would be a race-detection heuristic and
+    /// this file has already been defeated twice by reasoning of that shape.
+    ///
+    /// Reported exactly once, structurally. `retire` and `closeAndDrainSortedSegments()`'s own
+    /// critical section take the SAME lock, so one of them runs first and the other sees its
+    /// effect: if `retire` wins, the task is gone from `pendingTasks` before the drain
+    /// snapshots it, and the failures travel in `completedPersistenceFailures`; if the drain
+    /// wins, `isClosed` is already set, this returns `false` having stored nothing, and the
+    /// failures travel via `await task.value` instead. Never both, never neither.
+    func retire(id: UUID, segments: [SpeechSegment], persistenceFailures: [Error]) -> Bool {
         lock.withLock { state in
             guard !state.isClosed else { return false }
             state.completedSegments.append(contentsOf: segments)
+            state.completedPersistenceFailures.append(contentsOf: persistenceFailures)
             state.pendingTasks.removeAll { $0.id == id }
             return true
         }
     }
 
     /// Closes the collector, drains it, and returns every collected segment sorted by start,
-    /// plus the persistence failures of whichever chunks this call itself had to wait out.
+    /// plus the persistence failures of every one of those segments.
+    ///
+    /// THE INVARIANT, in full: for every segment in the returned array, that segment's
+    /// persistence attempt has run to completion, and any failure from that attempt is in the
+    /// returned `persistenceFailures`. Both halves, for both sides of the race, with no gap
+    /// between them.
     ///
     /// For a task already `retire`d before this ran: its persistence already completed before
-    /// `retire` succeeded (see this file's header), so nothing further to await or report --
-    /// its failures, if any, were already the watcher's to log, same as any other mid-meeting
-    /// chunk. This method does not revisit them; doing so would mean reporting old, already-
-    /// logged mid-meeting failures through a result object that exists to report exactly the
-    /// segments THIS call had to drain, not the whole meeting's persistence history.
+    /// `retire` succeeded (see this file's header), and its failures were stored beside its
+    /// segments by that same `retire` call, so they are returned from `completedPersistence
+    /// Failures` here. An earlier revision deliberately did NOT return these, arguing they were
+    /// "old, already-logged mid-meeting failures" that a drain result had no business
+    /// revisiting. Review rejected that, correctly: the argument is about WHEN the failure
+    /// happened, but the result object's contract is about WHICH SEGMENTS it is handing back --
+    /// and it is handing this one back. A drain that returns a segment while withholding the
+    /// reason it never reached disk reports a clean meeting for a transcript that is only
+    /// partly persisted, which is the entire failure mode this type exists to prevent. The
+    /// watcher's stderr log stays exactly as it was (unchanged, and still the only report a
+    /// mid-meeting failure gets at the time it happens); this is not a second mid-meeting
+    /// reporting channel, it is the same failure staying attached to its segment until someone
+    /// drains it.
     ///
     /// For a task NOT yet `retire`d when this ran (still in `pendingTasks`): its own watcher
     /// Task is concurrently racing to reach the same `await task.value` and then call `retire`,
@@ -129,17 +169,19 @@ final class MeetingChunkCollector {
     /// watcher's stderr log (which still fires too, redundantly but harmlessly, for whichever
     /// side loses the `retire` race).
     func closeAndDrainSortedSegments() async -> (segments: [SpeechSegment], persistenceFailures: [Error]) {
-        let (tasksToAwait, alreadyCompleted) = lock.withLock { state in
+        let (tasksToAwait, alreadyCompleted, alreadyCompletedFailures) = lock.withLock { state in
             state.isClosed = true
             let tasks = state.pendingTasks.map { $0.task }
             let completed = state.completedSegments
+            let completedFailures = state.completedPersistenceFailures
             state.pendingTasks.removeAll()
             state.completedSegments.removeAll()
-            return (tasks, completed)
+            state.completedPersistenceFailures.removeAll()
+            return (tasks, completed, completedFailures)
         }
 
         var segments = alreadyCompleted
-        var persistenceFailures: [Error] = []
+        var persistenceFailures = alreadyCompletedFailures
         for task in tasksToAwait {
             let outcome = await task.value
             segments.append(contentsOf: outcome.segments)
@@ -172,6 +214,11 @@ final class MeetingChunkCollector {
             let tasks = state.pendingTasks.map { $0.task }
             state.pendingTasks.removeAll()
             state.completedSegments.removeAll()
+            // Discarded with the segments they belong to: `cancelAll` is the discard path
+            // (`MeetingEngine.discard()`), where the caller has said it wants none of this
+            // meeting's output. Keeping failures for a transcript nobody will read would be
+            // reporting on a meeting that no longer exists.
+            state.completedPersistenceFailures.removeAll()
             return tasks
         }
         tasksToCancel.forEach { $0.cancel() }

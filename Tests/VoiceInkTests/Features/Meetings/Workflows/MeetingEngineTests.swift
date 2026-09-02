@@ -239,6 +239,131 @@ private actor Gate {
     }
 }
 
+/// Returns `micText` for the FIRST mic chunk only; every later mic chunk transcribes to empty
+/// text (which `transcribeMicChunk` turns into zero segments). That keeps the racing chunk the
+/// ONLY chunk carrying the text the persistence fixture below targets, so `stop()`'s own
+/// final-chunk persist call can never be mistaken for the racing one -- the difference between
+/// proving the collector-drain path waits out and reports the racing chunk, and proving only
+/// that *some* persist call blocked `stop()`.
+private struct SingleMicChunkTranscriptionCoordinator: MeetingTranscriptionCoordinating {
+    let micText: String
+    private let calls = CallCounter()
+
+    func getVadManager() async -> VadManager? { nil }
+
+    func transcribeMeetingChunk(at url: URL) async throws -> SpeechTranscriptionResult {
+        guard url.deletingLastPathComponent().lastPathComponent == MeetingRuntimePaths.micChunkDirectoryName else {
+            return SpeechTranscriptionResult(text: "", segments: [])
+        }
+        let isFirst = await calls.claimFirst()
+        return SpeechTranscriptionResult(text: isFirst ? micText : "", segments: [])
+    }
+
+    func transcribeMeeting(at url: URL) async throws -> SpeechTranscriptionResult {
+        SpeechTranscriptionResult(text: "", segments: [])
+    }
+
+    func diarizeSystemAudio(at url: URL) async throws -> DiarizationResult? { nil }
+}
+
+private actor CallCounter {
+    private var claimed = false
+
+    func claimFirst() -> Bool {
+        guard !claimed else { return false }
+        claimed = true
+        return true
+    }
+}
+
+/// The error `RacingChunkPersistence` throws, carrying the segment text it refused so a test can
+/// assert it was THAT chunk's failure that surfaced, not any failure at all.
+private struct StubPersistenceError: Error {
+    let text: String
+}
+
+/// A `MeetingPersisting` that behaves exactly like the real `MeetingStore` it wraps, except that
+/// `appendSegment` for one chosen segment text optionally suspends and then always throws.
+///
+/// This is what replaced `MeetingEngine.init`'s `persistenceGateForTesting` closure, which
+/// review rejected: that parameter was module-internal and took an arbitrary non-returning async
+/// closure, so production code inside the app target could suspend persistence -- and `stop()`
+/// -- indefinitely through a hook with no production purpose. The engine now names its
+/// persistence dependency by protocol (`MeetingPersisting`), so this fixture is an ordinary
+/// injected test double living in the test target, and the engine has no test-only parameter at
+/// all. See `MeetingPersisting.swift`'s header.
+///
+/// It wraps a real `MeetingStore` rather than reimplementing one so every call the test is not
+/// interested in still hits real SwiftData and the on-disk assertions stay meaningful.
+private struct RacingChunkPersistence: MeetingPersisting {
+    let store: MeetingStore
+    /// The one segment text whose persistence is gated and failed.
+    let failingSegmentText: String
+    /// Opened by this fixture the moment the targeted `appendSegment` is reached. This is the
+    /// "gate entered" signal a test waits on to construct the race deterministically, instead of
+    /// sleeping and hoping: a sleep lets the pre-fix code reach the gate too, so a sleep-built
+    /// race proves nothing about which interleaving actually ran.
+    let enteredGate: Gate?
+    /// Awaited before the targeted `appendSegment` throws, so a test controls exactly how long
+    /// that persistence attempt stays outstanding. `nil` fails immediately, with no suspension.
+    let releaseGate: Gate?
+
+    @discardableResult
+    func startMeeting(title: String, audioDirectoryPath: String, startDate: Date) async throws -> MeetingHandle {
+        try await store.startMeeting(title: title, audioDirectoryPath: audioDirectoryPath, startDate: startDate)
+    }
+
+    @discardableResult
+    func appendSegment(
+        startOffset: TimeInterval,
+        endOffset: TimeInterval,
+        speakerLabel: String,
+        text: String,
+        sourceChannel: MeetingSegmentChannel,
+        to meeting: MeetingHandle
+    ) async throws -> MeetingSegmentHandle {
+        guard text == failingSegmentText else {
+            return try await store.appendSegment(
+                startOffset: startOffset,
+                endOffset: endOffset,
+                speakerLabel: speakerLabel,
+                text: text,
+                sourceChannel: sourceChannel,
+                to: meeting
+            )
+        }
+        await enteredGate?.open()
+        await releaseGate?.wait()
+        throw StubPersistenceError(text: text)
+    }
+
+    func updateDuration(_ duration: TimeInterval, for meeting: MeetingHandle) async throws {
+        try await store.updateDuration(duration, for: meeting)
+    }
+
+    func updateState(_ state: MeetingState, for meeting: MeetingHandle) async throws {
+        try await store.updateState(state, for: meeting)
+    }
+
+    func finish(_ meeting: MeetingHandle, endDate: Date) async throws {
+        try await store.finish(meeting, endDate: endDate)
+    }
+
+    func markFailed(_ meeting: MeetingHandle) async throws {
+        try await store.markFailed(meeting)
+    }
+}
+
+/// Ordered record of what happened, so "stop() did not return early" is checked as an ORDERING
+/// fact after the run rather than only as a snapshot taken during it.
+private actor EventLog {
+    private(set) var events: [String] = []
+
+    func record(_ event: String) {
+        events.append(event)
+    }
+}
+
 /// Lets a test observe "has `engine.stop()` returned yet?" from outside, without consuming
 /// its result via `Task.value` (which would itself suspend until completion, defeating the
 /// point of checking whether it has completed).
@@ -512,67 +637,141 @@ struct MeetingEngineTests {
     /// failed silently to stderr. "Retired" meant "persistence is ABOUT to be attempted," not
     /// "persistence completed," and the collector's drain could not tell the difference.
     ///
-    /// `persistenceGateForTesting` (test-only seam on `MeetingEngine.init`) suspends exactly
-    /// the racing chunk's `persistSegments` call at a chosen moment via `Gate`, so this test
-    /// constructs the interleaving deliberately rather than hoping a timing window lines up.
-    /// Transcription itself is fast (plain `FakeTranscriptionCoordinator`, no delay) -- the
-    /// gate, not transcription timing, is what controls the race.
-    @Test("stop() does not return before a racing chunk's persistence attempt finishes")
-    func stopAwaitsRacingChunkPersistenceBeforeReturning() async throws {
+    /// This test now pins BOTH halves of that invariant on the drain-wins side of the race:
+    /// `stop()` does not return while the racing chunk's persistence is outstanding, AND when
+    /// that persistence fails, the failure reaches `MeetingEngineResult.persistenceFailures`
+    /// rather than only stderr. A previous revision asserted the first half only, which left
+    /// the second free to regress unnoticed.
+    ///
+    /// DETERMINISTIC BY CONSTRUCTION, not by sleeping. The race is built by waiting on
+    /// `enteredGate` -- a signal `RacingChunkPersistence` opens the instant the racing chunk's
+    /// `appendSegment` is reached -- so the chunk's persistence is provably suspended, and its
+    /// task provably still pending, before `stop()` is ever called. An earlier revision slept
+    /// 100ms here instead, which review correctly rejected: under pre-fix scheduling the old
+    /// drain path could reach the gate itself within that window, so the test passed either way
+    /// and proved nothing about which interleaving ran. The one remaining `Task.sleep` below is
+    /// an OBSERVATION window ("has stop() returned yet?"), not part of constructing the race,
+    /// and the `EventLog` ordering assertion checks the same fact a second way without it.
+    @Test("stop() waits out a racing chunk's persistence and reports its failure")
+    func stopAwaitsRacingChunkPersistenceAndSurfacesItsFailure() async throws {
         let container = try makeContainer()
-        let store = MeetingStore(modelContainer: container)
         let mic = FakeMeetingMicRecorder()
         let system = FakeSystemAudioRecorder()
-        let coordinator = FakeTranscriptionCoordinator(micText: "gated racing chunk")
-        let gate = Gate()
+        let enteredGate = Gate()
+        let releaseGate = Gate()
+        let persistence = RacingChunkPersistence(
+            store: MeetingStore(modelContainer: container),
+            failingSegmentText: "gated racing chunk",
+            enteredGate: enteredGate,
+            releaseGate: releaseGate
+        )
         let engine = MeetingEngine(
             title: "GatedRace",
-            persistence: store,
-            transcriptionCoordinator: coordinator,
+            persistence: persistence,
+            transcriptionCoordinator: SingleMicChunkTranscriptionCoordinator(micText: "gated racing chunk"),
             retainRecording: false,
             meetingMicRecorder: mic,
-            systemAudioRecorderOverride: system,
-            persistenceGateForTesting: { segments, _ in
-                // Gate ONLY the racing chunk's own persist call. stop()'s final-chunk persist
-                // call (empty segments -- nothing more was fed after pause()) must sail
-                // through, or this test would just prove *some* gated call blocks stop(), not
-                // that the collector-drain path specifically waits out the racing chunk.
-                guard segments.contains(where: { $0.text == "gated racing chunk" }) else { return }
-                await gate.wait()
-            }
+            systemAudioRecorderOverride: system
         )
 
         try await engine.start()
         mic.onRawPCMSamples?(fakeAudioSamples())
 
-        // Rotates the mic chunk; its watcher Task will reach persistSegments and suspend on
-        // the gate shortly after (transcription is fast/synchronous here).
+        // Rotates the mic chunk and registers its task with the collector, synchronously.
         engine.pause()
-        // Bounded head start so the watcher reliably reaches the gate before stop() races it
-        // below. This only affects arrival order in THIS test's construction -- the property
-        // under test holds regardless of which of {watcher, stop()} gets there first, which is
-        // exactly why embedding persistence in the awaited task closes the race either way.
-        try await Task.sleep(for: .milliseconds(100))
+
+        // The race, imposed rather than raced for: this returns only once that chunk's
+        // persistence attempt is actually inside the gate, so the task CANNOT have completed
+        // and CANNOT have been retired when stop() closes the collector below.
+        await enteredGate.wait()
 
         let box = StopOutcomeBox()
+        let log = EventLog()
         let stopTask = Task {
             let result = try await engine.stop()
+            await log.record("stopReturned")
             await box.complete(result)
         }
 
-        // stop() must NOT have completed yet: the racing chunk's persistence is still
-        // suspended on the closed gate. This is the invariant itself -- stop() cannot return
-        // before every persistence attempt for a drained segment has finished.
+        // Observation window only (see this test's doc comment): stop() must NOT have returned
+        // while the racing chunk's persistence is still suspended.
         try await Task.sleep(for: .milliseconds(300))
         let completedWhileGated = await box.result != nil
         #expect(!completedWhileGated, "stop() returned while the racing chunk's persistence was still gated shut")
 
-        await gate.open()
+        await log.record("gateOpened")
+        await releaseGate.open()
         try await stopTask.value
         let result = try #require(await box.result)
 
+        // The same fact as the snapshot above, as an ordering: stop() cannot have returned
+        // before the gate was opened.
+        #expect(await log.events == ["gateOpened", "stopReturned"])
+
+        // Completion half: the segment is in the transcript.
         #expect(result.rawTranscript.contains("gated racing chunk"))
+        // Failure half: and the caller is told it never reached disk.
+        #expect(result.persistenceFailures.contains { ($0 as? StubPersistenceError)?.text == "gated racing chunk" })
         let segments = try fetchSegments(from: container)
-        #expect(segments.contains { $0.text == "gated racing chunk" && $0.sourceChannel == .mic })
+        #expect(!segments.contains { $0.text == "gated racing chunk" })
+    }
+
+    /// The OTHER side of that race, and the half two fix rounds left open: the chunk's own
+    /// watcher Task reaches `await task.value` FIRST and retires the chunk before `stop()`
+    /// closes the collector. Completion was already guaranteed on this side (persistence lives
+    /// inside the awaited task, so `retire` succeeding means it already ran). Failure reporting
+    /// was not: `retire` took only the segments, so the failure was dropped at that moment and
+    /// `closeAndDrainSortedSegments()` handed back a segment it could no longer report a
+    /// persistence failure for. The transcript said the meeting was complete, the result said
+    /// it persisted cleanly, and the only record otherwise was a line on stderr -- exactly the
+    /// silent partial loss this whole path exists to prevent.
+    ///
+    /// DETERMINISTIC BY CONSTRUCTION, with no sleep and no gate: `onChunkTranscribed` is fired
+    /// by the watcher only AFTER its `retire` call has already succeeded, so waiting on it
+    /// before calling `stop()` does not merely make the watcher-wins interleaving likely, it
+    /// makes the drain-wins one impossible.
+    @Test("stop() reports the persistence failure of a chunk its watcher retired first")
+    func stopSurfacesPersistenceFailureOfAlreadyRetiredChunk() async throws {
+        let container = try makeContainer()
+        let mic = FakeMeetingMicRecorder()
+        let system = FakeSystemAudioRecorder()
+        let persistence = RacingChunkPersistence(
+            store: MeetingStore(modelContainer: container),
+            failingSegmentText: "retired before stop",
+            enteredGate: nil,
+            releaseGate: nil
+        )
+        let engine = MeetingEngine(
+            title: "RetiredBeforeStop",
+            persistence: persistence,
+            transcriptionCoordinator: SingleMicChunkTranscriptionCoordinator(micText: "retired before stop"),
+            retainRecording: false,
+            meetingMicRecorder: mic,
+            systemAudioRecorderOverride: system
+        )
+
+        let retired = Gate()
+        engine.onChunkTranscribed = { segments, _ in
+            guard segments.contains(where: { $0.text == "retired before stop" }) else { return }
+            Task { await retired.open() }
+        }
+
+        try await engine.start()
+        mic.onRawPCMSamples?(fakeAudioSamples())
+        engine.pause()
+
+        // Fired only after the watcher's `retire` succeeded, so by the time stop() runs the
+        // chunk is already in the collector's completed bucket and its task is gone.
+        await retired.wait()
+
+        let result = try await engine.stop()
+
+        #expect(result.rawTranscript.contains("retired before stop"))
+        #expect(
+            result.persistenceFailures.contains { ($0 as? StubPersistenceError)?.text == "retired before stop" },
+            "a chunk retired before stop() lost its persistence failure: the transcript reports it, the store does not have it, and the result says the meeting persisted cleanly"
+        )
+        let segments = try fetchSegments(from: container)
+        #expect(!segments.contains { $0.text == "retired before stop" })
     }
 }

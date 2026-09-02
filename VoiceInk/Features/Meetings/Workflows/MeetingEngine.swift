@@ -143,11 +143,23 @@ struct MeetingEngineResult: Sendable {
     /// `rawTranscript` above may be more complete than what is actually on disk: the caller
     /// decides what to do with that (retry, warn the user, log for support), but it must not be
     /// silently ignored, which is the whole reason this exists -- see `persistSegments`'s doc
-    /// comment for why silent `try?` discard here was reviewed and rejected. Does NOT cover the
-    /// fire-and-forget mid-meeting rotation watchers' own persistence (those have no result
-    /// object to report into by the time they run; they log failures instead, see
-    /// `rotateChunkOnQueue`/`rotateSystemChunkOnQueue`), nor `pause()`/`resume()`/`discard()`'s
-    /// `updateState`/`markFailed` calls, which this finding did not scope in.
+    /// comment for why silent `try?` discard here was reviewed and rejected.
+    ///
+    /// COVERAGE, exactly. Every chunk whose segments appear in `rawTranscript` by way of a
+    /// collector drain reports its persistence failures here, on both sides of the race that
+    /// drain runs: the chunk still in flight when `stop()` closed the collector (awaited
+    /// directly), and the chunk its own watcher retired first (failures retired alongside the
+    /// segments -- `MeetingChunkCollector.retire(id:segments:persistenceFailures:)`). That
+    /// second case is the one this used to miss, and it is why the sentence that stood here --
+    /// "does NOT cover the fire-and-forget mid-meeting rotation watchers' own persistence" --
+    /// is gone: it described the reporting channel available at the MOMENT a mid-meeting chunk
+    /// fails (stderr, which is unchanged and still the only one then), but read as a statement
+    /// about this array it was simply a hole, and a segment could reach `rawTranscript` while
+    /// the reason it never reached disk reached nothing but a log line.
+    ///
+    /// Still NOT covered, deliberately: `pause()`/`resume()`/`discard()`'s own
+    /// `updateState`/`markFailed` calls, which no finding has scoped in -- see FOLLOWUPS.md's
+    /// entry on `discard()`.
     let persistenceFailures: [Error]
 }
 
@@ -159,7 +171,10 @@ final class MeetingEngine {
     private static let logger = Logger(subsystem: "com.hainesy.voiceinkmeetings", category: "MeetingEngine")
 
     private let title: String
-    private let persistence: MeetingStore
+    /// Named by protocol, not by concrete `MeetingStore` -- see `MeetingPersisting.swift`'s
+    /// header for why (it is what replaced the rejected `persistenceGateForTesting` seam).
+    /// Every production call site passes a real `MeetingStore`, which conforms unchanged.
+    private let persistence: any MeetingPersisting
     private let transcriptionCoordinator: MeetingTranscriptionCoordinating
     private let systemAudioRecorder: SystemAudioCapturing
     private let neuralAec = MeetingNeuralAec()
@@ -169,8 +184,6 @@ final class MeetingEngine {
     private var rawMicChunkRecorder: PCMChunkRecorder?
     private var systemChunkRecorder: PCMChunkRecorder?
     private let retainRecording: Bool
-    /// Test-only seam -- see `init`'s own doc comment. `nil` for every real caller.
-    private let persistenceGateForTesting: (@Sendable ([SpeechSegment], MeetingSegmentChannel) async -> Void)?
     private var retainedRecordingWriter: MeetingRecordingWriter?
     private var retainedRecordingWriterError: Error?
     /// VAD facade for speech-boundary chunk rotation. Renamed from the donor's
@@ -262,35 +275,29 @@ final class MeetingEngine {
     ///   `MeetingStore`'s per-chunk persistence wiring under test, and that is otherwise
     ///   unreachable without real CoreAudio-tap/ScreenCaptureKit hardware access. `nil` (the
     ///   default) reproduces the donor's exact hardcoded behavior for every real caller.
-    /// - Parameter persistenceGateForTesting: test-only seam, NOT present in the donor (no
-    ///   donor equivalent to gate -- see `systemAudioRecorderOverride` above for why this file
-    ///   already has this category of seam). Awaited as the first thing `persistSegments(_:
-    ///   channel:)` does for every call, before any real `MeetingStore` write, with that call's
-    ///   own `segments`/`channel` so a test can decide, per call, whether to suspend it -- most
-    ///   tests want to gate exactly one specific chunk's persistence attempt (e.g. by matching
-    ///   segment text), not every persist call `stop()` happens to make along the way (such as
-    ///   the final chunk's, which runs before the collector drain this seam usually targets).
-    ///   Exists so a test can deterministically suspend that one attempt at a chosen moment --
-    ///   via a continuation it controls -- and observe exactly what `stop()` does while it is
-    ///   still outstanding, rather than relying on real I/O happening to be slow enough to hit
-    ///   the same window by chance. `nil` (the default) is a true no-op: it is never even
-    ///   called unless a test supplies one.
+    /// - Parameter persistence: named by protocol (`MeetingPersisting`) rather than by the
+    ///   concrete `MeetingStore`. This is what replaced a rejected `persistenceGateForTesting`
+    ///   closure parameter that existed only so a test could suspend one persistence attempt:
+    ///   its stored property was `private`, but the parameter itself was module-internal and
+    ///   took an arbitrary non-returning async closure, so any caller in the app target could
+    ///   wedge `stop()` open forever with a hook that had no production purpose at all. There
+    ///   is now no such parameter. See `MeetingPersisting.swift`'s header for the full
+    ///   reasoning, including the residual this trades for (the same one every other injected
+    ///   dependency on this initialiser already carries) and why `#if DEBUG` was rejected.
     init(
         title: String,
-        persistence: MeetingStore,
+        persistence: any MeetingPersisting,
         transcriptionCoordinator: MeetingTranscriptionCoordinating = NullMeetingTranscriptionCoordinator(),
         useCoreAudioTap: Bool = true,
         retainRecording: Bool,
         meetingMicRecorder: MeetingMicRecording = RouteAwareMeetingMicRecorder(),
-        systemAudioRecorderOverride: SystemAudioCapturing? = nil,
-        persistenceGateForTesting: (@Sendable ([SpeechSegment], MeetingSegmentChannel) async -> Void)? = nil
+        systemAudioRecorderOverride: SystemAudioCapturing? = nil
     ) {
         self.title = title
         self.persistence = persistence
         self.transcriptionCoordinator = transcriptionCoordinator
         self.retainRecording = retainRecording
         self.meetingMicRecorder = meetingMicRecorder
-        self.persistenceGateForTesting = persistenceGateForTesting
         if let systemAudioRecorderOverride {
             self.systemAudioRecorder = systemAudioRecorderOverride
         } else if useCoreAudioTap {
@@ -801,7 +808,6 @@ final class MeetingEngine {
     /// failures are invisible looks healthy when it is not.
     @discardableResult
     private func persistSegments(_ segments: [SpeechSegment], channel: MeetingSegmentChannel) async -> [Error] {
-        await persistenceGateForTesting?(segments, channel)
         guard let meetingHandle else { return [] }
         let speakerLabel = channel == .mic ? "You" : "Others"
         var failures: [Error] = []
@@ -894,7 +900,16 @@ final class MeetingEngine {
             Task { [weak self] in
                 let outcome = await task.value
                 guard let self else { return }
-                guard self.micChunkCollector.retire(id: retireID, segments: outcome.segments) else { return }
+                // Failures go into the collector WITH the segments they belong to, so a
+                // later `closeAndDrainSortedSegments()` can report them for the segments it
+                // hands back. The stderr log below is unchanged and still fires: it remains
+                // the only report a failure gets at the time it happens, mid-meeting, when no
+                // `stop()` result object exists yet.
+                guard self.micChunkCollector.retire(
+                    id: retireID,
+                    segments: outcome.segments,
+                    persistenceFailures: outcome.persistenceFailures
+                ) else { return }
                 if !outcome.persistenceFailures.isEmpty {
                     fputs("[meeting] failed to persist \(outcome.persistenceFailures.count) mic segment(s): \(outcome.persistenceFailures)\n", stderr)
                 }
@@ -950,7 +965,13 @@ final class MeetingEngine {
             Task { [weak self] in
                 let outcome = await task.value
                 guard let self else { return }
-                guard self.systemChunkCollector.retire(id: retireID, segments: outcome.segments) else { return }
+                // Same as the mic watcher above: segments and their persistence outcome are
+                // retired together, and the stderr log stays as the mid-meeting report.
+                guard self.systemChunkCollector.retire(
+                    id: retireID,
+                    segments: outcome.segments,
+                    persistenceFailures: outcome.persistenceFailures
+                ) else { return }
                 if !outcome.persistenceFailures.isEmpty {
                     fputs("[meeting] failed to persist \(outcome.persistenceFailures.count) system segment(s): \(outcome.persistenceFailures)\n", stderr)
                 }

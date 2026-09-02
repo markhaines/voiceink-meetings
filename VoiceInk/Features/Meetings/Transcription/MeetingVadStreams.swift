@@ -264,6 +264,26 @@ final class MicVadStream: @unchecked Sendable {
         }
         return AECCleanedMicSamples(drained)
     }
+
+    /// Wraps samples that are ALREADY AEC-cleaned into the same unforgeable receipt type,
+    /// without running the echo canceller again and without driving the wrapped VAD
+    /// controller. For exactly one caller: `MeetingNeuralAec.flushStreamingMic()`'s output at
+    /// pause/stop (donor `appendFlushedStreamingMicOnQueue`,
+    /// `MeetingSession.swift:1264-1266`) — samples already produced by
+    /// `MicEchoCanceller.processStreamingMic` on an earlier call, buffered inside the
+    /// canceller, and only now drained. Re-running `process(_:)` on them would put them
+    /// through AEC a second time; that is what this entry point exists to avoid.
+    ///
+    /// Matches the donor precisely: `appendCleanedMicSamplesOnQueue`
+    /// (`MeetingSession.swift:1267-1278`), the function every flushed/cleaned buffer funnels
+    /// through, never calls `vadController.processAudio` itself — only the two real-time
+    /// callback sites do. So this method intentionally does not touch `controller` either; it
+    /// exists solely to let already-cleaned samples re-enter the typed funnel so the mic
+    /// `PCMChunkRecorder` equivalent never diverges from what the VAD saw. See
+    /// `meeting-session-port-plan.md` section 3's AEC bullet, which flagged this exact gap.
+    func acceptFlushed(_ alreadyCleaned: [Float]) -> AECCleanedMicSamples {
+        AECCleanedMicSamples(alreadyCleaned)
+    }
 }
 
 /// System-side facade over `StreamingVadController`. Accepts only `RawSystemSamples` — handing it

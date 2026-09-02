@@ -1184,6 +1184,15 @@ Donor test original for reference: `native/MuesliNative/Tests/MuesliTests/Meetin
 No upstream (`Beingpax/VoiceInk`) file touched, no SPM package added — same as the original
 port. Still not wired into any engine.
 
+**Correction (`meeting-engine` branch):** the line above is now stale. `MeetingEngine.swift`
+(`Workflows/`) wires this writer in — `appendMic`/`appendSystem` from the realtime capture
+callbacks, `markPauseBoundary()` on pause, `stop()`/`cancel()` on teardown, gated by a new
+`retainRecording: Bool` init parameter (default on). This correction is left here because the
+port that added `MeetingEngine.swift` initially trusted a seam-map document that had itself
+trusted this section's "not wired into any engine" framing to mean the whole *type* was absent,
+not just its wiring — an easy mistake to repeat for the next reader too if this section keeps
+reading as current.
+
 ## stage2-models-store (Stage 2a: meeting data layer)
 
 Adds `Meeting.swift`, `MeetingSegment.swift` (both `Models/`), `MeetingSegmentPersistenceActor.swift`

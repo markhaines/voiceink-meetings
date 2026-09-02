@@ -2237,3 +2237,116 @@ with the fixes in place, including the new regression test and a new positive te
 No change to pause ordering, stop teardown, callback-barrier ordering, or realtime callback
 ordering: every edit here is scoped to the four findings above; nothing else in the retained
 lifecycle/audio paths was touched.
+
+## meeting-engine second review round (PR #12): retire/persist ordering
+
+One blocking finding survived the round above: F1, F2, and F4 passed re-review; F2's *fix*
+(the `persistPending` closure on `closeAndDrainSortedSegments`) closed the "task still pending
+when `stop()` closes the collector" race, but the sibling race it did not close was found on
+re-review: the mid-meeting watchers (`rotateChunkOnQueue`/`rotateSystemChunkOnQueue`) called
+`micChunkCollector.retire(id:segments:)`/`systemChunkCollector.retire(id:segments:)` **before**
+`persistSegments(_:channel:)`. `retire` succeeding moves the chunk into the collector's
+`completedSegments` bucket, and `closeAndDrainSortedSegments()` treats anything already in that
+bucket as "someone else's job to persist, do not touch it again" (correctly, for a chunk whose
+persistence genuinely already finished) -- but "retire succeeded" only meant "persistence was
+*about* to be attempted," not that it had completed. If `stop()` called
+`closeAndDrainSortedSegments()` in the window between `retire` succeeding and `persistSegments`
+finishing, the chunk landed in `MeetingEngineResult.rawTranscript` while its append was still in
+flight, or had already failed with the error going only to stderr -- `persistenceFailures`
+stayed empty regardless. `MeetingChunkCollector.swift`'s own doc comment encoded the wrong
+invariant in prose ("were already handed to their own caller's persistence step before
+`isClosed` was set" -- handed to, not completed): flagged by the reviewer as the bug written
+down, corrected below.
+
+**Design: fold persistence into the SAME `Task` the collector tracks and awaits**, rather than
+inverting the watcher's call order (persist-then-retire) with `retire` left as an independent
+arbiter. `MeetingChunkCollector.Outcome` bundles `segments: [SpeechSegment]` with
+`persistenceFailures: [Error]`; `rotateChunkOnQueue`/`rotateSystemChunkOnQueue` now build a
+`Task<MeetingChunkCollector.Outcome, Never>` whose closure transcribes AND persists (calling
+`persistSegments` itself) before returning, so the watcher's `retire(id:segments:)` call --
+which only ever runs after `await task.value` resolves -- cannot happen until persistence for
+that chunk has already run to completion. `closeAndDrainSortedSegments()` no longer takes a
+`persistPending` closure (dead code now, removed): it returns `(segments:
+[SpeechSegment], persistenceFailures: [Error])` directly, since any task it has to await
+already carries its own completed persistence outcome by construction.
+
+**Rejected alternative: invert the watcher's order (persist, then retire), with retire as the
+sole arbiter of who persists.** This looked simpler at first (smaller diff, no new type) but
+does not actually satisfy constraint (a), no double-persist, without extra machinery: `stop()`'s
+drain loop does not go through `retire` at all for a still-pending task -- it awaits `task.value`
+directly. If the task's OWN return value is just `[SpeechSegment]` (as before) and persistence is
+a separate step the WATCHER performs after awaiting that value, then both the watcher and
+`stop()`'s drain loop independently observe the same `task.value` and each could decide, on its
+own, that persisting is its job -- there is no shared state between them that says "the other side
+already handled this." Making `retire` itself the sole arbiter would require it to gate *whether
+persistence runs*, not just record segments, which means either the drain loop must also call
+`retire` (a behavior change to a path that currently never touches it) or a second synchronization
+primitive is needed on top of `retire` -- redundant complexity next to the alternative. Folding
+persistence into the awaited `Task` gets mutual exclusion for free from Swift's own `Task`
+semantics: a `Task`'s body runs exactly once no matter how many callers `await` its `.value`,
+regardless of which caller gets there first. That is what "genuinely awaits it like any other
+pending work" (the brief's own phrasing) means in practice.
+
+**How the three constraints are satisfied:**
+- **(a) no double-persist:** persistence runs inside the tracked `Task`'s body, and
+  `Task<Success, Failure>.value` executes that body exactly once regardless of how many
+  observers await it (the watcher, `closeAndDrainSortedSegments()`'s drain loop, or both
+  concurrently) -- there is nothing left to coordinate.
+- **(b) `stop()` cannot return before a drained segment's persistence attempt has finished:**
+  for a task still pending when `stop()` closes the collector, `closeAndDrainSortedSegments()`
+  awaits that same `Task`, whose body does not return until persistence has run; for a task
+  already retired before close, `retire` succeeding is now a guarantee persistence already ran
+  (see the design above), so there is nothing left outstanding either way.
+- **(c) failures from the racing chunk reach `persistenceFailures`, not just stderr:**
+  `closeAndDrainSortedSegments()` returns the awaited `Outcome.persistenceFailures` for every
+  task it had to drain, and `MeetingEngine.stop()` appends them directly into
+  `MeetingEngineResult.persistenceFailures` -- no closure, no side channel.
+
+**Proof, not assertion.** A `persistenceGateForTesting: (@Sendable ([SpeechSegment],
+MeetingSegmentChannel) async -> Void)? = nil` test-only seam was added to `MeetingEngine.init`
+(same category as the pre-existing `systemAudioRecorderOverride` seam, no donor equivalent
+either): awaited as the first thing `persistSegments` does, with that call's own segments/
+channel so a test can gate exactly one specific chunk's persist call, not every persist call
+`stop()` happens to make. `MeetingEngineTests.stopAwaitsRacingChunkPersistenceBeforeReturning`
+uses a `Gate` actor (suspend-until-opened, test-controlled, not a `Task.sleep` guess) to hold
+the racing chunk's `persistSegments` call suspended at a moment the test chooses, then checks
+-- via a `StopOutcomeBox` actor set only once `stop()` actually returns -- that `stop()` has
+NOT completed 300ms after being raced against the gate. Run against a deliberately, temporarily
+reverted build (moved the persist call back out of the tracked `Task` and into the watcher,
+after `retire`, exactly mirroring the pre-fix shape -- reverted, verified, then restored, same
+methodology as the F2 regression test above) it failed with:
+```
+Expectation failed: !(completedWhileGated → <not evaluated>): stop() returned while the racing chunk's persistence was still gated shut
+```
+confirming `stop()` returned while persistence for the gated chunk was still outstanding. Note
+that this same deliberate revert also reintroduces the ORIGINAL F2 symptom as a side effect
+(`stopPersistsChunkStillInFlightAtCallTime` failed too, in the same run) -- both fixes live in
+the same restructured code path, so a revert deep enough to demonstrate one necessarily
+demonstrates the other; this is not a regression in the shipped fix, only a property of how the
+temporary demonstration revert was constructed. With the fix restored, both tests -- and the
+full relevant suite (20 tests: `MeetingEngineTests`, `MeetingChunkCollectorTests`,
+`MeetingVadStreamsTests`) -- pass.
+
+`MeetingChunkCollectorTests.drainSurfacesPersistenceFailuresFromPendingTask` additionally proves
+constraint (c) in isolation, at the collector level with a synthetic injected `Error`, with no
+`MeetingStore`/SwiftData involvement: a deliberate choice over fabricating a real SwiftData
+failure at the `MeetingEngine` level, because `MeetingStore.swift`'s own header documents that
+resolving a `MeetingHandle` the store's `ModelContext` does not recognise (e.g. by deleting the
+underlying row out from under a live handle to force a `MeetingStoreError`) is NOT the
+recoverable "not found" path it looks like and can fatal-error the process -- not a risk worth
+taking against a component this finding did not ask to be touched, when the collector-level
+test already proves the exact mechanism this fix relies on.
+
+**Disclosed finding, NOT fixed in this round (explicitly out of scope):** re-reading `discard()`
+per the review brief -- its `Task { try? await persistence.markFailed(meetingHandle) }` discards
+`markFailed`'s error the same way the pre-F3 code discarded every other persistence error. If
+that call fails, the meeting row is left in whatever state it was in when `discard()` ran
+(`.recording` or `.paused`) rather than moving to `.failed` -- a later reader (meeting history,
+support investigation) would see an apparently-abandoned in-progress meeting with no signal that
+it was actually a deliberate, handled discard. Same category of gap as F3, on a path F3's brief
+did not scope in (`pause()`/`resume()`/`discard()`'s own `updateState`/`markFailed` calls) --
+recorded here for a future round, not fixed now.
+
+No upstream file touched, no SPM dependency added. Files changed:
+`MeetingChunkCollector.swift`, `MeetingEngine.swift`, `MeetingChunkCollectorTests.swift`,
+`MeetingEngineTests.swift`.

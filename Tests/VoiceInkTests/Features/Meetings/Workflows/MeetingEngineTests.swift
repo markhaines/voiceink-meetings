@@ -218,6 +218,38 @@ private struct DelayedMicChunkTranscriptionCoordinator: MeetingTranscriptionCoor
     func diarizeSystemAudio(at url: URL) async throws -> DiarizationResult? { nil }
 }
 
+/// Deterministic suspend/release point for the "retire races persist" regression below.
+/// `wait()` suspends until `open()` is called (or returns immediately if already open) --
+/// used to hold one specific chunk's `persistSegments` call open exactly as long as the test
+/// needs, rather than approximating a race with a fixed `Task.sleep` delay.
+private actor Gate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        if isOpen { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func open() {
+        isOpen = true
+        let toResume = waiters
+        waiters.removeAll()
+        toResume.forEach { $0.resume() }
+    }
+}
+
+/// Lets a test observe "has `engine.stop()` returned yet?" from outside, without consuming
+/// its result via `Task.value` (which would itself suspend until completion, defeating the
+/// point of checking whether it has completed).
+private actor StopOutcomeBox {
+    private(set) var result: MeetingEngineResult?
+
+    func complete(_ result: MeetingEngineResult) {
+        self.result = result
+    }
+}
+
 @Suite("MeetingEngine", .serialized)
 struct MeetingEngineTests {
     private func makeContainer() throws -> ModelContainer {
@@ -469,5 +501,78 @@ struct MeetingEngineTests {
         // call raced the collector's close and lost, so persistence was skipped entirely.
         let segments = try fetchSegments(from: container)
         #expect(segments.contains { $0.text == "in-flight when stop was called" && $0.sourceChannel == .mic })
+    }
+
+    /// Regression test for the SIBLING of the "silent chunk loss" finding above, found on
+    /// re-review of that fix: the mid-meeting watcher (`rotateChunkOnQueue`) called
+    /// `retire(id:segments:)` BEFORE `persistSegments`, so a chunk could be moved into the
+    /// collector's `completedSegments` bucket -- and so be treated by
+    /// `closeAndDrainSortedSegments()` as "already someone else's job to persist, don't touch
+    /// it again" -- while its actual persistence attempt was still outstanding, or had already
+    /// failed silently to stderr. "Retired" meant "persistence is ABOUT to be attempted," not
+    /// "persistence completed," and the collector's drain could not tell the difference.
+    ///
+    /// `persistenceGateForTesting` (test-only seam on `MeetingEngine.init`) suspends exactly
+    /// the racing chunk's `persistSegments` call at a chosen moment via `Gate`, so this test
+    /// constructs the interleaving deliberately rather than hoping a timing window lines up.
+    /// Transcription itself is fast (plain `FakeTranscriptionCoordinator`, no delay) -- the
+    /// gate, not transcription timing, is what controls the race.
+    @Test("stop() does not return before a racing chunk's persistence attempt finishes")
+    func stopAwaitsRacingChunkPersistenceBeforeReturning() async throws {
+        let container = try makeContainer()
+        let store = MeetingStore(modelContainer: container)
+        let mic = FakeMeetingMicRecorder()
+        let system = FakeSystemAudioRecorder()
+        let coordinator = FakeTranscriptionCoordinator(micText: "gated racing chunk")
+        let gate = Gate()
+        let engine = MeetingEngine(
+            title: "GatedRace",
+            persistence: store,
+            transcriptionCoordinator: coordinator,
+            retainRecording: false,
+            meetingMicRecorder: mic,
+            systemAudioRecorderOverride: system,
+            persistenceGateForTesting: { segments, _ in
+                // Gate ONLY the racing chunk's own persist call. stop()'s final-chunk persist
+                // call (empty segments -- nothing more was fed after pause()) must sail
+                // through, or this test would just prove *some* gated call blocks stop(), not
+                // that the collector-drain path specifically waits out the racing chunk.
+                guard segments.contains(where: { $0.text == "gated racing chunk" }) else { return }
+                await gate.wait()
+            }
+        )
+
+        try await engine.start()
+        mic.onRawPCMSamples?(fakeAudioSamples())
+
+        // Rotates the mic chunk; its watcher Task will reach persistSegments and suspend on
+        // the gate shortly after (transcription is fast/synchronous here).
+        engine.pause()
+        // Bounded head start so the watcher reliably reaches the gate before stop() races it
+        // below. This only affects arrival order in THIS test's construction -- the property
+        // under test holds regardless of which of {watcher, stop()} gets there first, which is
+        // exactly why embedding persistence in the awaited task closes the race either way.
+        try await Task.sleep(for: .milliseconds(100))
+
+        let box = StopOutcomeBox()
+        let stopTask = Task {
+            let result = try await engine.stop()
+            await box.complete(result)
+        }
+
+        // stop() must NOT have completed yet: the racing chunk's persistence is still
+        // suspended on the closed gate. This is the invariant itself -- stop() cannot return
+        // before every persistence attempt for a drained segment has finished.
+        try await Task.sleep(for: .milliseconds(300))
+        let completedWhileGated = await box.result != nil
+        #expect(!completedWhileGated, "stop() returned while the racing chunk's persistence was still gated shut")
+
+        await gate.open()
+        try await stopTask.value
+        let result = try #require(await box.result)
+
+        #expect(result.rawTranscript.contains("gated racing chunk"))
+        let segments = try fetchSegments(from: container)
+        #expect(segments.contains { $0.text == "gated racing chunk" && $0.sourceChannel == .mic })
     }
 }

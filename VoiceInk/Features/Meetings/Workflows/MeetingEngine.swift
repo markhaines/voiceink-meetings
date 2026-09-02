@@ -169,6 +169,8 @@ final class MeetingEngine {
     private var rawMicChunkRecorder: PCMChunkRecorder?
     private var systemChunkRecorder: PCMChunkRecorder?
     private let retainRecording: Bool
+    /// Test-only seam -- see `init`'s own doc comment. `nil` for every real caller.
+    private let persistenceGateForTesting: (@Sendable ([SpeechSegment], MeetingSegmentChannel) async -> Void)?
     private var retainedRecordingWriter: MeetingRecordingWriter?
     private var retainedRecordingWriterError: Error?
     /// VAD facade for speech-boundary chunk rotation. Renamed from the donor's
@@ -260,6 +262,19 @@ final class MeetingEngine {
     ///   `MeetingStore`'s per-chunk persistence wiring under test, and that is otherwise
     ///   unreachable without real CoreAudio-tap/ScreenCaptureKit hardware access. `nil` (the
     ///   default) reproduces the donor's exact hardcoded behavior for every real caller.
+    /// - Parameter persistenceGateForTesting: test-only seam, NOT present in the donor (no
+    ///   donor equivalent to gate -- see `systemAudioRecorderOverride` above for why this file
+    ///   already has this category of seam). Awaited as the first thing `persistSegments(_:
+    ///   channel:)` does for every call, before any real `MeetingStore` write, with that call's
+    ///   own `segments`/`channel` so a test can decide, per call, whether to suspend it -- most
+    ///   tests want to gate exactly one specific chunk's persistence attempt (e.g. by matching
+    ///   segment text), not every persist call `stop()` happens to make along the way (such as
+    ///   the final chunk's, which runs before the collector drain this seam usually targets).
+    ///   Exists so a test can deterministically suspend that one attempt at a chosen moment --
+    ///   via a continuation it controls -- and observe exactly what `stop()` does while it is
+    ///   still outstanding, rather than relying on real I/O happening to be slow enough to hit
+    ///   the same window by chance. `nil` (the default) is a true no-op: it is never even
+    ///   called unless a test supplies one.
     init(
         title: String,
         persistence: MeetingStore,
@@ -267,13 +282,15 @@ final class MeetingEngine {
         useCoreAudioTap: Bool = true,
         retainRecording: Bool,
         meetingMicRecorder: MeetingMicRecording = RouteAwareMeetingMicRecorder(),
-        systemAudioRecorderOverride: SystemAudioCapturing? = nil
+        systemAudioRecorderOverride: SystemAudioCapturing? = nil,
+        persistenceGateForTesting: (@Sendable ([SpeechSegment], MeetingSegmentChannel) async -> Void)? = nil
     ) {
         self.title = title
         self.persistence = persistence
         self.transcriptionCoordinator = transcriptionCoordinator
         self.retainRecording = retainRecording
         self.meetingMicRecorder = meetingMicRecorder
+        self.persistenceGateForTesting = persistenceGateForTesting
         if let systemAudioRecorderOverride {
             self.systemAudioRecorder = systemAudioRecorderOverride
         } else if useCoreAudioTap {
@@ -667,15 +684,14 @@ final class MeetingEngine {
             diarizationSegments = diarizationResult.segments
         }
 
-        micSegments.append(contentsOf: await micChunkCollector.closeAndDrainSortedSegments(
-            persistPending: { segments in
-                // A chunk still transcribing when stop() reached this point: its own watcher
-                // Task's `retire` call is now guaranteed to fail (the collector just closed),
-                // so its normal persistence would never run without this. See
-                // MeetingChunkCollector.swift's `closeAndDrainSortedSegments(persistPending:)`.
-                persistenceFailures.append(contentsOf: await self.persistSegments(segments, channel: .mic))
-            }
-        ))
+        // Persistence for a still-in-flight chunk is embedded in the task
+        // `closeAndDrainSortedSegments()` itself awaits (see MeetingChunkCollector.swift's
+        // header and `rotateChunkOnQueue`/`rotateSystemChunkOnQueue`), so this call already
+        // waits out that persistence and hands back its failures directly -- no separate
+        // closure needed.
+        let micDrain = await micChunkCollector.closeAndDrainSortedSegments()
+        micSegments.append(contentsOf: micDrain.segments)
+        persistenceFailures.append(contentsOf: micDrain.persistenceFailures)
         micSegments.sort { lhs, rhs in
             if lhs.start == rhs.start {
                 return lhs.text < rhs.text
@@ -683,11 +699,9 @@ final class MeetingEngine {
             return lhs.start < rhs.start
         }
 
-        systemSegments.append(contentsOf: await systemChunkCollector.closeAndDrainSortedSegments(
-            persistPending: { segments in
-                persistenceFailures.append(contentsOf: await self.persistSegments(segments, channel: .system))
-            }
-        ))
+        let systemDrain = await systemChunkCollector.closeAndDrainSortedSegments()
+        systemSegments.append(contentsOf: systemDrain.segments)
+        persistenceFailures.append(contentsOf: systemDrain.persistenceFailures)
         systemSegments.sort { lhs, rhs in
             if lhs.start == rhs.start {
                 return lhs.text < rhs.text
@@ -787,6 +801,7 @@ final class MeetingEngine {
     /// failures are invisible looks healthy when it is not.
     @discardableResult
     private func persistSegments(_ segments: [SpeechSegment], channel: MeetingSegmentChannel) async -> [Error] {
+        await persistenceGateForTesting?(segments, channel)
         guard let meetingHandle else { return [] }
         let speakerLabel = channel == .mic ? "You" : "Others"
         var failures: [Error] = []
@@ -850,30 +865,41 @@ final class MeetingEngine {
         let chunkOffset = chunkTiming.startTimeSeconds
 
         fputs("[meeting] rotating raw mic chunk at offset=\(String(format: "%.0f", chunkOffset))s\n", stderr)
-        let task = Task { [weak self] () -> [SpeechSegment] in
-            guard let self else { return [] }
+        // Persistence is embedded in this SAME task (fork deviation, see
+        // MeetingChunkCollector.swift's header): the task transcribes AND persists before its
+        // value resolves, so `retire` succeeding is a genuine guarantee that persistence
+        // already ran, and `stop()`'s drain of a still-pending task gets the real persistence
+        // outcome by awaiting this same value, not a separately-timed side channel.
+        let task = Task { [weak self] () -> MeetingChunkCollector.Outcome in
+            guard let self else { return .empty }
+            var segments: [SpeechSegment] = []
             if Task.isCancelled {
                 self.cleanupTemporaryChunkURLs(rawChunkURL)
-                return []
+            } else {
+                segments = await self.transcribeMicChunk(
+                    rawURL: rawChunkURL,
+                    chunkTiming: chunkTiming,
+                    isFinalChunk: false
+                )
             }
-            return await self.transcribeMicChunk(
-                rawURL: rawChunkURL,
-                chunkTiming: chunkTiming,
-                isFinalChunk: false
-            )
+            // Matches the pre-F3 shape exactly: persistSegments ran unconditionally after the
+            // watcher's retire, cancelled-with-nothing-transcribed included (it is a no-op
+            // beyond updating the meeting's duration when segments is empty). Preserved here,
+            // not changed -- this task is a straight relocation of that call, not a new policy.
+            let failures = await self.persistSegments(segments, channel: .mic)
+            return MeetingChunkCollector.Outcome(segments: segments, persistenceFailures: failures)
         }
         let (registered, retireID) = micChunkCollector.add(task)
         if registered {
             Task { [weak self] in
-                let segments = await task.value
+                let outcome = await task.value
                 guard let self else { return }
-                guard self.micChunkCollector.retire(id: retireID, segments: segments) else { return }
-                let failures = await self.persistSegments(segments, channel: .mic)
-                if !failures.isEmpty {
-                    fputs("[meeting] failed to persist \(failures.count) mic segment(s): \(failures)\n", stderr)
+                guard self.micChunkCollector.retire(id: retireID, segments: outcome.segments) else { return }
+                if !outcome.persistenceFailures.isEmpty {
+                    fputs("[meeting] failed to persist \(outcome.persistenceFailures.count) mic segment(s): \(outcome.persistenceFailures)\n", stderr)
                 }
-                guard !segments.isEmpty else { return }
-                self.onChunkTranscribed?(segments, "You")
+                guard !outcome.segments.isEmpty else { return }
+                self.onChunkTranscribed?(outcome.segments, "You")
             }
         } else {
             task.cancel()
@@ -891,41 +917,45 @@ final class MeetingEngine {
         let chunkOffset = chunkTiming.startTimeSeconds
         let chunkDuration = chunkTiming.durationSeconds
         fputs("[meeting] rotating system chunk at offset=\(String(format: "%.0f", chunkOffset))s\n", stderr)
-        let task = Task { [weak self] () -> [SpeechSegment] in
+        // Persistence embedded in this SAME task -- see the mic rotation task above and
+        // MeetingChunkCollector.swift's header for why.
+        let task = Task { [weak self] () -> MeetingChunkCollector.Outcome in
             defer {
                 try? FileManager.default.removeItem(at: chunkURL)
             }
-            guard let self else { return [] }
-            do {
-                if Task.isCancelled {
-                    return []
+            guard let self else { return .empty }
+            var segments: [SpeechSegment] = []
+            if !Task.isCancelled {
+                do {
+                    let result = try await self.transcriptionCoordinator.transcribeMeetingChunk(at: chunkURL)
+                    if !result.text.isEmpty {
+                        fputs("[meeting] system chunk transcribed: \"\(String(result.text.prefix(60)))...\"\n", stderr)
+                        segments = self.normalizeSystemTranscription(
+                            result: result,
+                            startTime: chunkOffset,
+                            endTime: chunkOffset + max(chunkDuration, 0.1)
+                        )
+                    }
+                } catch {
+                    fputs("[meeting] system chunk transcription failed: \(error)\n", stderr)
                 }
-                let result = try await self.transcriptionCoordinator.transcribeMeetingChunk(at: chunkURL)
-                if !result.text.isEmpty {
-                    fputs("[meeting] system chunk transcribed: \"\(String(result.text.prefix(60)))...\"\n", stderr)
-                    return self.normalizeSystemTranscription(
-                        result: result,
-                        startTime: chunkOffset,
-                        endTime: chunkOffset + max(chunkDuration, 0.1)
-                    )
-                }
-            } catch {
-                fputs("[meeting] system chunk transcription failed: \(error)\n", stderr)
             }
-            return []
+            // Matches the pre-F3 shape exactly: persistSegments ran unconditionally after the
+            // watcher's retire, cancelled/empty-result included. Preserved here, not changed.
+            let failures = await self.persistSegments(segments, channel: .system)
+            return MeetingChunkCollector.Outcome(segments: segments, persistenceFailures: failures)
         }
         let (registered, retireID) = systemChunkCollector.add(task)
         if registered {
             Task { [weak self] in
-                let segments = await task.value
+                let outcome = await task.value
                 guard let self else { return }
-                guard self.systemChunkCollector.retire(id: retireID, segments: segments) else { return }
-                let failures = await self.persistSegments(segments, channel: .system)
-                if !failures.isEmpty {
-                    fputs("[meeting] failed to persist \(failures.count) system segment(s): \(failures)\n", stderr)
+                guard self.systemChunkCollector.retire(id: retireID, segments: outcome.segments) else { return }
+                if !outcome.persistenceFailures.isEmpty {
+                    fputs("[meeting] failed to persist \(outcome.persistenceFailures.count) system segment(s): \(outcome.persistenceFailures)\n", stderr)
                 }
-                guard !segments.isEmpty else { return }
-                self.onChunkTranscribed?(segments, "Others")
+                guard !outcome.segments.isEmpty else { return }
+                self.onChunkTranscribed?(outcome.segments, "Others")
             }
         } else {
             task.cancel()

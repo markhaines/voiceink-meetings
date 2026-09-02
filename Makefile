@@ -8,9 +8,15 @@ WHISPER_CPP_REV := $(shell grep -v '^[[:space:]]*\#' $(CURDIR)/whisper-cpp.rev |
 LOCAL_DERIVED_DATA := $(CURDIR)/.local-build
 LOCAL_CODESIGN_IDENTITY ?=
 RUN_APP_NAME ?= VoiceInk
-# Extra xcodebuild flags for `make local`, e.g. non-interactive CI passing
-# -skipPackagePluginValidation -skipMacroValidation (no GUI to click "Trust & Enable" on).
-LOCAL_XCODEBUILD_FLAGS ?=
+# Extra xcodebuild flags for `make local`. Defaults to exactly what CI passes
+# (.github/workflows/ci.yml), because a local Mac has the same "no GUI to click Trust & Enable
+# on" problem non-interactive CI does: -skipPackagePluginValidation is required for mlx-swift's
+# CudaBuild build-tool plugin (see FORK-PATCHES.md's "Build-time macro and plugin trust" note
+# for why that flag is scoped/bounded rather than removed), and -onlyUsePackageVersionsFromResolvedFile
+# stops a from-scratch resolve from drifting off Package.resolved's reviewed pins.
+# -skipMacroValidation must NOT be added back: Phase 0 removed the one macro that needed it
+# from the build graph entirely (see FORK-PATCHES.md), so no macro validation gate exists to skip.
+LOCAL_XCODEBUILD_FLAGS ?= -skipPackagePluginValidation -onlyUsePackageVersionsFromResolvedFile
 
 .PHONY: all clean whisper setup build local check healthcheck help dev run release release-setup
 

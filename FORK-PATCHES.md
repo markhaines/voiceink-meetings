@@ -2688,3 +2688,69 @@ Files changed: `App/Navigation/ContentView.swift`, `App/Navigation/AppSidebar.sw
 `Features/Meetings/Views/MeetingDetailView.swift`,
 `Features/Meetings/Views/MeetingRecordingController.swift`,
 `Tests/VoiceInkTests/Features/Meetings/Views/MeetingRecordingControllerTests.swift`.
+
+### Launch fix: `make local`'s product built but crashed on launch (two more upstream touchpoints)
+
+`make local` (with the CI-matching flags, see below) built successfully, but the product
+crashed instantly: `EXC_CRASH (SIGABRT)`, DYLD `Library missing`, with the decisive reason
+`Library not loaded: @rpath/whisper.framework/Versions/Current/whisper ... code signature ...
+not valid for use in process: mapping process and mapped file (non-platform) have different
+Team IDs`.
+
+**Root cause.** `security find-identity -v -p codesigning` returns zero valid identities on
+this Mac, so `make local` ad-hoc signs (`CODE_SIGN_IDENTITY="-"`). `ENABLE_HARDENED_RUNTIME =
+YES` is set at the project level for the App target (`project.pbxproj`, both Debug and Release
+configs), and hardened runtime enforces library validation: every loaded binary must share the
+main executable's Team ID. Ad-hoc signatures never carry a Team ID at all — confirmed from the
+crash report itself, `"codeSigningTeamID":""` on the main binary — so this check can never pass
+for any separately ad-hoc-signed embedded code, whisper.xcframework (built independently by
+whisper.cpp's own `build-xcframework.sh`) included. A prior attempt at a single consistent
+`codesign --force --deep --sign - --options runtime` re-sign pass over the whole bundle did not
+fix this, which is expected once the mechanism is understood: the failure is "no Team ID
+present to match," not "two mismatched Team IDs from separate signing passes," so re-signing
+consistently changes nothing.
+
+**Fix chosen: `com.apple.security.cs.disable-library-validation` in
+`VoiceInk/VoiceInk.local.entitlements` ONLY.** Rejected alternatives and why:
+- Consistent one-pass re-signing: doesn't address the actual mechanism (see above), and was
+  already tried.
+- Turning off hardened runtime for local builds: strictly larger blast radius than disabling
+  library validation alone — it would also drop the DYLD_INSERT_LIBRARIES block, the
+  unsigned-executable-memory restriction, and debugger-attach protections, none of which are
+  the problem here.
+- The chosen fix is scoped to exactly the one check that ad-hoc-plus-prebuilt-framework local
+  builds can structurally never satisfy.
+
+**Guaranteed confined to local/ad-hoc builds, not Release.** `VoiceInk.local.entitlements` is
+referenced in exactly three places repo-wide (grep-verified): the Makefile's `local` target's
+`CODE_SIGN_ENTITLEMENTS` override, `.github/workflows/ci.yml`'s equivalent CI build-and-test
+step, and `scripts/verify-meeting-store-isolation.sh`'s local-build invocation — all local/ad-hoc
+paths. The Xcode project's own build settings point Debug at `VoiceInk.debug.entitlements` and
+Release at `VoiceInk.entitlements` (`project.pbxproj`, `CODE_SIGN_ENTITLEMENTS`), neither of
+which was touched, and `scripts/release.sh`'s `xcodebuild archive -configuration Release` passes
+no entitlements override, so it falls through to the project's own Release entitlements. The
+disable-library-validation key cannot reach a release build through any of these paths.
+
+**Cost, stated plainly:** this lets the ad-hoc-signed process load code not signed by the same
+identity as the main binary — a real, narrow security reduction. Accepted only because local
+ad-hoc dev builds have no signing identity to validate embedded code against in the first
+place, and the entitlement is unreachable from any build path that could ship.
+
+### Fourth upstream touchpoint (not originally budgeted): `Makefile` default flags
+
+`make local` out of the box (before this branch) failed at `Validate plug-in "CudaBuild" in
+package "mlx-swift"` — `LOCAL_XCODEBUILD_FLAGS` (added in phase-0-fork-hygiene) defaulted to
+empty, so a bare `make local` on this project's own canonical dev Mac never carried the
+`-skipPackagePluginValidation -onlyUsePackageVersionsFromResolvedFile` pair CI already passes
+(`.github/workflows/ci.yml`) — there being no GUI to click "Trust & Enable" on outside an
+interactive Xcode session. Defaulted `LOCAL_XCODEBUILD_FLAGS` to that same CI-matching pair,
+still overridable (`LOCAL_XCODEBUILD_FLAGS=... make local`). Chose the Makefile over documenting
+the workaround in `BUILDING.md` because documentation doesn't stop a bare `make local` from
+failing — it just tells the next person what to type instead of fixing the default. This is a
+fourth, not-originally-budgeted upstream touchpoint on this branch (Mark pre-authorized it as
+the one candidate for a fourth, contingent on this judgement call). `-skipMacroValidation` is
+deliberately NOT part of the default: Phase 0 removed the one macro that needed it from the
+build graph entirely, and that property must hold — see the "Build-time macro and plugin trust"
+note under `phase-0-fork-hygiene`.
+
+Files changed for this fix: `VoiceInk/VoiceInk.local.entitlements`, `Makefile`.

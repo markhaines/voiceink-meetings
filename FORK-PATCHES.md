@@ -2579,3 +2579,101 @@ Test case 'MeetingEngineTests/discardRetriesMarkFailedOnPersistentFailure()' pas
 
 No upstream file touched, no SPM dependency added. Files changed: `MeetingChunkCollector.swift`,
 `MeetingEngine.swift`, `MeetingEngineTests.swift`, `FOLLOWUPS.md`.
+
+## meetings-ui-shell: Meetings screen, wired into the app for the first time
+
+Before this branch, `Features/Meetings/Views/` was empty and nothing outside
+`Features/Meetings/` referenced `MeetingEngine`/`MeetingStore`/`MeetingMonitor` (grep-verified):
+the entire meetings subsystem built by every stage above was unreachable from the running app.
+This adds the list + detail screen and wires it into navigation, using the two upstream
+touchpoints the dispatch for this branch budgeted and no others.
+
+### Upstream touchpoints (both budgeted, both minimal)
+
+1. **`App/Navigation/ContentView.swift`**: added `case meetings = "Meetings"` to `ViewType` and
+   `case .meetings: MeetingsView()` to `detailView(for:)`.
+2. **`App/Navigation/AppSidebar.swift`**: added `.meetings` to `ViewType.primaryItems`, plus its
+   `icon` (`person.2.wave.2.fill`), `sidebarIconStyle` (new `AppTheme.Sidebar.meetings` token,
+   `.systemTeal` — every other case in that enum was already claimed), and title (falls through
+   to the default `LocalizedStringKey(rawValue)` case, same as every entry but
+   `.transcribeAudio`). `ViewType.assertSidebarItemsCoverAllCases()`'s `#if DEBUG` assert
+   (`Set(sidebarItems) == Set(allCases) && sidebarItems.count == allCases.count`) passes with
+   `.meetings` added to both the enum and `primaryItems`.
+
+`VoiceInkEngine`, `RecordingState`, and `Features/Recording/Capture/Recorder.swift` are
+untouched — grep-verified after this branch's changes, not just before.
+
+### Views (`Features/Meetings/Views/`)
+
+- `MeetingsView.swift`: SwiftData `@Query(sort: \Meeting.startDate, order: .reverse)` list,
+  modeled on `Features/History/Views/InlineHistoryView.swift`'s list + `.sidePanel` detail
+  pattern (the closest existing analog — same main-content-area placement as the History
+  screen's inline form, not a separate window). Includes a genuine empty state (icon, message,
+  and an explicit note that transcription isn't built yet), since that is what a first launch
+  will show.
+- `MeetingDetailView.swift`: metadata header (title/state badge/date/duration) plus segments in
+  `(startOffset, orderIndex)` order — matching `MeetingSegment.orderIndex`'s documented purpose
+  as the tiebreaker for equal offsets — rendered as speaker bubbles styled after
+  `Features/History/Views/TranscriptionDetailView.swift`'s `MessageBubble`. An empty-segments
+  state is handled explicitly (not left to render nothing) with the same "not built yet" framing
+  as the list's empty state, rather than looking like a bug.
+- `MeetingStateBadge` (in `MeetingsView.swift`): small `MeetingState` → color/label mapping,
+  reused by both the list row and the detail header.
+- `AppTheme.Sidebar.meetings` added to `DesignSystem/Theme/AppTheme.swift` (`.systemTeal`).
+
+### Step-3 judgement call: the record control is wired to the REAL engine, not a stub
+
+The dispatch for this branch was explicit that the record control should only be built at all
+if `MeetingEngine` can actually be constructed and driven today, and should be a fake/stub
+control (or omitted) otherwise. It can: `MeetingEngine.init` takes `title`, `persistence: any
+MeetingPersisting`, and `retainRecording: Bool` with no default; every other parameter — the
+transcription coordinator included — already defaults to `NullMeetingTranscriptionCoordinator()`
+in the engine's own signature (`Workflows/MeetingEngine.swift`), which is itself a real,
+already-shipped concrete type (not something this branch added), not merely a protocol with no
+implementation. So this branch wires the real thing:
+
+- `MeetingRecordingController.swift` (new, `Features/Meetings/Views/`): a small
+  `@MainActor ObservableObject` that constructs a real `MeetingStore(modelContainer:)` and a
+  real `MeetingEngine(title:persistence:transcriptionCoordinator:retainRecording:)` — explicitly
+  passing `NullMeetingTranscriptionCoordinator()` (naming the stub at the call site rather than
+  leaning on the default silently) and `retainRecording: false` — and calls `engine.start()` /
+  `engine.stop()` from Start/Stop Meeting buttons in `MeetingsView`'s top bar.
+- **What this means concretely**: tapping Start Meeting captures real mic + system audio through
+  the full Stage-1 pipeline (AEC, VAD-driven chunk rotation, mic-health/recovery), and
+  `MeetingStore` persists a real `Meeting` row with a real `duration`, reaching `.completed` on
+  Stop. Because the transcription coordinator is the null stub, every chunk transcription
+  returns `SpeechTranscriptionResult(text: "", segments: [])` (see that type's own header), so
+  the meeting is saved with **zero segments** — not fabricated placeholder text. This is the
+  "audio capture and persistence genuinely run end to end, only the transcript text is absent"
+  branch of the dispatch's either/or, not the "ship it disabled" branch, because nothing actually
+  blocks construction today.
+- **`retainRecording: false`, explicitly, not the engine's own silence on a default**:
+  `MeetingEngine.init`'s own doc comment argues at length for no default here, because the flag
+  decides whether a recording of the OTHER PARTICIPANTS on the call is written to permanent
+  storage, and there is no settings surface yet for a real user choice. `false` is that same
+  reasoning carried through to this call site: recording and retaining other people's audio by
+  default, with no UI to ever turn it off, would be exactly the unreviewed default that doc
+  comment argues against. `Meeting`/`MeetingSegment` rows (the metadata + empty transcript) are
+  still persisted regardless — `retainRecording` only gates the separate mixed-audio WAV
+  (`MeetingRecordingWriter`), not the SwiftData persistence path.
+- Real TCC consent (`kTCCServiceAudioCapture`) is exercised the normal way — no workaround
+  attempted, per the dispatch's explicit instruction.
+
+### Tests
+
+`Tests/VoiceInkTests/Features/Meetings/Views/MeetingRecordingControllerTests.swift`: covers only
+the controller's own guard logic (start-before-`configure()` is a no-op; stop-while-idle is a
+no-op; `configure()` is one-shot), against an in-memory `ModelContainer` — the same fixture
+pattern `MeetingStoreTests.swift` uses. Deliberately does NOT call `startMeeting`/`stopMeeting`
+in a way that reaches `engine.start()`: that touches real CoreAudio and needs microphone/audio-
+capture TCC consent, which the CI runner does not have (see `.github/workflows/ci.yml`'s
+existing note on why `VoiceInkUITests` is skipped there for the same reason). The engine's own
+lifecycle is already covered by `MeetingEngineTests.swift` against fake recorders; this file
+does not duplicate that.
+
+No upstream file touched beyond the two budgeted touchpoints above. No SPM dependency added.
+Files changed: `App/Navigation/ContentView.swift`, `App/Navigation/AppSidebar.swift`,
+`DesignSystem/Theme/AppTheme.swift`, `Features/Meetings/Views/MeetingsView.swift`,
+`Features/Meetings/Views/MeetingDetailView.swift`,
+`Features/Meetings/Views/MeetingRecordingController.swift`,
+`Tests/VoiceInkTests/Features/Meetings/Views/MeetingRecordingControllerTests.swift`.

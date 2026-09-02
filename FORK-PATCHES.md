@@ -869,6 +869,143 @@ residual holes are stated there and accepted: passing a no-op canceller, and `un
 `.tandem/` dependency) handover document for the next stage, covering AEC/VAD wiring, rotation
 inputs/outputs, reconcile-before-format ordering, and diarizer preload/cancellation semantics,
 all cited against donor file/line references.
+## phase-1-aec-dtln (Stage 1: Acoustic Echo Cancellation, DTLN path)
+
+Ports the donor's meeting AEC engine, DTLN path only (LocalVQE deferred; Apple Voice Processing
+I/O rejected — both settled by the Phase 1 AEC de-risk investigations at
+`.tandem/884f6ef6905c4e2aa4e2ca28c34ea629/{dtln-aec-viability,vpio-aec-spike}.md`, outside this
+repo): `Capture/MeetingNeuralAec.swift` (donor 796 lines, DTLN-only excision — 4 points: the
+`preload()` LocalVQE-first branch removed, `MeetingAecProcessorSelection` trimmed 3→1 case, the
+`localvqe` special case in `referenceDelaySamples()` dropped, `LocalVQEProcessor.swift`/
+`LocalVQEBridge` never ported at all — delay estimator and buffer/trim machinery kept verbatim,
+load-bearing on DTLN), `Capture/MeetingAecDiagnostics.swift` (extracted from
+`MeetingSessionDiagnostics.swift` donor lines 72-156: `MeetingAecDiagnosticsSnapshot` +
+its `Decodable` extension, `MeetingAecDelayObservation`, `MeetingAecDelayCandidateScore`,
+`MeetingAecDelaySkip` — same donor file as `Capture/AudioSampleStats.swift` (lines 5-52, Stage 0)
+and capture-core's `SystemAudioCaptureDiagnostics.swift` (lines 54-71), three different slices of
+one donor file ported independently by three different agents; the `MeetingSessionDiagnostics`
+aggregator class itself, donor line 158+, is not ported — MeetingSession integration owns it),
+and `Tests/.../MeetingNeuralAecTests.swift` (15 of the donor's 17 `@Test`s; 2 dropped —
+`localVQEBridgeRejectsEmptyModelPath`, `localVQEBridgeReportsMissingLibraryPath` — called the
+`LocalVQEBridge` C target directly and would no longer compile).
+
+Adds `MeetingAecRouteBypassSource`, a small protocol (new, not from the donor — the donor never
+gated meeting AEC on route) letting a headphone-like audio route bypass DTLN per mic chunk;
+seamed for the MeetingSession integration owner to wire to the real `AudioRouteClassifier`
+(ported separately, for dictation today).
+
+### 2. `project.pbxproj`: `dtln-aec-coreml` package reference + `DTLNAecCoreML`/`DTLNAec512` product links (VoiceInk target)
+
+This is an upstream-owned-file touch outside the `Features/Meetings/` slice, so it counts against
+the Phase 1+ budget the note below sets — and, same as section 1's bridging-header entry, it is
+logged here as a deliberate, one-time addition rather than left implicit in a diff.
+
+**Why this one is unavoidable, not a workaround.** Linking a Swift Package product into an Xcode
+target's build graph is not expressible any other way in a plain `.xcodeproj` (this project has
+no root-level `Package.swift` for the app itself — every dependency is an Xcode-managed
+`XCRemoteSwiftPackageReference`/`XCSwiftPackageProductDependency` pair, entirely inside
+`project.pbxproj`). There is no `xcodebuild` verb to add a package reference; only Xcode's GUI or
+a direct pbxproj edit can do it, and both mutate the same bytes. Confirmed empirically before
+touching anything: with `dtln-aec-coreml` pinned in `Package.resolved` and both new Swift files
+in place (picked up automatically via `PBXFileSystemSynchronizedRootGroup`, no pbxproj edit
+needed for those), the *only* build error in the whole log was
+`MeetingNeuralAec.swift:53:8: error: Unable to resolve module dependency: 'DTLNAecCoreML'`.
+
+**Why this Stage-1 cluster specifically, and not left for a later serial merge.** The four
+parallel Stage-1 agents (capture core, mic+route, AEC, VAD chunking) were each told not to touch
+`project.pbxproj`, to avoid a four-way collision on one shared file. Checked before editing: the
+capture-core cluster had already finished and had not touched it; mic+route and vad-chunking were
+both instructed not to and have no reason to (neither adds an SPM dependency). With no live
+collision risk, adding it here — once, minimally — is cheaper than adding a fifth, purely
+mechanical hand-off step whose only job would be this exact 6-hunk edit.
+
+**The edit, and confirmation every hunk was read.** Six additive hunks, no reformatting, no
+`objectVersion`/`preferredProjectObjectVersion` change, modeled directly on the existing
+`swift-huggingface` entry (same `exactVersion` requirement shape) and on `mlx-swift-lm` (same
+one-package/two-products shape, there `MLXLLM`+`MLXLMCommon`, here `DTLNAecCoreML`+`DTLNAec512`):
+
+1. `PBXBuildFile` section: 2 new entries (`DTLNAecCoreML in Frameworks`, `DTLNAec512 in
+   Frameworks`), each `productRef`-linked to its `XCSwiftPackageProductDependency`.
+2. `VoiceInk` target's `Frameworks` build phase `files` list: the same 2 entries appended.
+3. `VoiceInk` target's `packageProductDependencies`: 2 entries appended (test targets and
+   `VoiceInkRefineXPC` untouched — nothing in this port is referenced outside the `VoiceInk`
+   app target; the ported test file uses `@testable import VoiceInk` only, never
+   `import DTLNAecCoreML` directly).
+4. `PBXProject.packageReferences`: 1 entry appended
+   (`XCRemoteSwiftPackageReference "dtln-aec-coreml"`).
+5. `XCRemoteSwiftPackageReference` section: 1 new block, `repositoryURL =
+   "https://github.com/MimicScribe/dtln-aec-coreml.git"`, originally `requirement = { kind =
+   exactVersion; version = 0.7.0; }` — pinned exact, not `upToNextMajorVersion`, since this
+   package is archived and will never publish a compatible newer tag to float onto. **Repinned
+   to `{ kind = revision; revision = ecb641dcb4b152fd10b1261a869aaa1e8acf0174; }` shortly after
+   — see the dedicated subsection below — for a LICENSE fix found during review, not for any
+   code reason.**
+6. `XCSwiftPackageProductDependency` section: 2 new blocks (`DTLNAecCoreML`, `DTLNAec512`), both
+   `package`-linked to the one reference above.
+
+`git diff VoiceInk.xcodeproj/project.pbxproj` was read in full after the edit — all 6 hunks are
+attributable to exactly this package link, nothing else. `xcodebuild -resolvePackageDependencies`
+afterward resolved `DTLNAecCoreML` at `0.7.0` and left `Package.resolved` byte-identical to the
+version already committed (the manual pin added ahead of this edit — see the AEC task report —
+matched exactly what a real Xcode resolution produces). `scripts/verify-package-trust.sh` passed
+unchanged. Debug build and the full local test run (`xcodebuild test`, CI's exact invocation)
+both succeeded afterward — see the AEC task report,
+`.tandem/884f6ef6905c4e2aa4e2ca28c34ea629/aec-dtln.md`, for the literal commands and output.
+
+### 3. `dtln-aec-coreml` repinned from tag `0.7.0` to commit `ecb641d`, for a LICENSE fix
+
+The review that produced section 2's pin found that `LICENSE` at tag `0.7.0` read verbatim
+`Copyright (c) 2026 Anthropic` — not MimicScribe, the actual publisher — unchanged since the
+repo's first commit and identical at the donor's older `0.6.0-beta` pin, with the same
+misattribution in `DTLNAecCoreML.podspec` (`s.author`, `s.homepage`, `s.source` all pointing at
+an unrelated `anthropics/` GitHub org). An MIT grant is only worth what the granting party can
+actually grant. The maintainer's very next commit, `ecb641d` — one commit past the `0.7.0` tag,
+and the current archived HEAD — fixes exactly that (LICENSE and podspec renamed to MimicScribe)
+and nothing else functional, and additionally adds the archive notice to the README.
+
+**Verified docs-only before repinning**, so this costs nothing in code: `git diff
+0.7.0..ecb641d --stat` touches exactly 4 files (`DTLNAecCoreML.podspec`,
+`Documentation/GettingStarted.md`, `LICENSE`, `README.md`) — zero changes under `Sources/`, to
+`Package.swift`, under `ThirdPartyLicenses/`, or to any `.mlpackage` resource. Confirmed by git
+object identity, not just diff absence: the `Sources/` tree
+(`9d3f71f8f9ab8ac185c4b79425f913c27edd7067`) and the `Package.swift` blob
+(`e41c9ef8064ee1cd1ad964e9ce23e1dce05f8f07`) are byte-identical at both revisions. Nothing in
+`MeetingNeuralAec.swift` or its tests needed to change.
+
+**The pbxproj edit for the repin** was a single-hunk, one-line-pair change to the existing
+`XCRemoteSwiftPackageReference "dtln-aec-coreml"` block's `requirement`, from `kind =
+exactVersion; version = 0.7.0;` to `kind = revision; revision =
+ecb641dcb4b152fd10b1261a869aaa1e8acf0174;` (pinning a commit rather than a tag requires the
+`revision` requirement kind). Read in full; nothing else in the file changed.
+`xcodebuild -resolvePackageDependencies` resolved `DTLNAecCoreML` at `ecb641d` afterward;
+`scripts/verify-package-trust.sh --update` re-blessed the moved pin; Debug build and the full
+local test run both succeeded again. Full history of the LICENSE finding, kept rather than
+discarded, lives in the `dtln-aec-coreml` entry's `note` field in `package-trust.json` and in
+the AEC task report.
+
+### 4. `scripts/verify-package-trust.sh`: plain-package `note` field now survives `--update`
+
+Found while writing the note above: `--update` already preserves an existing `note` across runs
+for the `components` section (`entry.get("note", "PENDING REVIEW")`), but rebuilds each plain
+package's `graph.packages` record from scratch every time, with no equivalent preservation. A
+`note` manually added to a package (as done here, twice, once for each pin) would be silently
+dropped by the very next `--update` for a completely unrelated pin bump elsewhere in the graph
+— and `verify` mode would keep passing, since it only compares `location`/`revision`/`tree`/
+`manifests`, not `note`, so nobody would notice. Fixed surgically: in the same loop that builds
+each package's record, look up the previously-trusted record for that identity and carry its
+`note` forward if one exists (mirrors the components pattern; does *not* default-inject
+`"PENDING REVIEW"` onto every plain package, since most carry no note and don't need one).
+
+**Proved with a real, reversible test**, not just reasoning about the code: temporarily bumped
+`KeySender`'s pin in `Package.resolved` to a different, real commit on its own repo
+(`bd01c54755b337ea63211656dab916afe7e40357`, an unrelated package to `dtln-aec-coreml`), ran
+`scripts/verify-package-trust.sh --update`, and confirmed both halves of the result: KeySender's
+own record genuinely changed (`~ package keysender: 99584bf1a03a -> bd01c54755b3`, proving this
+was a real re-bless, not a no-op), and `dtln-aec-coreml`'s `note` survived intact (present,
+correct length, revision unchanged) despite having nothing to do with the pin that moved. Then
+reverted KeySender's pin back to its correct committed revision and ran `--update` once more to
+restore the clean, correct final state — confirmed with `scripts/verify-package-trust.sh`
+(verify mode) passing and `git diff --stat` showing no residual KeySender change anywhere.
 
 ## Architecture budget note
 
@@ -921,3 +1058,7 @@ precedent by extracting `AudioSampleStats.swift` from the same donor file. It is
 the Stage 0 decision NOT to port `MeetingPromptStateMachine.swift`: that would have required
 inventing a placeholder for `MeetingCandidate`, a type belonging to a detection subsystem that
 has not been designed yet, which is a different act from lifting declarations verbatim.
+should look nothing like this. Stage 1's own touchpoint count so far: 2 (Stage 0's bridging
+header, this stage's package link) — both one-time additions to a target's build graph, not
+recurring edits, and both logged with the same rationale: confirmed unavoidable, confirmed
+minimal, confirmed no live collision with a parallel agent.

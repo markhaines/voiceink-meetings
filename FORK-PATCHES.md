@@ -1071,6 +1071,88 @@ header, this stage's package link) — both one-time additions to a target's bui
 recurring edits, and both logged with the same rationale: confirmed unavoidable, confirmed
 minimal, confirmed no live collision with a parallel agent.
 
+## meeting-recording-writer (Stage 1: retained mixed-recording writer)
+
+`VoiceInk/Features/Meetings/Capture/MeetingRecordingWriter.swift` and its test
+(`Tests/VoiceInkTests/Features/Meetings/Capture/MeetingRecordingWriterTests.swift`) — no entry
+needed under the rule at the top of this file (new code entirely under `Features/Meetings/`).
+Logged anyway for visibility, matching the precedent set by the `SystemAudioCaptureDiagnostics`
+note above.
+
+Ported verbatim from the donor's `MeetingRecordingWriter.swift` (273 lines): mixes mic + system
+PCM16 into one retained WAV, with `persistTemporaryRecordingAsync(...)` transcoding to M4A (or
+moving as-is for WAV) into the app's support directory. This is the retained *mixed* recording
+for later export — distinct from `PCMChunkRecorder` (already ported, per-source transcription
+chunks) and `WavWriter` (already ported, static WAV header helpers). No dependency on any
+unresolved seam: it does not reference `MeetingSession` or any other undesigned type, so it
+carried no out-of-scope surface to extract or defer.
+
+Diff against the donor is empty except the per-file MIT header block (confirmed with `diff`,
+matching the same verbatim precedent as `PCMChunkRecorder.swift`). The test file's only
+non-header change is `@testable import MuesliNativeApp` → `@testable import VoiceInk`, the
+same single-line adaptation `PCMChunkRecorderTests.swift` used. None of the five tests touch
+real audio hardware (they exercise pure file I/O and in-memory mixing), so none needed the
+`TEST_RUNNER_VOICEINK_CI` CI-only guard `AudioGraphExceptionBridgeTests.swift` uses.
+
+Not wired into any engine — `MeetingEngine` does not exist yet and is out of scope for this
+port. The class and its tests land standalone, same as `SystemAudioCaptureDiagnostics` did.
+
+### Fix round: temp-directory identity rename, init leak fix, missing test coverage
+
+Independent review of PR #9 (approved, zero blocking issues) found one thing worth fixing
+before merge and asked for broader test coverage. Two production deviations from the donor
+now exist, both intentional and both logged here (superseding the "diff against the donor is
+empty except the header block" claim two paragraphs up, which was true only up to this point):
+
+1. **Temp directory renamed** `muesli-meeting-recordings` → `voiceinkmeetings-meeting-
+   recordings`. Same rationale `CoreAudioSystemRecorder.swift` already established for its own
+   temp directory (`muesli-system-audio` → `voiceinkmeetings-system-audio`, see that file's
+   header and the `phase-1-capture-core` section above): `FileManager.default.temporaryDirectory`
+   is shared per-user, not per-app, so if the donor app is ever installed on the same Mac, two
+   apps would sweep and write the same directory. Checked for every occurrence before changing
+   it, per the lesson from that same port (a name used in more than one place — creation and a
+   separate sweep/cleanup match — breaks silently if only one site is renamed): the donor's
+   `MeetingRecordingWriter.swift` has exactly one occurrence, but the donor's
+   `MuesliController.swift` (`recoverStaleLiveMeetings`'s startup path, not yet ported — it
+   belongs to a future `MeetingEngine`/app-lifecycle port, well outside this port's scope) has a
+   *second* occurrence: a `cleanupTemporaryDirectory(named: "muesli-meeting-recordings", ...)`
+   startup sweep. That second site does not exist in this fork today, so nothing here is
+   currently broken by the rename — but whoever ports that startup-cleanup logic later MUST use
+   `voiceinkmeetings-meeting-recordings` to match, or the sweep will silently miss this writer's
+   temp files and they will accumulate forever. Flagging it here so that future port does not
+   rediscover the mismatch the hard way.
+2. **`init()` no longer leaks an empty file on a failed `FileHandle` open.** The donor calls
+   `FileManager.default.createFile(atPath:contents:nil)` and then guards on
+   `FileHandle(forWritingAtPath:)`; if the guard fails, the donor throws without removing the
+   file it just created, leaving an orphaned zero-byte WAV in the temp directory. This port
+   removes it (`try? FileManager.default.removeItem(at: fileURL)`) before throwing. The same
+   latent leak exists in `PCMChunkRecorder.createFileState()`, ported verbatim in Stage 1 and
+   out of scope for this fix round — noted here for whoever next touches that file.
+
+Four tests added beyond the donor's five, per the reviewer's request, all in the same test
+file: a transcode-failure path that feeds a non-audio file as the "temp WAV" and asserts the
+transcode throws *and* the temp recording survives (it's the only copy — losing it on a failed
+export would make the recording unrecoverable) with no leftover `.m4a` in the destination
+directory; a cancellation test that asserts `stop()` returns `nil` afterward and that further
+`appendMic`/`appendSystem` calls stay inert rather than crashing or resurrecting a file; a
+disk-level cancellation test that diffs `FileManager`'s directory listing before/after to prove
+the temp file is actually deleted, not just that in-memory state was reset (the same class of
+gap a PCMChunkRecorder test was strengthened to catch in Stage 1); and a genuine two-queue
+concurrent-append test — two separate `DispatchQueue`s each append to the writer in different-
+sized chunks, and the test asserts the exact expected mixed output (positionally distinct mic/
+system values, so a lock failure that lost, duplicated, or reordered samples would be caught,
+not just a count mismatch). None of the four need real audio hardware, so none use
+`TEST_RUNNER_VOICEINK_CI`. The suite is now marked `.serialized`: two of the new tests touch the
+shared OS temp directory directly (`MeetingRecordingWriter.init()` takes no parameters — unlike
+`PCMChunkRecorder(directoryName:)`, there is no fork-injectable per-test directory to isolate
+into), so Swift Testing's default parallel execution could let one test's create/delete land
+inside another's before/after snapshot window.
+
+Donor test original for reference: `native/MuesliNative/Tests/MuesliTests/MeetingRecordingWriterTests.swift`, 110 lines.
+
+No upstream (`Beingpax/VoiceInk`) file touched, no SPM package added — same as the original
+port. Still not wired into any engine.
+
 ## stage2-models-store (Stage 2a: meeting data layer)
 
 Adds `Meeting.swift`, `MeetingSegment.swift` (both `Models/`), `MeetingSegmentPersistenceActor.swift`

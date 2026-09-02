@@ -1065,10 +1065,11 @@ minimal, confirmed no live collision with a parallel agent.
 
 ## stage2-models-store (Stage 2a: meeting data layer)
 
-Adds `Meeting.swift`, `MeetingSegment.swift` (both `Models/`), `MeetingSegmentPersistenceService.swift`
-(`Models/`) and `MeetingState.swift` (`State/`) — all new, entirely under `Features/Meetings/`,
-so none of them need an entry here under this file's own rule. This section covers the one
-upstream-file touch this stage makes.
+Adds `Meeting.swift`, `MeetingSegment.swift` (both `Models/`), `MeetingSegmentPersistenceActor.swift`
+(`Models/`, renamed from `MeetingSegmentPersistenceService.swift` in the fix round below) and
+`MeetingState.swift` (`State/`) — all new, entirely under `Features/Meetings/`, so none of them
+need an entry here under this file's own rule. This section covers the one upstream-file touch
+this stage makes.
 
 ### 1. `VoiceInk/App/VoiceInk.swift`: a 4th SwiftData store, `meetings.store`
 
@@ -1116,9 +1117,188 @@ over exhaustively.
 ### Note: unit tests need no `TEST_RUNNER_VOICEINK_CI` gating
 
 `Tests/VoiceInkTests/Features/Meetings/Models/MeetingModelTests.swift` and
-`MeetingSegmentPersistenceServiceTests.swift` run entirely against an in-memory SwiftData
+`MeetingSegmentPersistenceActorTests.swift` run entirely against an in-memory SwiftData
 `ModelContainer` (`ModelConfiguration(isStoredInMemoryOnly: true)`) — no `AVAudioEngine`, no
 `AudioQueueRef`, no CoreAudio device enumeration, nothing that touches the hardware inventory
 `AudioGraphExceptionBridgeTests.swift`'s CI-only skip (`phase-1-mic-route` section above) exists
 to work around. Confirmed by running the full local suite with `TEST_RUNNER_VOICEINK_CI` both
 set and unset: identical pass/fail results either way. No new gating was added.
+
+## stage2-models-store fix round (review response)
+
+Independent review of the PR above returned CHANGES-REQUIRED on one blocking issue
+(concurrency safety was contractual, not enforced) and one test-honesty issue (the
+"crash loses nothing" test proved cross-context object visibility inside one live container,
+not durability across a process death). Both are fixed here, in the same two files this
+stage already owned (`MeetingSegmentPersistenceService.swift`, renamed to
+`MeetingSegmentPersistenceActor.swift`, and its test file, likewise renamed, plus a new
+`MeetingSegmentPersistenceActorDurabilityTests.swift`). No third upstream-file touch was
+needed; `VoiceInk/App/VoiceInk.swift` is unchanged from the entry above, and the reviewer's own
+correction — that listing `Meeting.self`/`MeetingSegment.self` in both the aggregate `Schema`
+and `meetingsConfig` does NOT create store ambiguity, because the aggregate schema isn't a
+store assignment mechanism — is recorded here so it isn't re-litigated: that wiring is
+untouched, and should stay untouched.
+
+### 1. Concurrency: `MeetingSegmentPersistenceService` (struct wrapping a caller-supplied
+`ModelContext`) → `MeetingSegmentPersistenceActor` (`@ModelActor`, `PersistentIdentifier` in
+and out)
+
+The struct's real defect: it accepted any `ModelContext` and exposed synchronous methods
+taking/returning managed `Meeting` objects, with only a doc comment telling callers to "hop to
+the context's own actor" first — a documented contract, not a structural one, and the project's
+own hard-won lesson (two earlier "safe" type boundaries elsewhere in this codebase were each
+defeated in one line by review because the guarantee was documented rather than compiler-
+enforced) says that doesn't count as fixed.
+
+**Fix.** `@ModelActor actor MeetingSegmentPersistenceActor` — SwiftData's purpose-built tool for
+this exact problem (<https://developer.apple.com/documentation/swiftdata/modelactor>). The
+macro synthesizes the actor's own `ModelContext` from a `ModelContainer` passed to the generated
+`init(modelContainer:)`, so the type is now constructed from a container, never handed someone
+else's context, matching the reviewer's explicit direction. Every public method takes and
+returns `PersistentIdentifier` (`Sendable`, `Hashable`, `Codable`) instead of a managed
+`Meeting`/`MeetingSegment` — no managed object of either type ever crosses the actor boundary.
+
+**The property this structurally guarantees, verified by attacking it, verbatim.** Per the
+brief's instruction, three deliberate violations were written against this file in a scratch
+test file (`Tests/VoiceInkTests/Features/Meetings/Models/ScratchAttack.swift`), built, the exact
+compiler output captured below, then the scratch file deleted — it is not part of this PR's
+diff:
+
+```swift
+// ATTACK 1: pass a managed `Meeting` object where a `PersistentIdentifier` is required.
+func attackPassManagedObjectAcrossBoundary(
+    actor: MeetingSegmentPersistenceActor, meeting: Meeting
+) async throws {
+    try await actor.appendSegment(
+        startOffset: 0, endOffset: 1, speakerLabel: "You", text: "x",
+        sourceChannel: .mic, to: meeting
+    )
+}
+
+// ATTACK 2: call an actor-isolated method synchronously, without `await`.
+func attackCallWithoutAwait(actor: MeetingSegmentPersistenceActor, id: PersistentIdentifier) throws {
+    try actor.updateState(.paused, for: id)
+}
+
+// ATTACK 3 (expected, per older SwiftData write-ups, to compile — it did NOT, see below):
+func attackReachThroughNonisolatedModelContext(actor: MeetingSegmentPersistenceActor, meeting: Meeting) {
+    actor.modelContext.insert(meeting)
+}
+```
+
+Verbatim `xcodebuild build-for-testing` output (Xcode 26.6, macOS SDK):
+
+```
+ScratchAttack.swift:13:34: error: cannot convert value of type 'Meeting' to expected argument type 'PersistentIdentifier'
+    sourceChannel: .mic, to: meeting
+                             ^
+ScratchAttack.swift:19:15: error: call to actor-isolated instance method 'updateState(_:for:)' in a synchronous nonisolated context
+    try actor.updateState(.paused, for: id)
+              ^
+VoiceInk.MeetingSegmentPersistenceActor.updateState:2:15: note: calls to instance method 'updateState(_:for:)' from outside of its actor context are implicitly asynchronous
+internal func updateState(_ state: VoiceInk.MeetingState, for meetingID: PersistentIdentifier) throws}
+              ^
+ScratchAttack.swift:25:11: error: actor-isolated property 'modelContext' can not be referenced from a nonisolated context
+    actor.modelContext.insert(meeting)
+          ^
+```
+
+**No residual hole, and this was checked rather than assumed — a correction to the brief's own
+premise.** The brief (correctly describing older SwiftData documentation) expected attack 3 to
+compile clean, exposing `AnyModelActor.modelContext`'s documented `nonisolated` declaration as
+an unclosable framework gap. It does not compile on this project's actual toolchain: reading
+`/Applications/Xcode-26.6.0.app/.../SwiftData.framework/.../arm64e-apple-macos.swiftinterface`
+directly shows `extension ModelActor { public var modelContext: ModelContext { get } }` with
+**no** `nonisolated` modifier, which makes it actor-isolated by default on this SDK — and attack
+3's compiler error confirms it empirically, not just from reading the interface. So: no
+disclosed hole here, because there genuinely isn't one on this SDK. (A future SDK could in
+principle change this back; if `attackReachThroughNonisolatedModelContext`-shaped code ever
+starts compiling clean, that is the signal something regressed.)
+
+### 2. A second, worse crash found by attacking the actor's own identifier lookup
+
+Writing the "unknown identifier" test (`unknownIdentifierThrows`, an identifier from a
+different `ModelContainer` passed into a legitimate actor call) surfaced a real production bug,
+not just a test gap: SwiftData's own identifier-lookup APIs are not safe against a foreign
+`PersistentIdentifier`, in two different ways, both proven with real crash evidence rather than
+inferred:
+
+- **`ModelContext.model(for:)`** returns a plain `any PersistentModel` (no `Optional`), so
+  `modelContext.model(for: id) as? Meeting` looks like a normal nil-on-miss check. It isn't:
+  touching the returned fault crashes the process outright —
+  `SwiftData/BackingData.swift:1057: Fatal error: This model instance was invalidated because
+  its backing data could no longer be found the store` — reproduced against a `startMeeting`'d
+  meeting from one in-memory `ModelContainer`, looked up through a second, unrelated
+  `ModelContainer`'s context.
+- **`ModelActor`'s own built-in `self[id, as: Meeting.self]` subscript** — the framework's
+  purpose-built, `Optional`-returning lookup for exactly this situation — was tried as the
+  natural replacement for a hand-rolled fallback, and is WORSE: it does not return `nil` for a
+  foreign identifier, it returns a non-nil but invalid `Meeting`. The `guard let` in
+  `meeting(for:)` then passes, and the crash only happens on the NEXT property mutation. Caught
+  by the full local test suite (not by inspection): `~/Library/Logs/DiagnosticReports/VoiceInk
+  Dev-2026-09-02-083842.ips`, `EXC_BREAKPOINT`/`SIGTRAP`, symbolicated stack bottoming out at
+  `Meeting.duration.setter` → SwiftData's `Observation` machinery → `_assertionFailure`, from
+  `MeetingSegmentPersistenceActorTests.unknownIdentifierThrows()` calling
+  `actor.updateDuration(10, for: foreignID)`. This is a strictly worse failure mode than
+  `model(for:)`'s: it defers the crash past the "did I find it" check into whatever mutation
+  happens to run next, so a naive `guard let ... else { throw }` around it looks correct and
+  isn't.
+
+**Fix, verified as the one approach that survives being attacked.**
+`MeetingSegmentPersistenceActor.meeting(for:)` uses neither: `modelContext.registeredModel(for:
+id)` first (a pure in-memory lookup, no store access — this actor's own context always has a
+`Meeting` registered the instant `startMeeting` creates it, so every legitimate call in a single
+actor's lifetime hits this branch), falling back to a `FetchDescriptor<Meeting>(predicate:
+#Predicate { $0.persistentModelID == id })` for an identifier the context hasn't seen yet (a
+real store query — an absent row is an empty result, not a fault to materialize, so it degrades
+to "throw `.meetingNotFound`" instead of crashing). Verified against all three call shapes: a
+foreign-container identifier (throws, no crash), a same-session identifier the actor's own
+context already has registered (works, as before), and — new coverage — a same-session
+identifier the actor's context has NOT yet registered
+(`MeetingSegmentPersistenceActorTests.unknownIdentifierThrows` no longer crashes; the durability
+tests below exercise the "not yet registered" fetch path directly, since a freshly reopened
+container never has anything registered).
+
+### 3. The durability test now proves the actual guarantee, against a real on-disk store
+
+`MeetingSegmentPersistenceActorDurabilityTests.swift` (new file) replaces the previous
+in-memory-only "crash loses nothing" coverage. It writes a meeting and five segments through a
+`ModelConfiguration(schema:url:)` (a real temp-directory SQLite file), lets the writing
+`ModelContainer`/actor go completely out of scope with **no** `finish` call (standing in for a
+crash mid-meeting), then opens a **brand-new** `ModelContainer` against the same file and
+asserts every segment is present, in the correct order (`startOffset`, then `orderIndex`
+tiebreak), and still attached to its meeting. A second test does the same for `updateDuration`
++ `finish`. Runs on a CI runner with no audio hardware — only a temp-directory file, cleaned up
+in a `defer`.
+
+**A second empirical finding, this one about test-writing, not the actor.**
+`readContext.model(for: meetingID)` on the freshly reopened container hit the exact same
+`SwiftData/BackingData.swift` crash class described in section 2 above — this time not because
+the identifier was foreign, but because a brand-new context has nothing registered yet, and
+`model(for:)`'s crash-on-fault behavior doesn't care why the row can't be resolved through that
+path. Fixed the same way as the actor: `readContext.fetch(FetchDescriptor<Meeting>())` instead.
+
+**A third finding, more consequential for whoever builds MeetingEngine's crash recovery.** The
+first version of this test also asserted `reread.persistentModelID == meetingID` (the identifier
+captured before teardown, compared against the identifier of the row read back after reopening).
+That assertion FAILED — reliably, not flakily — even though the store UUID, entity name, and
+primary key all matched in the debug description. This is not a bug in this PR; it's Apple's own
+documented behavior (`PersistentIdentifier` is valid only for the lifetime of the `ModelContainer`
+that produced it) proven empirically rather than taken on faith. **Implication recorded here so
+it isn't rediscovered the hard way later:** a future MeetingEngine crash-recovery feature that
+needs to find "the still-`.recording` meeting from last session" on relaunch must query for it
+(by `state`, or by this app's own `Meeting.id: UUID`), never by holding onto and reusing a
+`PersistentIdentifier` saved from a previous process. The durability tests now compare
+`Meeting.id` (this app's own stored UUID, captured from a plain read on the still-live container
+before teardown) instead, and use reference equality (`$0.meeting === reread`) for the
+segment-to-meeting relationship check, which is valid because both sides are fetched into the
+same `readContext`.
+
+### Verification
+
+Full local suite (`xcodebuild test`, CI's exact invocation, `-destination 'platform=macOS'`,
+parallel test execution as CI runs it) green twice in a row after the fixes above, plus the
+isolated new-test-only run (non-parallel) used to bisect each crash down to its actual test and
+call site. `scripts/verify-package-trust.sh` passes unchanged (no new dependency). Diagnostic
+report paths for both crash discoveries are cited above rather than only described, so they can
+be re-read if this ever needs re-verifying.

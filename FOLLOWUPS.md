@@ -3,6 +3,25 @@
 Known gaps deliberately left open, with the reasoning, so they are decisions rather than
 accidents. See each entry for the evidence.
 
+## `Meeting.id` / `MeetingSegment.id` are not declared `@Attribute(.unique)`
+
+Source: `VoiceInk/Features/Meetings/Models/Meeting.swift`,
+`VoiceInk/Features/Meetings/Models/MeetingSegment.swift`. Both `id: UUID` fields are plain
+stored properties, not marked unique. This is fine today because every `id` is locally
+constructed (`UUID()` in each model's own `init`, never accepted as external input) and nothing
+currently queries by `id` for identity purposes — `MeetingSegmentPersistenceActor` looks meetings
+up by `PersistentIdentifier`, SwiftData's own row identity, not by this field.
+
+**Would need revisiting** if a future import or sync path (e.g. a Transcripted-compatible
+importer, or cross-device sync) ever admits externally supplied `id` values: without a
+uniqueness constraint, two rows could silently share an `id`, and any code written later that
+assumes `id` is a reliable lookup key (following the pattern `Meeting.id` is already documented
+as suited for — see `MeetingSegmentPersistenceActorDurabilityTests.swift`'s note on why
+`PersistentIdentifier` doesn't survive a container reopen but `Meeting.id` does) would need the
+constraint added first. Not fixed here: no current caller needs it, and adding `@Attribute
+(.unique)` to an already-shipped model is the kind of change worth making deliberately, with a
+migration in mind, rather than speculatively.
+
 ## `AudioGraphExceptionBridgeTests`: three tests skip on CI, run for real on a developer Mac
 
 `inputStateReadIsContained`, `invalidInputRouteIsContained` and `installTapExceptionIsContained`

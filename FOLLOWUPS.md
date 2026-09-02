@@ -90,6 +90,33 @@ An earlier device-presence guard attempt on this exact file/branch is superseded
 described in the file header — see PR #3's `acf438c`/`2f822a4` history for that dead end if it
 resurfaces as a suggestion.
 
+## `RouteAwareMeetingMicRecorderTests.healthTriggeredRecoveryPromotesOnFirstBuffer` flaked once on CI
+
+`Tests/VoiceInkTests/Features/Meetings/Capture/RouteAwareMeetingMicRecorderTests.swift`. Failed
+once on CI run 33664226428 (attempt 1) at 0.038s -- far inside `waitUntil`'s 5s timeout, so an
+assertion flipped rather than a wait expiring. Evidence that it is non-deterministic rather than
+a real regression:
+
+- **The same commit (`1bc26756`) passed on attempt 2 of the same run**, with no code change
+  between attempts.
+- Locally the test passed 12/12 consecutive runs alongside the full `MeetingEngineTests` suite.
+- It is the only failed run in the last 25 on this repo.
+- The change in flight (`MeetingChunkCollector`/`MeetingEngine` persistence reporting) touches
+  no code this test exercises: `MeetingEngineTests` uses its own private `FakeMeetingMicRecorder`
+  and never constructs a `RouteAwareMeetingMicRecorder`.
+
+**Likely cause, not confirmed:** the test's `factoryCalls` and `samples` are plain `var`s
+mutated from recorder callbacks (which run on `lifecycleQueue` and its async continuations) and
+read from the test task with no synchronisation, so their visibility across threads is not
+guaranteed. `#expect(degraded.stopCalls == 0)` is additionally a "has not happened yet"
+assertion, which is only ever true within a window. Not confirmed because the `.xcresult` is not
+recoverable from a failed CI run (see the entry below), so which of the three `#expect`s failed
+is unknown -- fixing that upload would have answered this in one step.
+
+**Not fixed here:** out of scope for the meeting-persistence change that observed it, and fixing
+it properly means giving those counters real synchronisation rather than adding a retry. Worth
+doing together with the `.xcresult` upload below, so the next occurrence is diagnosable.
+
 ## `.xcresult` not recoverable from a failed CI run
 
 When "Run test targets" fails, nothing in `.github/workflows/ci.yml` uploads the `.xcresult`

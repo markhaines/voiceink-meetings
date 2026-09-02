@@ -1,4 +1,13 @@
-// Ported verbatim from Muesli-HQ/muesli (native/MuesliNative/Sources/MuesliNativeApp/MeetingRecordingWriter.swift).
+// Ported from Muesli-HQ/muesli (native/MuesliNative/Sources/MuesliNativeApp/MeetingRecordingWriter.swift).
+//
+// Two deliberate deviations from the donor, both logged in FORK-PATCHES.md:
+// 1. The retained-recording temp directory is `voiceinkmeetings-meeting-recordings`, not the
+//    donor's `muesli-meeting-recordings` -- same fork-owned-identity rationale as
+//    CoreAudioSystemRecorder.swift's temp directory rename: FileManager.temporaryDirectory is
+//    shared per-user, so two apps installed on the same Mac must not collide on the same sweep
+//    target.
+// 2. init() removes the empty file it just created if opening a FileHandle for it fails, so a
+//    failed init leaves nothing behind (the donor leaves an orphaned zero-byte file).
 //
 // MIT License
 //
@@ -76,11 +85,12 @@ final class MeetingRecordingWriter {
 
     init() throws {
         let tempDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("muesli-meeting-recordings", isDirectory: true)
+            .appendingPathComponent("voiceinkmeetings-meeting-recordings", isDirectory: true)
         try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
         let fileURL = tempDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("wav")
         FileManager.default.createFile(atPath: fileURL.path, contents: nil)
         guard let fileHandle = FileHandle(forWritingAtPath: fileURL.path) else {
+            try? FileManager.default.removeItem(at: fileURL)
             throw NSError(
                 domain: "MeetingRecordingWriter",
                 code: 1,

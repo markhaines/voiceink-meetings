@@ -1,7 +1,21 @@
 // Adapted from Muesli-HQ/muesli
-// (native/MuesliNative/Tests/MuesliTests/MeetingRecordingWriterTests.swift).
+// (native/MuesliNative/Tests/MuesliTests/MeetingRecordingWriterTests.swift, 110 lines).
 // Import line changed: `@testable import MuesliNativeApp` -> `@testable import VoiceInk`
-// (this fork's module name). Otherwise byte-for-byte unchanged.
+// (this fork's module name). The five donor tests below `readMonoPCM16WAVSamples` (through
+// `persistTemporaryRecordingTranscodesToM4AByDefault`) are otherwise byte-for-byte unchanged.
+//
+// Four tests added beyond the donor, per fork review: a transcode-failure path
+// (`persistTemporaryRecordingSurfacesTranscodeFailure`), cancellation's in-memory state reset
+// (`cancelResetsStateForSubsequentCalls`), cancellation's on-disk cleanup
+// (`cancelDeletesTemporaryFileFromDisk`), and genuine two-queue concurrent appends
+// (`concurrentAppendsPreserveOrderingAndCounts`). None need real audio hardware, so none use
+// the `TEST_RUNNER_VOICEINK_CI` guard `AudioGraphExceptionBridgeTests.swift` uses. The suite is
+// marked `.serialized` because two of the new tests diff `FileManager`'s listing of the shared
+// `voiceinkmeetings-meeting-recordings` temp directory before and after an operation --
+// `MeetingRecordingWriter.init()` takes no parameters (fixed donor API, not a fork-injectable
+// directory like `PCMChunkRecorder(directoryName:)`), so every writer in this suite shares one
+// directory, and Swift Testing's default parallel test execution would let one test's create/
+// delete steps land inside another's before/after snapshot window.
 //
 // MIT License
 //
@@ -32,7 +46,7 @@ import Foundation
 import Testing
 @testable import VoiceInk
 
-@Suite("MeetingRecordingWriter")
+@Suite("MeetingRecordingWriter", .serialized)
 struct MeetingRecordingWriterTests {
 
     @Test("streaming writer merges mic and system samples incrementally")
@@ -116,6 +130,116 @@ struct MeetingRecordingWriterTests {
 
         let file = try AVAudioFile(forReading: savedURL)
         #expect(file.length > 0)
+    }
+
+    @Test("persistTemporaryRecording throws and preserves the temp recording when the M4A transcode fails")
+    func persistTemporaryRecordingSurfacesTranscodeFailure() async throws {
+        let sourceDirectory = makeTemporaryDirectory()
+        let tempURL = sourceDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("wav")
+        try Data("not a real wav file".utf8).write(to: tempURL)
+        let supportDirectory = makeTemporaryDirectory()
+        let startedAt = Date(timeIntervalSince1970: 1_711_000_000)
+
+        await #expect(throws: (any Error).self) {
+            _ = try await MeetingRecordingWriter.persistTemporaryRecordingAsync(
+                from: tempURL,
+                meetingTitle: "Broken Recording",
+                startedAt: startedAt,
+                supportDirectory: supportDirectory
+            )
+        }
+
+        // The temp recording must survive a failed transcode -- it is the only copy of the
+        // meeting, and losing it on a failed export would make the recording unrecoverable.
+        #expect(FileManager.default.fileExists(atPath: tempURL.path) == true)
+
+        let recordingsDirectory = supportDirectory.appendingPathComponent("meeting-recordings", isDirectory: true)
+        let leftoverM4As = (try? FileManager.default.contentsOfDirectory(atPath: recordingsDirectory.path))?
+            .filter { $0.hasSuffix(".m4a") } ?? []
+        #expect(leftoverM4As.isEmpty)
+    }
+
+    @Test("cancel resets in-memory state so a later stop returns nil and further appends stay inert")
+    func cancelResetsStateForSubsequentCalls() throws {
+        let writer = try MeetingRecordingWriter()
+        writer.appendMic([1000, 2000])
+
+        writer.cancel()
+        #expect(writer.stop() == nil)
+
+        // Appends after cancel must not resurrect a file handle or crash.
+        writer.appendMic([100])
+        writer.appendSystem([200])
+        #expect(writer.stop() == nil)
+    }
+
+    @Test("cancel deletes the in-progress temporary recording file from disk")
+    func cancelDeletesTemporaryFileFromDisk() throws {
+        let recordingsDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("voiceinkmeetings-meeting-recordings", isDirectory: true)
+        let filesBefore = existingFileNames(in: recordingsDirectory)
+
+        let writer = try MeetingRecordingWriter()
+        writer.appendMic([1000, 2000, 3000])
+
+        let createdFiles = existingFileNames(in: recordingsDirectory).subtracting(filesBefore)
+        #expect(createdFiles.count == 1)
+        let createdFileName = try #require(createdFiles.first)
+        let createdFileURL = recordingsDirectory.appendingPathComponent(createdFileName)
+        #expect(FileManager.default.fileExists(atPath: createdFileURL.path) == true)
+
+        writer.cancel()
+
+        #expect(FileManager.default.fileExists(atPath: createdFileURL.path) == false)
+    }
+
+    @Test("concurrent mic and system appends from separate queues do not lose or reorder samples")
+    func concurrentAppendsPreserveOrderingAndCounts() throws {
+        let writer = try MeetingRecordingWriter()
+        let sampleCount = 4000
+        let micSamples: [Int16] = (0..<sampleCount).map { Int16($0 % 1000) }
+        let systemSamples: [Int16] = (0..<sampleCount).map { Int16(($0 % 1000) + 2000) }
+        let expectedMixed: [Int16] = (0..<sampleCount).map { Int16(($0 % 1000) + 1000) }
+
+        let micQueue = DispatchQueue(label: "meeting-recording-writer-tests.mic")
+        let systemQueue = DispatchQueue(label: "meeting-recording-writer-tests.system")
+        let group = DispatchGroup()
+
+        group.enter()
+        micQueue.async {
+            var index = 0
+            while index < micSamples.count {
+                let end = min(index + 37, micSamples.count)
+                writer.appendMic(Array(micSamples[index..<end]))
+                index = end
+            }
+            group.leave()
+        }
+
+        group.enter()
+        systemQueue.async {
+            var index = 0
+            while index < systemSamples.count {
+                let end = min(index + 61, systemSamples.count)
+                writer.appendSystem(Array(systemSamples[index..<end]))
+                index = end
+            }
+            group.leave()
+        }
+
+        group.wait()
+
+        let tempURL = try #require(writer.stop())
+        let samples = try readMonoPCM16WAVSamples(from: tempURL)
+
+        #expect(samples == expectedMixed)
+    }
+
+    private func existingFileNames(in directory: URL) -> Set<String> {
+        guard let contents = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else {
+            return []
+        }
+        return Set(contents)
     }
 
     private func makeTemporaryDirectory() -> URL {

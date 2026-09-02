@@ -704,11 +704,9 @@ off, corrected after reading the real donor code) shared types in `Models/`:
   construction. Both read and confirmed directly, not assumed.
 
 `MeetingPromptStateMachine.swift` was in scope but is NOT ported — see the dedicated section
-below. Full narrative detail (every donor use-site read, exact commands run for each gate) is
-additionally in the task report at `.tandem/884f6ef6905c4e2aa4e2ca28c34ea629/phase1-foundation.md`,
-but that path is orchestration state, not part of this repository, so nothing above depends on
-it being reachable. This entry covers the one upstream-file touch, against the ~6-touchpoint
-budget the note below sets for Phase 1+.
+below. Every fact needed to understand this stage's changes is above, in this document; this
+entry covers the one upstream-file touch, against the ~6-touchpoint budget the note below sets
+for Phase 1+.
 
 ### 1. `project.pbxproj`: `SWIFT_OBJC_BRIDGING_HEADER` added (VoiceInk target, Debug + Release)
 
@@ -747,12 +745,88 @@ Recommendation for whichever Stage-1 cluster owns Detection: port
 `MeetingPromptStateMachine.swift` and `MeetingCandidateResolver.swift` together, verbatim, in
 the same change, under the same non-negotiable porting rules (every comment, every branch).
 
+## phase-1-vad-chunking (Stage 1: VAD chunking and transcript assembly)
+
+Ported verbatim into `VoiceInk/Features/Meetings/Transcription/`:
+`StreamingVadController.swift` (donor 225 lines, byte-identical), `TranscriptFormatter.swift`
+(donor 226, only `import MuesliCore` dropped), `TranscriptReconciler.swift` (donor 321, same),
+and `DiarizerRuntimePolicy.swift` (donor 306, one flagged deviation below). This section exists
+even though these files live entirely under `Features/Meetings/` — normally exempt per this
+file's header — because an independent review round required the one deviation below to be
+recorded here explicitly, not just in the file's own header comment.
+
+### `DiarizerRuntimePolicy.swift`: `DiarizerPreloadDiagnostics`'s default `signalSink`
+
+The donor's `DiarizerPreloadDiagnostics.init` (donor `DiarizerRuntimePolicy.swift:176-186`)
+defaults `signalSink` to:
+
+```swift
+signalSink: @escaping SignalSink = { event, parameters in
+    TelemetryDeck.signal(event, parameters: parameters)
+}
+```
+
+This fork has no `TelemetryDeck` dependency (confirmed by grepping `Package.resolved` and
+`project.pbxproj` — 28 pinned packages, none of them TelemetryDeck; VoiceInk has no telemetry
+system at all yet), and adding one is out of scope for this stage: it would mean editing
+`project.pbxproj` (forbidden for this cluster) and `package-trust.json` (owned by a different
+concurrent change). The verbatim default cannot compile as-is.
+
+**First attempt (reverted): a no-op default.** An earlier pass of this file replaced the default
+with `{ _, _ in }`. Independent cross-vendor review correctly flagged this as an unacceptable
+silent behavior change: every production caller that relies on the default (which is every real
+caller — none inject an explicit sink) would silently lose every preload
+started/ready/failed/interrupted diagnostic, with nothing anywhere signaling that anything had
+been dropped. A silent no-op default is not acceptable in any form, per that review.
+
+**Fix applied.** `signalSink` stays a defaulted parameter — same shape as the donor, so no call
+site is forced to change — but the default now logs through this fork's existing `os.Logger`
+facility (`Logger(subsystem: "com.hainesy.voiceinkmeetings", category: "DiarizerPreloadDiagnostics")`,
+the same convention used throughout the rest of the app, e.g. `VoiceInk/App/VoiceInk.swift`)
+instead of calling `TelemetryDeck.signal` or doing nothing. Preload diagnostics remain observable
+in Console.app / `log stream` until a real telemetry backend replaces this default. Every call
+site in the ported test suite (`DiarizerRuntimePolicyTests.swift`) already supplies its own
+explicit `signalSink`, so this default is only ever exercised by production code that hasn't been
+given one — no test behavior depends on it. Everything else in the file, including every comment
+and the M1/macOS-15.1 GPU-avoidance branch (FluidAudio issue #344), remains byte-for-byte
+identical to the donor.
+
+### `MeetingVadStreams.swift` and `ADAPTER-HANDOVER.md`: new fork-owned files, not ports
+
+Added in the same review round, for a different finding: `StreamingVadController.processAudio(_:)`
+takes an untyped `[Float]`, so nothing in this cluster's own code enforced the donor's
+AEC-cleaned-mic-only / raw-system-only split (`MeetingSession.swift:1226-1233` and
+`:1257-1262`) once a later adapter stage started wiring real audio in. `MeetingVadStreams.swift`
+adds `MicVadStream`/`SystemVadStream`, a facade over the (unedited) ported
+`StreamingVadController`, with distinct nominal wrapper types (`RawMicSamples`,
+`RawSystemSamples`) so feeding the wrong stream to the wrong VAD is a compile error. `MicVadStream`
+additionally owns the AEC call itself (`MicEchoCanceller`), so there is no API by which raw mic
+samples can reach the mic VAD un-cancelled: the facade takes raw samples and runs the canceller
+itself, and `AECCleanedMicSamples` is an unforgeable receipt it hands back rather than an input a
+caller constructs. Two earlier designs that instead restricted who could CONSTRUCT that type were
+both defeated (a trapping protocol witness; a cross-file extension initializer assigning an
+internal stored property) -- see that file's header comment for both defeats, and
+`MeetingVadStreamsTests.swift` for the full attack list with each verbatim compiler error. The two
+residual holes are stated there and accepted: passing a no-op canceller, and `unsafeBitCast`.
+`ADAPTER-HANDOVER.md`, alongside it in the same directory, is the self-contained (in-repo, no
+`.tandem/` dependency) handover document for the next stage, covering AEC/VAD wiring, rotation
+inputs/outputs, reconcile-before-format ordering, and diarizer preload/cancellation semantics,
+all cited against donor file/line references.
+
 ## phase-1-aec-dtln (Stage 1: Acoustic Echo Cancellation, DTLN path)
 
 Ports the donor's meeting AEC engine, DTLN path only (LocalVQE deferred; Apple Voice Processing
-I/O rejected — both settled by the Phase 1 AEC de-risk investigations at
-`.tandem/884f6ef6905c4e2aa4e2ca28c34ea629/{dtln-aec-viability,vpio-aec-spike}.md`, outside this
-repo): `Capture/MeetingNeuralAec.swift` (donor 796 lines, DTLN-only excision — 4 points: the
+I/O rejected — both settled by Phase 1 AEC de-risk investigations, whose findings are inlined
+here so they survive without any external report. **VPIO was rejected on the donor's own
+evidence**: Muesli shipped Apple VoiceProcessingIO in commit `75254c93` (2026-04-07) and
+reverted it in `01320aef` about 15 minutes later, with the revert message recording that VPIO's
+AEC "works but reduces speaker volume by 60-80% even at minimum ducking level. Users can't hear
+the meeting without headphones"; the very next donor commit adds the DTLN CoreML path. VPIO has
+no privileged reference for audio it does not itself render, so it compensates by ducking, and
+there is no public API to decouple cancellation from ducking. **LocalVQE was deferred** because
+its ggml dylibs are not in the donor repo and must be built from source
+(`scripts/build_localvqe.sh`); DTLN is the documented stopgap, with the LocalVQE follow-up
+recorded in `FOLLOWUPS.md`): `Capture/MeetingNeuralAec.swift` (donor 796 lines, DTLN-only excision — 4 points: the
 `preload()` LocalVQE-first branch removed, `MeetingAecProcessorSelection` trimmed 3→1 case, the
 `localvqe` special case in `referenceDelaySamples()` dropped, `LocalVQEProcessor.swift`/
 `LocalVQEBridge` never ported at all — delay estimator and buffer/trim machinery kept verbatim,
@@ -827,8 +901,10 @@ afterward resolved `DTLNAecCoreML` at `0.7.0` and left `Package.resolved` byte-i
 version already committed (the manual pin added ahead of this edit — see the AEC task report —
 matched exactly what a real Xcode resolution produces). `scripts/verify-package-trust.sh` passed
 unchanged. Debug build and the full local test run (`xcodebuild test`, CI's exact invocation)
-both succeeded afterward — see the AEC task report,
-`.tandem/884f6ef6905c4e2aa4e2ca28c34ea629/aec-dtln.md`, for the literal commands and output.
+both succeeded afterward. The literal commands were the same `xcodebuild` invocations CI runs
+(see `.github/workflows/ci.yml`); every hunk of the `project.pbxproj` diff was read back
+line by line and confirmed attributable to linking this one package (25 added lines, no
+reformatting, no `objectVersion` bump).
 
 ### 3. `dtln-aec-coreml` repinned from tag `0.7.0` to commit `ecb641d`, for a LICENSE fix
 
@@ -896,3 +972,46 @@ should look nothing like this. Stage 1's own touchpoint count so far: 2 (Stage 0
 header, this stage's package link) — both one-time additions to a target's build graph, not
 recurring edits, and both logged with the same rationale: confirmed unavoidable, confirmed
 minimal, confirmed no live collision with a parallel agent.
+
+## phase-1-capture-core (Stage 1: system audio capture core)
+
+### 1. `VoiceInk/Info.plist`: `NSAudioCaptureUsageDescription` added
+
+The CoreAudio process-tap path (`CoreAudioSystemRecorder.swift`) triggers the system "would
+like to record audio from other applications" dialog only if `NSAudioCaptureUsageDescription`
+is present in `Info.plist` — otherwise the tap creation call fails outright rather than
+prompting. Key was not already present (`NSMicrophoneUsageDescription`,
+`NSAppleEventsUsageDescription` and `NSScreenCaptureUsageDescription` were; this one wasn't).
+Added, matching the existing string style:
+
+```
+<key>NSAudioCaptureUsageDescription</key>
+<string>VoiceInk captures system audio from other applications during meeting recordings.</string>
+```
+
+This is the ~2nd of the ~6-touchpoint Phase 1+ budget the note above sets. Confirmed against
+the donor's own `scripts/build_native_app.sh` (which injects the same key at build time with
+`$APP_DISPLAY_NAME captures system audio from other applications during meeting recordings.`)
+and `REVIEW.md` ("System audio capture through the CoreAudio tap path uses audio-capture TCC
+(`kTCCServiceAudioCapture`) and does not require Screen Recording") — the permission this key
+gates is `kTCCServiceAudioCapture`, a distinct TCC service from `NSScreenCaptureUsageDescription`
+(Screen Recording), which the app already requests for a different feature (screen context).
+
+### Note: new fork-only file not from the donor
+
+`VoiceInk/Features/Meetings/Capture/SystemAudioCaptureDiagnostics.swift` is new, not upstream —
+no entry needed under the rule at the top of this file ("New code that lives entirely under
+`Features/Meetings/` ... does not need an entry here"). Logged anyway for visibility: it
+extracts `SystemAudioCaptureDiagnosticsSnapshot` and `SystemAudioDiagnosticsProviding` verbatim
+from the donor's `MeetingSessionDiagnostics.swift` (lines 54-70), the same donor file
+`AudioSampleStats.swift` was already extracted from in Stage 0. Both `CoreAudioSystemRecorder.swift`
+and `SystemAudioRecorder.swift` conform to `SystemAudioDiagnosticsProviding` and cannot compile
+without it; the rest of `MeetingSessionDiagnostics.swift` (AEC delay estimation, diarization
+counts, chunk health, the `MeetingSessionDiagnostics` class itself) is NOT ported and remains
+Stage-2/MeetingSession-owned. The extraction was judged in-scope, rather than logged as a
+"Known gap", because those 17 lines are pure declarations (one snapshot value type and one
+protocol) that two ported files cannot compile without, and because Stage 0 set exactly this
+precedent by extracting `AudioSampleStats.swift` from the same donor file. It is distinct from
+the Stage 0 decision NOT to port `MeetingPromptStateMachine.swift`: that would have required
+inventing a placeholder for `MeetingCandidate`, a type belonging to a detection subsystem that
+has not been designed yet, which is a different act from lifting declarations verbatim.

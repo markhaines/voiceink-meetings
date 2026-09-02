@@ -219,6 +219,14 @@ actor FluidAudioMeetingDiarizer: MeetingSystemAudioDiarizing {
     /// generation ends -- broadcast to every waiter by `finishLoad` or `expireLoad` -- or THIS
     /// call's own Task is cancelled, in which case `cancelWaiter` resumes just this continuation
     /// with `CancellationError` and removes it, WITHOUT touching the load or any other waiter.
+    ///
+    /// One residual, disclosed rather than papered over: a caller whose Task is ALREADY cancelled
+    /// when it reaches here races `onCancel` against the registration below. If `onCancel` wins,
+    /// `cancelWaiter` finds no entry and this call waits for the generation to end normally
+    /// instead of returning immediately. That is a latency cost, not a hang -- and specifically
+    /// not a hang BECAUSE of B2's fix: the generation is bounded by `expireLoad` regardless of
+    /// what the loader does, so the worst case is one `loadOperationTimeout`, not forever. Left
+    /// as is; closing it needs a pre-registration cancellation check whose own race is no simpler.
     private func join(generation: UUID) async throws {
         let id = UUID()
         try await withTaskCancellationHandler {

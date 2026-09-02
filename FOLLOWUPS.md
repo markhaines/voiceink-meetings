@@ -366,3 +366,17 @@ for the session.
 shows a genuine `DiarizerModels.load` hang is common rather than pathological, in which case the
 right answer is probably a circuit breaker that stops re-attempting, not a different ceiling.
 
+## A diarizer waiter cancelled before it registers waits for the ceiling, not for its cancel
+
+Source: `VoiceInk/Features/Meetings/Transcription/FluidAudioMeetingDiarizer.swift` (`join`).
+
+`withTaskCancellationHandler`'s `onCancel` can fire before the enclosing
+`withCheckedThrowingContinuation` has stored the waiter, in which case `cancelWaiter` finds no
+entry and the call waits for the load generation to end normally instead of returning at once
+with `CancellationError`. Only reachable for a caller whose Task is already cancelled on entry.
+
+Cost is latency, not a hang, and specifically because of B2's fix: the generation is bounded by
+`expireLoad` no matter what the loader does, so the worst case is one `loadOperationTimeout`
+(default 30s). Left as is -- a pre-registration cancellation check has its own race and is no
+simpler. Disclosed here so it is a decision rather than an oversight.
+

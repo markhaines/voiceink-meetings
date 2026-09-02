@@ -51,6 +51,68 @@ constraint added first. Not fixed here: no current caller needs it, and adding `
 (.unique)` to an already-shipped model is the kind of change worth making deliberately, with a
 migration in mind, rather than speculatively.
 
+## `RouteAwareMeetingMicRecorderTests`: cross-queue assertion audit (2026-09-02)
+
+Source: `Tests/VoiceInkTests/Features/Meetings/Capture/RouteAwareMeetingMicRecorderTests.swift`.
+This file produced two intermittent CI failures in two different tests
+(`liveRouteChangeWaitsForFirstBuffer`, then `healthTriggeredRecoveryPromotesOnFirstBuffer`),
+both the same class: `RouteAwareMeetingMicRecorder` retires a superseded child recorder by
+dispatching `child.recorder.stop(); child.recorder.cancel()` onto `cleanupQueue`
+(`.concurrent`) from `completePendingHandoff`, which itself runs on the serial
+`lifecycleQueue`. A test's `waitUntil` loop that only watches the *promotion signal* (the
+`samples` callback, or `activeRecorderKindForDebug()`) can observe that signal and fall
+through to a `#expect` on `stopCalls`/`cancelCalls` before the concurrently-dispatched
+retirement block has actually run — a wait that observes the promotion is not a wait that
+observes the teardown.
+
+Audited every one of the file's 24 `@Test`s for this shape: does a `#expect` read state
+written on `handoffWorkerQueue`/`cleanupQueue` without either (a) a direct `waitUntil` on
+that exact state, (b) a semaphore explicitly signalled from that write, or (c) a queue-order
+argument that's actually airtight (e.g. `stop()`/`cancel()` are literally the next
+synchronous statement on the calling thread, so returning from the call already proves the
+write happened)? 20 were safe by one of those three. 4 were exposed and fixed, all with the
+same idiom — extend the wait to cover the write actually being asserted, never a sleep:
+
+- `liveRouteChangeWaitsForFirstBuffer` — waited on `stopCalls` but not `cancelCalls`, which
+  is the second statement in the same retirement closure; extended the wait to both.
+- `healthTriggeredRecoveryPromotesOnFirstBuffer` — the flake itself: waited on `samples` but
+  asserted `degraded.stopCalls` next line, unguarded. Added `waitUntil { degraded.stopCalls
+  == 1 }`.
+- `rapidRouteChangesRejectSupersededCallbacks` — asserted `samples` after two *unrelated*
+  waits (`diagnosticsSnapshot()`, `system.stopCalls`) that happened to postdate the `samples`
+  write in lifecycleQueue program order. Technically safe but fragile — one reordering of
+  statements in `completePendingHandoff` would silently break the guarantee with no compiler
+  or test-runner signal. Hardened with a direct `waitUntil { samples == ... }`.
+- `stopWithQueuedRecoveryNeverStartsCandidate` — used a blind 200ms `DispatchSemaphore` +
+  `asyncAfter` delay as a "let it settle" proxy instead of watching the actual write. Replaced
+  with `waitUntil { candidate.cancelCalls >= 1 }` (test converted to `async throws`); the
+  `startCalls == 0` assertion next to it remains valid regardless of timing because the
+  production code's `isPendingCandidateCurrent` guard makes that code path structurally
+  unreachable once `stop()` has cleared `state.pending`, not just unlikely to be reached in
+  time.
+
+**The rule for the next test added to this file**: if an `#expect` reads a counter or
+callback effect that the production code sets from `handoffWorkerQueue` or `cleanupQueue`
+(anything dispatched via `cancelAsync`/`retireAfterHandoffAsync`/the handoff worker's
+`.async` block), the preceding `waitUntil` must name that exact variable — not a different
+variable that happens to change around the same time, and never a fixed sleep. `waitUntil`
+itself is always safe as a *wait condition* (worst case it polls longer or times out loudly
+via `Issue.record`); the risk is only ever an `#expect` immediately following a wait on
+something else.
+
+Proof the fixes are load-bearing, not just quieter: added a temporary `teardownDelay` hook to
+`FakeMeetingMicRecorder.stop()`/`cancel()` (0.3s `Thread.sleep`), reverted the two flaky
+tests' final assertions to their pre-fix unguarded form, and ran them — both failed
+deterministically (`Expectation failed: (system.stopCalls → 0) == 1` /
+`(degraded.stopCalls → 0) == 1`). Restored the guarded form with the delay still active — both
+passed (0.623s / 0.312s, visibly absorbing the injected delay via the wait). Reverted the
+delay instrumentation via `git checkout` + reapplying the real fix as a patch, so no
+instrumentation shipped. 30-iteration loops of both tests: 30/30 pass, 0 failures, confirmed
+against the `.xcresult` bundle (not just log grep) since `-only-testing` selectors for a single
+`@Test` method require the `()` suffix — an earlier run in this same session silently matched
+zero tests without it (`totalTestCount: 0`) and would have reported a meaningless "0/0 passed"
+had the bundle not been checked.
+
 ## `AudioGraphExceptionBridgeTests`: three tests skip on CI, run for real on a developer Mac
 
 `inputStateReadIsContained`, `invalidInputRouteIsContained` and `installTapExceptionIsContained`
@@ -90,7 +152,7 @@ An earlier device-presence guard attempt on this exact file/branch is superseded
 described in the file header — see PR #3's `acf438c`/`2f822a4` history for that dead end if it
 resurfaces as a suggestion.
 
-## `RouteAwareMeetingMicRecorderTests.healthTriggeredRecoveryPromotesOnFirstBuffer` flaked once on CI
+## `RouteAwareMeetingMicRecorderTests.healthTriggeredRecoveryPromotesOnFirstBuffer` flaked once on CI — RESOLVED
 
 `Tests/VoiceInkTests/Features/Meetings/Capture/RouteAwareMeetingMicRecorderTests.swift`. Failed
 once on CI run 33664226428 (attempt 1) at 0.038s -- far inside `waitUntil`'s 5s timeout, so an
@@ -105,17 +167,15 @@ a real regression:
   no code this test exercises: `MeetingEngineTests` uses its own private `FakeMeetingMicRecorder`
   and never constructs a `RouteAwareMeetingMicRecorder`.
 
-**Likely cause, not confirmed:** the test's `factoryCalls` and `samples` are plain `var`s
-mutated from recorder callbacks (which run on `lifecycleQueue` and its async continuations) and
-read from the test task with no synchronisation, so their visibility across threads is not
-guaranteed. `#expect(degraded.stopCalls == 0)` is additionally a "has not happened yet"
-assertion, which is only ever true within a window. Not confirmed because the `.xcresult` is not
-recoverable from a failed CI run (see the entry below), so which of the three `#expect`s failed
-is unknown -- fixing that upload would have answered this in one step.
-
-**Not fixed here:** out of scope for the meeting-persistence change that observed it, and fixing
-it properly means giving those counters real synchronisation rather than adding a retry. Worth
-doing together with the `.xcresult` upload below, so the next occurrence is diagnosable.
+**Was recorded here as "likely cause, not confirmed"** (unsynchronised counters read across
+threads). **Now confirmed and fixed**, together with the same class of bug found elsewhere in
+the same file, by the "`RouteAwareMeetingMicRecorderTests`: cross-queue assertion audit
+(2026-09-02)" entry above — see that entry for the exact race, the full per-test audit, and the
+before/after proof that the fix is load-bearing. The `#expect(degraded.stopCalls == 0)`
+mentioned in the original diagnosis as an additional "has not happened yet" assertion turned out
+to be safe (nothing in this test's flow could set it early); the actual fault was the very next
+`#expect(degraded.stopCalls == 1)` after the buffer arrives, asserted before the async
+retirement that sets it had necessarily run.
 
 ## `.xcresult` not recoverable from a failed CI run
 

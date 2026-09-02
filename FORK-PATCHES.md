@@ -2588,17 +2588,28 @@ the entire meetings subsystem built by every stage above was unreachable from th
 This adds the list + detail screen and wires it into navigation, using the two upstream
 touchpoints the dispatch for this branch budgeted and no others.
 
-### Upstream touchpoints (both budgeted, both minimal)
+### Upstream touchpoints: THREE, not the two this branch was budgeted
 
-1. **`App/Navigation/ContentView.swift`**: added `case meetings = "Meetings"` to `ViewType` and
-   `case .meetings: MeetingsView()` to `detailView(for:)`.
-2. **`App/Navigation/AppSidebar.swift`**: added `.meetings` to `ViewType.primaryItems`, plus its
-   `icon` (`person.2.wave.2.fill`), `sidebarIconStyle` (new `AppTheme.Sidebar.meetings` token,
-   `.systemTeal` — every other case in that enum was already claimed), and title (falls through
-   to the default `LocalizedStringKey(rawValue)` case, same as every entry but
+1. **`App/Navigation/ContentView.swift`** (budgeted): added `case meetings = "Meetings"` to
+   `ViewType` and `case .meetings: MeetingsView()` to `detailView(for:)`.
+2. **`App/Navigation/AppSidebar.swift`** (budgeted): added `.meetings` to
+   `ViewType.primaryItems`, plus its `icon` (`person.2.wave.2.fill`), `sidebarIconStyle`
+   (references the new `AppTheme.Sidebar.meetings` token — see touchpoint 3), and title (falls
+   through to the default `LocalizedStringKey(rawValue)` case, same as every entry but
    `.transcribeAudio`). `ViewType.assertSidebarItemsCoverAllCases()`'s `#if DEBUG` assert
    (`Set(sidebarItems) == Set(allCases) && sidebarItems.count == allCases.count`) passes with
    `.meetings` added to both the enum and `primaryItems`.
+3. **`DesignSystem/Theme/AppTheme.swift`** (NOT budgeted — flagged to Mark, accepted by him
+   rather than decided unilaterally): one added line, `static let meetings = Color(nsColor:
+   .systemTeal)`, in the `Sidebar` enum alongside `.dashboard`/`.modes`/`.models`/etc. Every
+   other case in that enum was already claimed by an existing `ViewType`, so `.meetings` needed
+   either a new token here or a colour hardcoded straight into `AppSidebar`/`MeetingsView` —
+   the latter would have made Meetings the one sidebar item themed outside the shared token
+   system. Reviewed and accepted as in scope for this branch precisely because it's a single
+   additive line in a constants enum (no existing case touched, no behavior of any other
+   `ViewType` changed) — about as low-conflict as an upstream edit gets, but still a real
+   upstream file this branch was not originally budgeted to touch, so it is logged here on its
+   own rather than folded into touchpoint 2's entry.
 
 `VoiceInkEngine`, `RecordingState`, and `Features/Recording/Capture/Recorder.swift` are
 untouched — grep-verified after this branch's changes, not just before.

@@ -1099,12 +1099,23 @@ FluidAudio package) — same as the existing precedent in this cluster
 import). FluidAudio is already a fork dependency (used extensively elsewhere), so the import is
 inert, not a new touchpoint.
 
-### Known test-coverage gap
+### Test-coverage gap (closed) — `MicTurnNormalizerMergeTests.swift`
 
 The donor's own test suite exercises `isFragmented` and the `sentenceSplit` proportional-timing
 interpolation directly, but never exercises `mergeAdjacentSegments` producing an actual merge:
 every donor test either has segments that don't merge (`preservesPhraseLikeTimings`, gap 0.6s >
 the 0.35s cap, neither segment short) or is fragmented before `mergeAdjacentSegments` is ever
-reached (`collapsesFragmentedShards`, `fragmentedShardsMultiSentence`). No donor test asserts two
-segments actually collapsing into one via the 0.35s gap or the 1.5s short-side cap. Not added
-speculatively here, per this task's instructions — flagged instead so it's visible to review.
+reached (`collapsesFragmentedShards`, `fragmentedShardsMultiSentence`). No donor test asserted two
+segments actually collapsing into one via the 0.35s gap or the 1.5s short-side cap. Left
+unfilled at first per that task's instructions — flagged instead of speculatively filled.
+
+Independent review of PR #10 agreed this gap should be closed even though it wasn't blocking
+("the merge branch is currently the one path unconstrained by the suite"), so a fix round added
+`Tests/VoiceInkTests/Features/Meetings/Transcription/MicTurnNormalizerMergeTests.swift` — a new
+fork-authored test file (not a port; every expected value hand-derived from the ported algorithm,
+not from running the code first). Pins: the 0.35s gap threshold from both sides, the 1.5s
+short-side cap from both sides (both the segment-short and previous-short branches of
+`shouldMerge` independently), and a pair of tests proving the merge tier uses the segments' own
+real timing rather than falling back to a whole-chunk sentence split — the case a "universal
+sentence-split stub" would fail. All 7 new tests passed against the ported code on first write,
+no code changes needed.

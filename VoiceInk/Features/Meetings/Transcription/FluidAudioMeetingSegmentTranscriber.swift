@@ -1,28 +1,34 @@
 // Fork-owned (no donor equivalent). Not a port.
 //
 // Direct FluidAudio integration for the meeting transcription seam (`DECISION-transcription-seam.md`,
-// Option (ii)). FIX ROUND (cross-vendor review, B1/B2): the first version of this file loaded
-// its own independent `AsrManager` + Parakeet models, permanently duplicating whatever dictation
-// already has loaded via `FluidAudioTranscriptionService`. On Mark's 16GB M2 Pro, where he
-// dictates with local Parakeet every day, that is unacceptable -- Mark explicitly authorised an
-// upstream touchpoint to fix it rather than ship it. This version instead SHARES dictation's
-// already-loaded `AsrManager` through `FluidAudioTranscriptionService.sharedAsrManager(for:)`
-// (a new, narrow, additive accessor on that file -- see FORK-PATCHES.md touchpoint 4). No model
-// duplication, no independent lifecycle to manage here: eviction/lifecycle is delegated wholesale
-// to the existing service's own (version-switch and `cleanup()`) behavior.
+// Option (ii)). It does NOT load models. It BORROWS the `AsrManager` dictation already has
+// loaded, through `FluidAudioTranscriptionService.borrowedAsrManager()` (FORK-PATCHES.md
+// touchpoint 4).
 //
-// SAFETY / actor isolation: `FluidAudioTranscriptionService` carries no actor isolation of its
-// own (see that file) -- its existing safety today comes entirely from every caller initiating
-// calls from `@MainActor` (via `TranscriptionServiceRegistry`), not from any compiler-enforced
-// mutual exclusion. `resolveSharedManager()` below is THIS actor's own method, annotated
-// `@MainActor` so calling it hops onto the main actor before touching the shared service --
-// putting the meeting seam's access pattern in the SAME shape dictation's own existing calls
-// already have (MainActor-initiated), not a new, less-disciplined bypass of it. This is a real,
-// disclosed limit, not a stronger guarantee: like dictation's own existing calls, it does not
-// itself prove no two overlapping calls can ever race past an internal `await` inside
-// `ensureModelsLoaded`; it proves the meeting seam is exactly as disciplined as dictation
-// already is, no more, no less. See FORK-PATCHES.md for the full reasoning and what remains
-// unproven without real hardware/model measurement.
+// FIX ROUND 3 (cross-vendor review, B1). Two earlier designs were defeated here:
+//   * Round 1 loaded its own independent `AsrManager` + Parakeet models, permanently doubling
+//     model memory on Mark's 16GB M2 Pro.
+//   * Round 2 fixed the duplication by calling `sharedAsrManager(for: version)`, which called
+//     `ensureModelsLoaded(for:)`. Review found the real defect that hid behind: a meeting asking
+//     for a version dictation did not have loaded ran `cleanupLoadedManagers()` -- including
+//     `asrManager.cleanup()`, which nils the CoreML models -- underneath a dictation suspended
+//     inside `AsrManager.transcribe`. `@MainActor` initiation does not prevent that: every one
+//     of those methods suspends, so actor reentrancy lets the two flows interleave. The comment
+//     that claimed the calls were "serialized on the same executor" and that this was "not new
+//     eviction behavior" was materially wrong on both counts and has been removed.
+//
+// Round 3 removes the capability instead of documenting the hazard. This type holds no version,
+// requests no version, and cannot trigger a load: `borrowedAsrManager()` is a synchronous,
+// non-throwing, argument-less getter over two stored properties (see its own doc comment for
+// the full argument, and `scripts/negative-controls/FluidAudioSharedModelAttacks.swift` for the
+// compile-time proof that the eviction-capable methods are unreachable from here).
+//
+// What that costs, stated plainly: if nothing is loaded, this transcriber throws
+// `MeetingSegmentTranscriberError.sharedModelNotLoaded` and `MeetingTranscriptionCoordinator`
+// degrades that ONE chunk to its flat-fallback path. It never loads a model to rescue itself.
+// Ensuring a model is loaded is dictation's job, via the existing `loadModel(for:)` that
+// `VoiceInkEngine` already calls at recording start; see FOLLOWUPS.md for the composition-root
+// requirement that follows from this.
 //
 // Segment mapping matches the donor's own `transcribeWithFluidAudio`
 // (`segment-timing-design.md` §A/§C exactly): one `SpeechSegment` per FluidAudio `TokenTiming`
@@ -35,17 +41,26 @@
 import FluidAudio
 import Foundation
 
+/// Errors a `MeetingSegmentTranscribing` conformer raises that the coordinator routes on rather
+/// than propagates. Deliberately narrow: `sharedModelNotLoaded` is the ONLY case, so the
+/// coordinator's catch cannot silently swallow a real transcription failure.
+enum MeetingSegmentTranscriberError: Error, Equatable {
+    /// Dictation has no model loaded, so there is nothing to borrow. Never means "loading
+    /// failed" -- the meeting seam does not load.
+    case sharedModelNotLoaded
+}
+
 actor FluidAudioMeetingSegmentTranscriber: MeetingSegmentTranscribing {
     private let sharedService: FluidAudioTranscriptionService
-    private let version: AsrModelVersion
 
-    init(sharedService: FluidAudioTranscriptionService, version: AsrModelVersion = .v3) {
+    init(sharedService: FluidAudioTranscriptionService) {
         self.sharedService = sharedService
-        self.version = version
     }
 
     func transcribe(chunkAt url: URL) async throws -> SpeechTranscriptionResult {
-        let manager = try await resolveSharedManager()
+        guard let manager = await borrowLoadedManager() else {
+            throw MeetingSegmentTranscriberError.sharedModelNotLoaded
+        }
         var decoderState = TdtDecoderState.make(decoderLayers: await manager.decoderLayerCount)
         // `AsrManager.transcribe(_:decoderState:language:)` reads and (for large files)
         // disk-backs the URL itself -- never routes through `AudioFileProcessor`, which would
@@ -86,8 +101,15 @@ actor FluidAudioMeetingSegmentTranscriber: MeetingSegmentTranscribing {
         }
     }
 
+    /// The ONE line of this file that touches dictation's service. `@MainActor` here is not the
+    /// safety argument (round 2's comment wrongly claimed it was); it just keeps the read on the
+    /// executor every other caller of that class uses. The safety argument is that
+    /// `borrowedAsrManager()` is synchronous and argument-less, so this hop reads whatever is
+    /// loaded and returns, with no suspension point in between and no way to ask for anything
+    /// else. `AsrManager` is a `public actor`, so the borrowed instance serializes a meeting's
+    /// `transcribe` against dictation's own by itself.
     @MainActor
-    private func resolveSharedManager() async throws -> AsrManager {
-        try await sharedService.sharedAsrManager(for: version)
+    private func borrowLoadedManager() -> AsrManager? {
+        sharedService.borrowedAsrManager()?.manager
     }
 }

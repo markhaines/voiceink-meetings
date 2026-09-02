@@ -95,18 +95,34 @@ actor MeetingTranscriptionCoordinator: MeetingTranscriptionCoordinating {
         try await diarizer?.diarize(fileAt: url)
     }
 
+    /// The one error a segment transcriber can raise that this coordinator ROUTES on instead of
+    /// propagating: `MeetingSegmentTranscriberError.sharedModelNotLoaded`, meaning dictation has
+    /// no model loaded so there was nothing to borrow (fix round 3, B1 -- the meeting seam
+    /// deliberately cannot load one itself, because being able to load is what let it evict
+    /// dictation's model mid-transcription). Degrading that chunk to `flatFallback` keeps the
+    /// meeting recording usable instead of failing the chunk outright.
+    ///
+    /// The catch is a typed `catch MeetingSegmentTranscriberError.sharedModelNotLoaded`, NOT a
+    /// blanket `catch`. A real inference failure, a cancellation, or a file error still
+    /// propagates -- a blanket catch here would silently turn every backend fault into a
+    /// plausible-looking flat transcript, which is exactly the failure mode that would be
+    /// hardest to notice in a 90-minute recording.
     private func route(_ url: URL) async throws -> SpeechTranscriptionResult {
-        switch backend {
-        case .fluidAudio:
-            if let fluidAudioTranscriber {
-                return try await fluidAudioTranscriber.transcribe(chunkAt: url)
+        do {
+            switch backend {
+            case .fluidAudio:
+                if let fluidAudioTranscriber {
+                    return try await fluidAudioTranscriber.transcribe(chunkAt: url)
+                }
+            case .transcribeCpp:
+                if let transcribeCppTranscriber {
+                    return try await transcribeCppTranscriber.transcribe(chunkAt: url)
+                }
+            case .other:
+                break
             }
-        case .transcribeCpp:
-            if let transcribeCppTranscriber {
-                return try await transcribeCppTranscriber.transcribe(chunkAt: url)
-            }
-        case .other:
-            break
+        } catch MeetingSegmentTranscriberError.sharedModelNotLoaded {
+            return try await flatFallback(url)
         }
         return try await flatFallback(url)
     }

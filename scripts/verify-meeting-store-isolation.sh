@@ -1,5 +1,11 @@
 #!/bin/bash
-# Runs the MeetingStore negative controls: source files that MUST NOT COMPILE.
+# Runs the structural negative controls: source files that MUST NOT COMPILE.
+#
+# Two boundaries are defended this way. `MeetingStore`'s isolation guarantee (below), and --
+# added in the meeting-transcription-coordinator fix round 3 --
+# `FluidAudioSharedModelAttacks.swift`, which asserts that no code in the app module can reach
+# the methods on `FluidAudioTranscriptionService` that evict dictation's loaded Parakeet model.
+# Same reasoning in both cases: a guarantee that is merely documented gets defeated in one line.
 #
 # `MeetingStore` claims a structural guarantee (see its doc comment): no code outside
 # MeetingStore.swift can reach the ModelContext it mutates, the objects registered in it, or the
@@ -167,6 +173,7 @@ run_case() {
 
 run_case MeetingStoreIsolationAttacks.swift 14
 run_case MeetingStoreRetroactiveConformanceAttack.swift 1
+run_case FluidAudioSharedModelAttacks.swift 5
 
-echo "All MeetingStore negative controls still fail to compile, for the expected reasons,"
+echo "All negative controls still fail to compile, for the expected reasons,"
 echo "each on the exact line its marker names, with no unattributed diagnostics."

@@ -2825,10 +2825,17 @@ instead within the one-file budget.
 2. For the common case — a meeting requests the SAME FluidAudio version dictation already has
    loaded — `sharedAsrManager`'s fast path means the new call is a no-op read of existing state;
    dictation's own manager is untouched, not even re-validated.
-3. Requesting a DIFFERENT version than dictation currently has loaded evicts dictation's manager
-   via `cleanupLoadedManagers()` — but that is the EXISTING code path `ensureModelsLoaded`
-   already takes whenever dictation itself switches models; a meeting is simply a new second
-   caller now ABLE to trigger it. This is disclosed, not hidden: see "still unproven" below.
+3. ~~Requesting a DIFFERENT version than dictation currently has loaded evicts dictation's
+   manager via `cleanupLoadedManagers()` — but that is the EXISTING code path
+   `ensureModelsLoaded` already takes whenever dictation itself switches models; a meeting is
+   simply a new second caller now ABLE to trigger it. This is disclosed, not hidden.~~
+   **WRONG, and fixed in round 3.** The eviction PATH is old; the cross-flow interleaving is
+   new, and that is the part that matters. `ensureModelsLoaded`, `cleanupLoadedManagers` and
+   `transcribe` all suspend, so `@MainActor` initiation gives no operation-level serialisation:
+   a meeting could run `asrManager.cleanup()` — which nils the CoreML models — underneath a
+   dictation suspended inside `AsrManager.transcribe`. Round 2's source comment claiming the
+   calls were "serialized on the same executor" and that this was "not new eviction behavior"
+   was materially misleading on both counts. Both the comment and the capability are gone.
 4. `OfflineTranscribeCppService.borrowModel` reuses `retainModel`/`releaseModel`'s EXISTING
    reference-counted eviction guard (`activeTranscriptionCount`) untouched — a meeting's borrow
    is indistinguishable, from the lock/refcount machinery's point of view, from a second
@@ -2900,14 +2907,28 @@ import`, without needing a real audio file on disk (`diarize(fileAt:)` itself st
 file I/O; `resolvedManager()` does not). No production code outside this actor calls it
 (grep-verified).
 
-One new fork-owned, non-upstream declaration: `extension DiarizerManager: @unchecked Sendable
-{}`, needed because `withTaskGroup`'s race requires a Sendable result type and `DiarizerManager`
+**SUPERSEDED by fix round 3 (B3).** One new fork-owned, non-upstream declaration:
+`extension DiarizerManager: @unchecked Sendable {}`, needed because `withTaskGroup`'s race requires a Sendable result type and `DiarizerManager`
 (FluidAudio's own plain class) has none. Honest about what this asserts: single-owner exclusive
 access, true by construction because this actor is the only place in the fork that ever
 constructs or touches a `DiarizerManager` (grep-verified) — not a general claim that the type is
-safe to share.
+safe to share. Review was right to reject this: whatever the comment said, the CONFORMANCE tells
+the compiler, target-wide and for every future FluidAudio version, that the type is safe to
+share, and a grep-based sole-owner convention is neither scoped nor enforceable. Removed in fix
+round 3.
 
-**B3 PROOF (the ceiling actually bites), quoted from a real run —
+> **RETRACTED by fix round 3 — the proof below is real output that demonstrates the WRONG
+> PROPERTY, and the ceiling it claims to prove did not exist.** The injected loader was
+> `try await Task.sleep(...)`, which IS cancellation-aware: the instant `group.cancelAll()` ran
+> it threw `CancellationError` and the "60s" loader was finished. That is the only reason the
+> enclosing `withTaskGroup` — structured concurrency, which cannot return until every child has
+> completed — was able to return at all. Against a cancellation-BLIND load, which is the sole
+> failure mode a ceiling exists for, the caller waited exactly as long as it would have with no
+> ceiling. The numbers below are genuine; the conclusion drawn from them was not. Kept here
+> rather than deleted so the mistake is legible. See "Fix round 3" below for the replacement
+> design and a proof against a loader that cannot be cancelled.
+
+**B3 PROOF (SUPERSEDED — see the retraction above), quoted from a real run —
 `FluidAudioMeetingDiarizerTests.hungLoadSurfacesAsATimeoutRatherThanHangingForever` injects a
 loader that `Task.sleep`s for 60 real seconds and never checks cancellation, against a 0.2s
 deadline:**
@@ -2945,15 +2966,258 @@ overflowed timestamps near `Int64.max` (converts without crashing, stays finite,
 and multiple malformed segments in one transcript (each clamped independently, in original
 order).
 
+### Fix round 3 (cross-vendor review of the fix round: B1, B2, B3)
+
+The same reviewer defeated two successive designs on the same properties, and one of round 2's
+"proofs" turned out to demonstrate the wrong thing. This round's bias, stated up front because it
+drove every decision below: **make the bad state impossible rather than unlikely.** On this
+branch three separate guarantees that were merely documented or merely conventional were each
+defeated in one line; the ones that held (`MeetingStore`'s isolation boundary) held because the
+unsafe call did not exist in the API and a negative control proved it on every CI run. All three
+fixes below take that shape.
+
+Confirmed still valid and NOT regressed: the naive-killer test and its paired fallback control;
+the fallback path emitting no negative/NaN/non-monotonic/out-of-chunk timestamps; the dead-code
+disclosure (nothing here is wired into a composition root yet); `OfflineTranscribeCppService
+.borrowModel(for:)` and its release discipline, which is untouched.
+
+#### B1 — a meeting could evict the model out from under a live dictation
+
+**The finding, accepted in full.** `@MainActor` initiation does not give operation-level
+serialisation. `ensureModelsLoaded`, `cleanupLoadedManagers` and `transcribe` all suspend, so a
+meeting-requested version switch could run `asrManager.cleanup()` — which nils out the CoreML
+models — underneath a dictation suspended inside `AsrManager.transcribe`. Round 2's source
+comment ("serialized on the same executor", "not new eviction behavior") was materially
+misleading: the eviction PATH is old, but the cross-flow interleaving is new, and that is the
+part that matters. `AsrManager.cleanup()` is four `nil` assignments to the loaded CoreML models
+(FluidAudio `AsrManager.swift:215`), so what dictation gets afterwards is not slow, it is broken.
+
+**The design: borrow-only, version-pinned, no load.** The accessor is now
+
+```swift
+func borrowedAsrManager() -> (manager: AsrManager, version: AsrModelVersion)?
+```
+
+**Why the bad interleaving is now impossible, not unlikely** — three independent reasons, each
+sufficient on its own:
+
+1. **No parameter.** There is no argument by which a caller can name a version other than the one
+   already loaded. "The meeting requested a switch" is not an expressible call. This is the
+   reviewer's own suggested direction (ii), pinning the seam to whatever is loaded, enforced by
+   the signature rather than by a rule.
+2. **No suspension point.** The method is not `async` and not `throws`. Its whole body is two
+   stored-property reads and a tuple construction, so it runs to completion between two of the
+   caller's instructions. There is no `await` at which anything can interleave — which is exactly
+   the property round 2's `@MainActor` argument was wrongly claimed to provide.
+3. **No reachable eviction.** It calls nothing. `ensureModelsLoaded`,
+   `ensureUnifiedModelsLoaded`, `ensureNemotronModelsLoaded` and `cleanupLoadedManagers` are all
+   `private` to `FluidAudioTranscriptionService.swift`, and
+   `scripts/negative-controls/FluidAudioSharedModelAttacks.swift` — compiled INTO THE APP TARGET
+   on every CI run, which is the realistic attacker for `private` — must not compile. Five
+   attacks, five compiler diagnostics, verified line-anchored (output quoted below).
+
+`FluidAudioMeetingSegmentTranscriber` no longer holds a `version` at all: it cannot want one.
+
+**The corrected comment.** Round 2's misleading paragraph is gone. The accessor now carries, in
+full: that the class has no actor isolation of its own; that `@MainActor` initiation does NOT
+serialise the operations because all of them suspend; the exact defect round 2 shipped and why;
+the three structural reasons above; and — separately — the two costs, neither hidden. Its
+operative text:
+
+> This version removes the ability rather than documenting the hazard: it is NOT `async` and NOT
+> `throws` ... so it contains no suspension point at which anything can interleave. It takes NO
+> parameter ... so "the meeting requested a version switch" is not an expressible call. It calls
+> nothing ... `scripts/negative-controls/FluidAudioSharedModelAttacks.swift` is compiled into the
+> app target on every CI run and MUST NOT COMPILE, which is what keeps that true rather than
+> conventional.
+>
+> Consequence, deliberately accepted: the meeting seam is PINNED to whatever version dictation
+> already has loaded, and returns nil when nothing is loaded ... Getting a model loaded stays
+> entirely dictation's job.
+>
+> The reverse direction is NOT closed and is not claimed to be: dictation switching models still
+> evicts a manager a meeting is mid-way through using. That asymmetry is the point — protecting
+> the daily dictation flow outranks a meeting chunk.
+
+**What this costs, and where it is recorded.** Two things, both in FOLLOWUPS.md rather than
+buried here: (a) a meeting chunk transcribed while dictation has nothing loaded throws
+`MeetingSegmentTranscriberError.sharedModelNotLoaded`, which
+`MeetingTranscriptionCoordinator` degrades to its flat-fallback path — so a composition root must
+load the selected model through the EXISTING dictation API (`loadModel(for:)`, as `VoiceInkEngine`
+already does at recording start), not through the meeting seam; (b) the asymmetry above. The
+coordinator's catch is typed (`catch MeetingSegmentTranscriberError.sharedModelNotLoaded`), not
+blanket, and `MeetingTranscriptionCoordinatorTests` carries both halves — the new
+`sharedModelNotLoadedDegradesToFallback` and the pre-existing
+`segmentTranscriberFailurePropagates` control, which would fail if the catch were ever widened.
+
+Still additive upstream: `git diff origin/phase-1-integration` on both upstream files is
+`47 ++++` / `26 ++++`, **0 deletions**. No third upstream file was needed.
+
+#### B2 — the timeout ceiling was false, and its proof proved the wrong thing
+
+**The finding, accepted in full**, including the part about the evidence. `withTaskGroup` is
+structured concurrency: it cannot return until every child finishes, so `group.cancelAll()`
+followed by leaving the group still awaits the loader. Round 2's proof (a "60s" loader completing
+in 0.214s against a 0.2s deadline) was real output demonstrating the wrong property: the loader
+was `try await Task.sleep`, which IS cancellation-aware and threw the instant cancellation
+arrived. That test could not have failed even if the ceiling were entirely fictional, which it
+was. The retraction is recorded inline above, next to the original quote.
+
+**The design: an unstructured load and an independently expiring deadline, which are siblings,
+not parent and child.** `startLoadIfNeeded()` creates one `Task` for the load and a separate
+`Task` for the deadline, stamps both with a generation `UUID`, and returns. Nothing in the actor
+ever awaits `loadTask`. `expireLoad(id:)` resumes every waiter with `.loadTimedOut`, cancels the
+load task best-effort, sets `activeLoadID = nil`, and returns — it does not await the loader, so
+the caller's return time depends on the deadline task alone.
+
+**Why the caller's bound now holds regardless of the loader**, and why each review requirement is
+met:
+
+- *Timeout completion does not await the loader*: there is no structured construct anywhere in
+  the path. `withTaskGroup`, `async let` and `TaskGroup` are all gone; both tasks are
+  unstructured `Task`s that the actor stores and forgets.
+- *Quarantine by load ID*: `finishLoad(id:_:)` opens with `guard activeLoadID == id else
+  { return }`. A late result from an abandoned generation is dropped on the floor; it cannot
+  install a manager into a generation that already gave up on it.
+- *A subsequent attempt gets a FRESH load*: `expireLoad` clears `activeLoadID`, so the next call
+  starts a new generation with a new id rather than joining the abandoned one.
+- The cost of that — an abandoned blind load running alongside its replacement — is recorded in
+  FOLLOWUPS.md, not hidden. It costs memory and CPU, never correctness, because of the id guard.
+
+**B2 PROOF, against a genuinely cancellation-BLIND loader.** The fixture is
+`CancellationBlindLoader` in `FluidAudioMeetingDiarizerTests.swift`. It is not `Task.sleep`:
+nothing in its path checks `Task.isCancelled`, nothing in it can throw `CancellationError`, it
+parks on a plain `withCheckedContinuation` (which has no cancellation semantics at all), and the
+blocking wait is `DispatchSemaphore.wait()` on a detached OS thread — a kernel wait
+`Task.cancel()` cannot interrupt — so the cooperative pool is never blocked and the loader
+genuinely keeps running after cancellation. It is completed only by the test calling `release()`.
+
+The test asserts the thing round 2 never did: not merely that the caller returned on time, but
+that **at the moment it returned, the loader had not finished** (`finishCount == 0`,
+`isStillRunning`), and that when the loader finally does return it reports that cancellation had
+been delivered to its task and ignored (`observedCancellationOnFinish == true`).
+
+**And a control, because a passing test proves nothing unless it could have failed.** Round 2's
+ceiling test passed while the ceiling was fictional, so
+`roundTwoStructuredCeilingDoesNotBoundABlindLoader` attacks that hole from the other side: it
+runs the SAME blind loader against round 2's exact `withTaskGroup` shape (reproduced in the test
+file) and asserts that shape does NOT return, 2 seconds after a 0.2s deadline. The fixture is
+therefore shown to defeat the old design and be survived by the new one, which is the only thing
+that makes the new one's pass mean anything.
+
+Quoted from a real local run (`xcodebuild test`, full `VoiceInkTests` suite):
+
+```
+Test case 'FluidAudioMeetingDiarizerTests/hungCancellationBlindLoadIsBoundedByTheCeiling()' passed on 'My Mac - VoiceInk Dev (9337)' (1.026 seconds)
+Test case 'FluidAudioMeetingDiarizerTests/afterTheCeilingFiresTheNextAttemptStartsAFreshLoad()' passed on 'My Mac - VoiceInk Dev (9337)' (1.054 seconds)
+Test case 'FluidAudioMeetingDiarizerTests/lateResultFromAnAbandonedLoadIsQuarantined()' passed on 'My Mac - VoiceInk Dev (9337)' (1.026 seconds)
+Test case 'FluidAudioMeetingDiarizerTests/roundTwoStructuredCeilingDoesNotBoundABlindLoader()' passed on 'My Mac - VoiceInk Dev (9337)' (2.064 seconds)
+```
+
+**How to read those numbers, since round 2's numbers were also real.** The wall-clock times are
+NOT the evidence; the in-test assertions are, and the durations only rule out the trivial
+explanation. `hungCancellationBlindLoadIsBoundedByTheCeiling` at 1.026s against a 0.2s deadline
+asserts, at the instant the caller returned, `loader.finishCount == 0` and `loader.isStillRunning`
+-- so the caller demonstrably did not return because the load ended. Its remaining ~0.8s is the
+test then releasing the loader and waiting for it to drain, after which it asserts
+`observedCancellationOnFinish == true`: cancellation HAD been delivered to the load task and the
+load ignored it. The control at 2.064s is the same loader against round 2's shape, still not
+returned two full seconds after a 0.2s deadline. Same fixture, opposite outcomes.
+
+The full local `VoiceInkTests` suite is green with these in it: **411 test cases passed, 0
+failed, `** TEST SUCCEEDED **`**.
+
+
+#### B3 — retroactive `@unchecked Sendable` on a third-party type
+
+**The finding, accepted in full.** `extension DiarizerManager: @unchecked Sendable {}` is a
+module-wide promise that FluidAudio's mutable class may cross concurrency domains safely, no
+matter what the comment above it claims, and every future FluidAudio bump inherits it silently.
+A grep-based sole-owner convention is neither scoped nor enforceable.
+
+**The design.** The conformance is deleted. In its place, a `private` single-field wrapper:
+
+```swift
+private struct LoadedDiarizerBox: @unchecked Sendable {
+    let manager: DiarizerManager
+}
+```
+
+Why this is genuinely narrower rather than the same promise wearing a hat: the conformance is on
+a `private` type declared in this file, so it cannot be seen, extended or relied on anywhere else
+in the target, and a future FluidAudio version cannot acquire it. Its two use sites are one hop —
+created inside the load task, immediately consumed by `finishLoad`, which stores the manager in
+actor-isolated state — and the manager is reachable from nowhere else at that moment.
+
+The redesign the reviewer offered as the alternative was taken as well, where it applies: the
+test seam no longer hands a `DiarizerManager` out of the actor at all.
+`resolvedManager()` is `private` again, and `resolvedManagerIdentity()` returns an
+`ObjectIdentifier` — a `Sendable` value — so a test can still assert two calls resolved the SAME
+instance while the actor's exclusive ownership is widened by exactly nothing. That is strictly
+stronger than round 2, which widened `resolvedManager()` to `internal`.
+
+**What could NOT be proven, stated plainly.** The natural compile-time control for this — assert
+`DiarizerManager` is not `Sendable` in this target — does not work here. The project builds in
+the Swift 5 language mode (`SWIFT_VERSION = 5.0`, no `SWIFT_STRICT_CONCURRENCY`), where a missing
+`Sendable` conformance is a warning, not an error. It was written as a sixth negative-control
+attack, produced no diagnostic at all, and the verifier correctly reported it as a missing
+expectation rather than passing quietly; it was then removed and the reason recorded in the
+attack file itself. The regression tripwire for B3 is therefore a text scan
+(`SharedModelDuplicationTests.diarizerDoesNotRetroactivelyConformAPackageType`, asserting the
+file contains no `extension DiarizerManager`), and it is labelled there as the weaker thing it
+is. It catches the exact regression by name; it does not prove the absence of every possible
+retroactive conformance.
+
+#### `SharedModelDuplicationTests` — record kept accurate, language not upgraded
+
+The source scan remains a modest regression tripwire and is now labelled as one in the file's own
+header: indirection defeats a substring scan, and it cannot prove that composition injects the
+same instance. That wording was NOT strengthened despite B1's fix being stronger; the stronger
+claim lives where it can be enforced, in the negative control. The one changed assertion tracks
+the renamed accessor and pins the no-argument call shape
+(`contains("sharedService.borrowedAsrManager()")`), so a reintroduced parameterised accessor
+fails here as well as failing the negative control.
+
 ### GATES
 
 Full local `VoiceInkTests` suite green (`xcodebuild test-without-building`, all suites including
 every new file in this fix round). CI green on PR #16 (see the PR's own checks). Both re-verified
 after this fix round, not just the original round — see the PR conversation for the exact run.
 
+**Fix round 3 gates.** Full local `VoiceInkTests` suite green: 411 test cases passed, 0 failed,
+`** TEST SUCCEEDED **` (`xcodebuild test`, Debug, `platform=macOS`). Structural negative controls
+green, including the new one — quoted verbatim from `scripts/verify-meeting-store-isolation.sh`:
+
+```
+==> FluidAudioSharedModelAttacks.swift
+  --- compiler diagnostics ---
+    __NegativeControl.swift:30:57: error: argument passed to call that takes no arguments
+    __NegativeControl.swift:36:23: error: 'ensureModelsLoaded' is inaccessible due to 'private' protection level
+    __NegativeControl.swift:40:19: error: 'cleanupLoadedManagers' is inaccessible due to 'private' protection level
+    __NegativeControl.swift:44:23: error: 'ensureUnifiedModelsLoaded' is inaccessible due to 'private' protection level
+    __NegativeControl.swift:48:23: error: 'ensureNemotronModelsLoaded' is inaccessible due to 'private' protection level
+  --- end diagnostics ---
+    ok  line 30: argument passed to call that takes no arguments
+    ok  line 36: 'ensureModelsLoaded' is inaccessible due to 'private' protection level
+    ok  line 40: 'cleanupLoadedManagers' is inaccessible due to 'private' protection level
+    ok  line 44: 'ensureUnifiedModelsLoaded' is inaccessible due to 'private' protection level
+    ok  line 48: 'ensureNemotronModelsLoaded' is inaccessible due to 'private' protection level
+All negative controls still fail to compile, for the expected reasons,
+each on the exact line its marker names, with no unattributed diagnostics.
+```
+
+Upstream diff still `47 ++++` / `26 ++++`, **0 deletions** across the two authorised files. Files
+changed in fix round 3: `FluidAudioTranscriptionService.swift` (accessor replaced, still purely
+additive), `FluidAudioMeetingSegmentTranscriber.swift`, `MeetingTranscriptionCoordinator.swift`,
+`FluidAudioMeetingDiarizer.swift`, `FluidAudioMeetingDiarizerTests.swift`,
+`MeetingTranscriptionCoordinatorTests.swift`, `SharedModelDuplicationTests.swift`,
+`scripts/negative-controls/FluidAudioSharedModelAttacks.swift` (new),
+`scripts/verify-meeting-store-isolation.sh`, `.github/workflows/ci.yml` (step renamed),
+`FOLLOWUPS.md`, `FORK-PATCHES.md` (this section).
+
 No upstream file touched beyond the ONE authorised touchpoint above (2 files:
 `FluidAudioTranscriptionService.swift`, `OfflineTranscribeCppService.swift`, both purely
-additive). No SPM dependency added. Files changed in this fix round:
+additive). No SPM dependency added. Files changed in the previous fix round:
 `FluidAudioTranscriptionService.swift`, `OfflineTranscribeCppService.swift`,
 `FluidAudioMeetingSegmentTranscriber.swift`, `TranscribeCppMeetingSegmentTranscriber.swift`,
 `FluidAudioMeetingDiarizer.swift`, `FluidAudioMeetingDiarizerTests.swift` (new),

@@ -286,9 +286,10 @@ the actual models downloaded:
   segment) — so this needs an explicit real-audio check, not just "it didn't throw."
 - **Actual resource measurement**, now that B1's fix round shares the loaded model with
   dictation instead of duplicating it: confirm on real hardware (ideally Mark's own 16GB M2 Pro)
-  that a meeting running concurrently with dictation does NOT, in practice, cause the
-  version-switch eviction race disclosed in `FORK-PATCHES.md`'s touchpoint 4 section, and that
-  memory stays within an acceptable envelope for the actual model(s) wired in.
+  that memory stays within an acceptable envelope for the actual model(s) wired in. (The
+  version-switch eviction race this bullet used to also ask about is CLOSED as of fix round 3 --
+  the meeting seam has no API that can request a version, so it cannot evict. See the
+  `borrowedAsrManager()` entries below and in `FORK-PATCHES.md` touchpoint 4.)
 - **`FluidAudioMeetingDiarizer`'s real `DiarizerModels.load`/`performCompleteDiarization` path**,
   including a real timing measurement against the `loadOperationTimeout` default (30s) chosen
   without any real-hardware data point for how long a genuine model load takes on Mark's
@@ -297,3 +298,71 @@ the actual models downloaded:
 
 None of this can be substituted with more unit tests against injected fakes — the whole point is
 verifying the REAL backend/model behavior the fakes stand in for.
+
+## The meeting transcription seam cannot load a Parakeet model, only borrow one
+
+Source: `VoiceInk/Infrastructure/Providers/Transcription/FluidAudio/FluidAudioTranscriptionService.swift`
+(`borrowedAsrManager()`), `VoiceInk/Features/Meetings/Transcription/FluidAudioMeetingSegmentTranscriber.swift`.
+
+Fix round 3 for review finding B1 removed the meeting seam's ability to trigger a model load,
+because being able to load was exactly what let a meeting run `cleanupLoadedManagers()` --
+including `asrManager.cleanup()` -- underneath a live dictation. The accessor is now synchronous,
+argument-less and calls nothing, so the bad interleaving is not expressible rather than merely
+unlikely.
+
+**The cost, which is real and is a composition-root requirement, not a bug:** if dictation has no
+model loaded when a meeting chunk is transcribed, `FluidAudioMeetingSegmentTranscriber` throws
+`MeetingSegmentTranscriberError.sharedModelNotLoaded` and `MeetingTranscriptionCoordinator`
+degrades that chunk to its flat-fallback path (a single zero-duration segment, which
+`MicTurnNormalizer` sentence-splits). It never loads a model to rescue itself.
+
+**What the composition root must therefore do** when one is finally built (nothing constructs a
+non-Null coordinator today): ensure the user's selected FluidAudio model is loaded through the
+EXISTING dictation API, `FluidAudioTranscriptionService.loadModel(for:)`, at meeting start --
+exactly as `VoiceInkEngine` already does at recording start (`VoiceInkEngine.swift`, the
+`@MainActor` preload block after `scheduleVoiceInkRefinePreparation`). That call belongs on the
+dictation side of the seam, where a version switch is the user's own intent, not on the meeting
+side, where it is an eviction of somebody else's model.
+
+## Dictation can still evict a model a meeting is using (the deliberate asymmetry)
+
+Source: same files. B1's fix is one-directional on purpose. A meeting can no longer evict
+dictation's manager. Dictation switching models still runs `cleanupLoadedManagers()` and can nil
+the CoreML models out of an `AsrManager` a meeting chunk is mid-way through using.
+
+Not fixed, and not an oversight: protecting Mark's daily dictation outranks a meeting chunk, and
+the two outcomes are not comparable. A meeting chunk that fails degrades to the flat-fallback
+transcript and the recording is already persisted; a dictation that fails is the thing Mark was
+in the middle of saying. Closing the reverse direction properly would need a lease/refcount on
+`FluidAudioTranscriptionService`'s manager lifecycle (the shape `OfflineTranscribeCppService`
+already has via `activeTranscriptionCount`), which means changing existing upstream logic rather
+than adding to it -- past the authorised touchpoint budget, and a change that could make
+dictation's own model switch block on a meeting.
+
+**Would need revisiting** if meetings ever become a foreground feature people run for hours
+alongside heavy dictation use, at which point the lease is worth its upstream cost.
+
+## An expired diarizer load keeps running alongside its replacement
+
+Source: `VoiceInk/Features/Meetings/Transcription/FluidAudioMeetingDiarizer.swift`
+(`expireLoad`).
+
+B2's fix makes the load-operation ceiling real by refusing to await the loader: when the deadline
+fires, waiters are released and the load task is cancelled best-effort and then forgotten. A
+loader that ignores cancellation -- the case the ceiling exists for -- therefore keeps running.
+If a later `diarizeSystemAudio` starts a fresh load (which it must, per the review requirement
+that a subsequent attempt not join a dead one), two model loads can be in flight at once, and the
+abandoned one holds whatever CoreML resources it has acquired until it finally returns. Its
+result is quarantined by load id and dropped, so it can never install a manager or corrupt state
+-- the cost is memory and CPU, not correctness.
+
+Bounded in practice by how the caller behaves: diarization runs once per meeting, from
+`MeetingEngine.stop()`. There is no retry loop, so "two at once" needs two meetings ending within
+one hung load of each other. Not fixed because every alternative is worse: awaiting the abandoned
+load is the B2 defect itself, and refusing a fresh load leaves diarization permanently poisoned
+for the session.
+
+**Would need revisiting** if a real-hardware measurement (see the smoke-test prerequisite above)
+shows a genuine `DiarizerModels.load` hang is common rather than pathological, in which case the
+right answer is probably a circuit breaker that stops re-attempting, not a different ceiling.
+

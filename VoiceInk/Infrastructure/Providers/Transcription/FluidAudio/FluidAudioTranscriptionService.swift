@@ -121,30 +121,51 @@ class FluidAudioTranscriptionService: TranscriptionService {
         }
     }
 
-    // Fork-owned accessor (FORK-PATCHES.md touchpoint 4, "meeting-transcription-coordinator fix
-    // round"): lets the meeting transcription seam reuse the SAME loaded `AsrManager` dictation
-    // uses, instead of loading an independent second copy of the Parakeet models. Authorised
-    // specifically to avoid that duplication on Mark's 16GB M2 Pro. Calls the SAME
-    // `ensureModelsLoaded(for:)` that `transcribe(audioURL:model:context:)` below already calls
-    // for dictation -- no existing method's behavior is changed by this addition, and the
-    // fast path (`asrManager != nil, activeVersion == version`) is a complete no-op relative to
-    // whatever dictation already has loaded.
+    // Fork-owned accessor (FORK-PATCHES.md touchpoint 4, "meeting-transcription-coordinator
+    // fix round 3"): lets the meeting transcription seam reuse the SAME loaded `AsrManager`
+    // dictation uses, instead of loading an independent second copy of the Parakeet models.
+    // Authorised specifically to avoid that duplication on Mark's 16GB M2 Pro.
     //
-    // SAFETY: this class carries no actor isolation of its own -- like every other method here,
-    // it relies on callers serializing their access, which today means "only ever called from
-    // `@MainActor` code, via `TranscriptionServiceRegistry`." The meeting seam's caller hops to
-    // `@MainActor` before calling this (see `FluidAudioMeetingSegmentTranscriber.swift`), so
-    // both dictation's and meetings' calls into this instance run serialized on the same
-    // executor. Requesting a DIFFERENT version than dictation currently has loaded evicts
-    // dictation's manager via the existing `cleanupLoadedManagers()` path -- identical to what
-    // happens today if dictation itself switches models; this is not new eviction behavior,
-    // only a new (and disclosed) second caller able to trigger it.
-    func sharedAsrManager(for version: AsrModelVersion) async throws -> AsrManager {
-        try await ensureModelsLoaded(for: version)
-        guard let asrManager else {
-            throw ASRError.notInitialized
-        }
-        return asrManager
+    // SAFETY -- what this accessor guarantees, and how, stated as what the code cannot do
+    // rather than as a convention:
+    //
+    // This class has no actor isolation of its own. `ensureModelsLoaded(for:)`,
+    // `cleanupLoadedManagers()` and `transcribe(audioURL:model:context:)` all suspend, so
+    // initiating a call on `@MainActor` does NOT serialize the operations against each other --
+    // a second call can and does interleave at any `await` inside a first. Round 2 of this
+    // accessor took `version` and called `ensureModelsLoaded(for:)`, so a meeting asking for a
+    // version dictation did not have loaded ran `cleanupLoadedManagers()` -- including
+    // `asrManager.cleanup()`, which nils out the CoreML models -- underneath a dictation that
+    // was suspended inside `AsrManager.transcribe`. That is a live-dictation failure, and
+    // "callers initiate on `@MainActor`" does not prevent it.
+    //
+    // This version removes the ability rather than documenting the hazard:
+    //   * It is NOT `async` and NOT `throws`. Its whole body is two stored-property reads and a
+    //     tuple construction, so it contains no suspension point at which anything can
+    //     interleave. It runs to completion between two of the caller's own instructions.
+    //   * It takes NO parameter. There is no argument by which a caller could name a model
+    //     version other than the one already loaded, so "the meeting requested a version
+    //     switch" is not an expressible call.
+    //   * It calls nothing. Not `ensureModelsLoaded`, not `getOrLoadModels`, not
+    //     `cleanupLoadedManagers`, not `cleanup()`. Those remain `private` to this file
+    //     (`cleanup()` is internal, but is dictation's own lifecycle API and is called from no
+    //     meeting file). `scripts/negative-controls/FluidAudioSharedModelAttacks.swift` is
+    //     compiled into the app target on every CI run and MUST NOT COMPILE, which is what
+    //     keeps that true rather than conventional.
+    //
+    // Consequence, deliberately accepted: the meeting seam is PINNED to whatever version
+    // dictation already has loaded, and returns nil when nothing is loaded (the caller then
+    // degrades to the coordinator's flat-fallback path). Getting a model loaded stays entirely
+    // dictation's job, through the existing `loadModel(for:)` API that `VoiceInkEngine` already
+    // calls at recording start. See FOLLOWUPS.md for what a composition root must therefore do.
+    //
+    // The reverse direction is NOT closed and is not claimed to be: dictation switching models
+    // still evicts a manager a meeting is mid-way through using. That asymmetry is the point --
+    // protecting the daily dictation flow outranks a meeting chunk, and a failed meeting chunk
+    // degrades to the flat-fallback transcript rather than losing the recording.
+    func borrowedAsrManager() -> (manager: AsrManager, version: AsrModelVersion)? {
+        guard let asrManager, let activeVersion else { return nil }
+        return (asrManager, activeVersion)
     }
 
     func loadModel(for model: FluidAudioModel) async throws {

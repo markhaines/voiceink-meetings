@@ -47,6 +47,14 @@ private struct ThrowingSegmentTranscriber: MeetingSegmentTranscribing {
     }
 }
 
+/// Stands in for the one condition the coordinator ROUTES on rather than propagating: dictation
+/// has no model loaded, so there was nothing for the meeting seam to borrow (fix round 3, B1).
+private struct NoSharedModelSegmentTranscriber: MeetingSegmentTranscribing {
+    func transcribe(chunkAt url: URL) async throws -> SpeechTranscriptionResult {
+        throw MeetingSegmentTranscriberError.sharedModelNotLoaded
+    }
+}
+
 private struct FakeDiarizer: MeetingSystemAudioDiarizing {
     let result: DiarizationResult?
 
@@ -160,6 +168,28 @@ struct MeetingTranscriptionCoordinatorTests {
         await #expect(throws: ThrowingSegmentTranscriber.Failure.self) {
             _ = try await coordinator.transcribeMeetingChunk(at: Self.chunkURL)
         }
+    }
+
+    @Test("sharedModelNotLoaded degrades to the flat fallback -- the ONE error routed, not propagated")
+    func sharedModelNotLoadedDegradesToFallback() async throws {
+        // Paired with `segmentTranscriberFailurePropagates` above, which is the control: these
+        // two together are what show the catch is narrow. If the coordinator ever used a blanket
+        // `catch`, that test would fail while this one still passed, so a regression here cannot
+        // hide behind a green suite. That matters more than usual: a blanket catch would turn a
+        // real backend fault into a plausible-looking flat transcript, which in a 90-minute
+        // recording is the hardest kind of wrong to notice.
+        let coordinator = MeetingTranscriptionCoordinator(
+            backend: .fluidAudio,
+            fluidAudioTranscriber: NoSharedModelSegmentTranscriber(),
+            fallbackTranscribe: { _ in "Hi there friend." }
+        )
+
+        let result = try await coordinator.transcribeMeetingChunk(at: Self.chunkURL)
+
+        #expect(result.text == "Hi there friend.")
+        #expect(result.segments.count == 1)
+        #expect(result.segments.first?.start == 0)
+        #expect(result.segments.first?.end == 0)
     }
 
     @Test("transcribeMeeting(at:) routes the same way as transcribeMeetingChunk(at:)")

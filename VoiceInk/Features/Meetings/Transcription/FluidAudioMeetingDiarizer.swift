@@ -6,38 +6,72 @@
 // whenever a `DiarizerManager`'s models are loaded (the M1/macOS-15.1 GPU-avoidance workaround,
 // FluidAudio issue #344) -- the default `loadManager` closure below is that one call site.
 //
-// FIX ROUND (cross-vendor review, B3): the pre-fix-round version of this file joined an
-// in-flight load but had NO operation ceiling and NO per-waiter cancellation -- `diarizeSystemAudio`
-// is awaited from `MeetingEngine.stop()`, so a hung CoreML load hung meeting completion
-// INDEFINITELY. This version implements the donor's bounded shared-load state machine
-// (`ADAPTER-HANDOVER.md` §5's three properties):
-//   1. Shared load: a second concurrent caller joins the SAME in-flight load, never starting a
-//      second one.
-//   2. An operation deadline (`loadOperationTimeout`, default 30s) independent of any individual
-//      caller's own cancellation -- `runWithDeadline` races the real load against a timeout
-//      sleep and returns whichever finishes first, so no caller ever waits past the deadline
-//      even if the underlying native call never itself notices cancellation (the same
-//      best-effort-cancel-the-loser shape the donor's own `timeoutDiarizerLoad` uses -- see that
-//      function's doc comment below for why "best effort" is honestly stated, not glossed over).
-//   3. Prompt waiter cancellation: a caller whose own Task is cancelled while joining returns
+// FIX ROUND 3 (cross-vendor review, B2 and B3). Two earlier designs were defeated here:
+//
+//   * Round 1 joined an in-flight load with no operation ceiling at all. `diarizeSystemAudio` is
+//     awaited from `MeetingEngine.stop()`, so a hung CoreML load hung meeting completion
+//     indefinitely: Mark ends a 90-minute meeting and the app never finishes it.
+//   * Round 2 added a ceiling built out of `withTaskGroup`, racing the loader against a timeout
+//     child and calling `group.cancelAll()` when the timeout won. Review found that this is not
+//     a ceiling at all. `withTaskGroup` is STRUCTURED concurrency: the group cannot return until
+//     every child task has finished, so leaving the group still awaits the loader. Against a
+//     loader that ignores cooperative cancellation -- which is the only failure mode the ceiling
+//     exists for -- the caller waited exactly as long as it would have with no ceiling. Round 2's
+//     own test appeared to prove otherwise (a "60s" loader finishing in 0.214s against a 0.2s
+//     deadline) because its loader was `try await Task.sleep`, which IS cancellation-aware and
+//     threw the instant `cancelAll()` ran. Real numbers, wrong property: it proved cooperative
+//     cancellation, not a ceiling.
+//
+// Round 3 makes the ceiling structural. The load runs in an UNSTRUCTURED `Task` that nothing
+// ever awaits, and the deadline is a SEPARATE unstructured `Task` that expires on its own clock.
+// Waiters are resumed by whichever of the two fires first, and neither one awaits the other, so
+// a caller's return time is bounded by the deadline task alone -- independently of whether the
+// loader can be cancelled, or ever finishes:
+//
+//   1. Shared load: a second concurrent caller joins the SAME in-flight load (`activeLoadID`),
+//      never starting a second one.
+//   2. Hard operation deadline (`loadOperationTimeout`, default 30s). `expireLoad` resumes every
+//      waiter with `.loadTimedOut` and returns. It cancels the load task best-effort and then
+//      forgets it; it never awaits it. A cancellation-BLIND loader is bounded by this, which is
+//      the property `FluidAudioMeetingDiarizerTests.hungCancellationBlindLoadIsBoundedByTheCeiling`
+//      proves with a loader that blocks on a `DispatchSemaphore` on a detached thread and cannot
+//      be interrupted by `Task.cancel()` at all.
+//   3. Quarantine by load ID: an abandoned load that eventually DOES finish calls `finishLoad`
+//      with its own id, sees it is no longer `activeLoadID`, and drops its result on the floor.
+//      It can never install a manager into a generation that already gave up on it. The abandoned
+//      `DiarizerManager` (if one is ever produced) is simply released.
+//   4. Fresh load, never a dead one: `expireLoad` clears `activeLoadID`, so the NEXT
+//      `diarize`/`resolvedManagerIdentity` starts a brand-new load with a new id rather than
+//      joining the abandoned one. Same for a failed load -- "a failed diarization is recoverable"
+//      (audio and segments are already persisted by the time this runs at `stop()`).
+//   5. Prompt waiter cancellation: a caller whose own Task is cancelled while joining returns
 //      immediately with `CancellationError` via `cancelWaiter`, WITHOUT touching the shared load
-//      Task -- every other waiter (and the load itself) is unaffected.
-// A failed or timed-out load clears `loadTask`, so the NEXT `diarizeSystemAudio` call attempts a
-// fresh load rather than being permanently poisoned -- matching "a failed diarization is
-// recoverable" (audio and segments already persisted by the time this runs at `stop()`).
+//      or any other waiter.
+//
+// B3: round 2 wrote `extension DiarizerManager: @unchecked Sendable {}`. Review was right that
+// this is a MODULE-WIDE promise about a third-party mutable class that every future FluidAudio
+// bump would silently inherit, regardless of what the comment above it said. It is gone. The
+// only `@unchecked` conformance left is `LoadedDiarizerBox` below: a `private`, single-field
+// wrapper whose entire justification is one hop, from the load task into this actor. Nothing
+// outside this actor is ever handed a `DiarizerManager` -- not even the test seam, which returns
+// an `ObjectIdentifier` (a `Sendable` value type) rather than the manager itself.
 
 import FluidAudio
 import Foundation
 
-// Retroactive, `@unchecked` Sendable conformance for a type this file never lets escape its
-// owning actor: `DiarizerManager` is FluidAudio's own plain class with no Sendable conformance
-// of its own, and `FluidAudioMeetingDiarizer` is the ONLY place in this fork that ever
-// constructs or touches one (grep-verified). `runWithDeadline` below needs SOME Sendable-typed
-// result to race two child tasks against each other; `@unchecked` here is an honest assertion of
-// single-owner exclusive access (this actor's serial isolation is what actually makes it safe),
-// not a claim that `DiarizerManager` is generally safe to share across actors -- it is not, and
-// nothing outside this actor is ever given a reference to one.
-extension DiarizerManager: @unchecked Sendable {}
+/// Carries a `DiarizerManager` across exactly one isolation hop: from the unstructured load task
+/// into `FluidAudioMeetingDiarizer.finishLoad(id:_:)`, which stores it in actor-isolated state
+/// and never lets it out again.
+///
+/// `private` on purpose. The `@unchecked` promise is scoped to THIS box and its two use sites in
+/// this file, not to `DiarizerManager`, so it cannot be inherited by any other code in the target
+/// and a future FluidAudio version cannot quietly acquire it. The promise itself is true by
+/// construction: the box is created inside the load task, immediately consumed by the actor, and
+/// the manager it carries is reachable from nowhere else at that moment (the load task's own
+/// reference goes out of scope on the next line).
+private struct LoadedDiarizerBox: @unchecked Sendable {
+    let manager: DiarizerManager
+}
 
 enum FluidAudioMeetingDiarizerError: Error, Equatable {
     case loadTimedOut
@@ -50,7 +84,12 @@ actor FluidAudioMeetingDiarizer: MeetingSystemAudioDiarizing {
     private let loadManager: @Sendable () async throws -> DiarizerManager
 
     private var loadedManager: DiarizerManager?
+    /// Identifies the load generation waiters are currently attached to. `nil` means no load is
+    /// in flight -- including immediately after `expireLoad` gave up on one that is still
+    /// running, which is what makes the next attempt a fresh load rather than a join.
+    private var activeLoadID: UUID?
     private var loadTask: Task<Void, Never>?
+    private var deadlineTask: Task<Void, Never>?
     private var waiters: [UUID: CheckedContinuation<Void, Error>] = [:]
 
     init(
@@ -86,82 +125,117 @@ actor FluidAudioMeetingDiarizer: MeetingSystemAudioDiarizing {
         return try manager.performCompleteDiarization(samples)
     }
 
-    /// `internal`, not `private`, for exactly one reason: so
-    /// `FluidAudioMeetingDiarizerTests.swift` can exercise the shared-load/timeout/cancellation
-    /// state machine directly via `@testable import`, without going through `diarize(fileAt:)`'s
-    /// real file I/O (which would need an actual audio file on disk, unrelated to what these
-    /// tests are proving). No production code outside this actor calls it (grep-verified) --
-    /// widening visibility here creates no seam anyone could use to change the actor's own
-    /// behavior, only to test it.
-    func resolvedManager() async throws -> DiarizerManager {
+    /// Test seam for the shared-load/deadline/quarantine state machine, so it can be exercised
+    /// without `diarize(fileAt:)`'s real file I/O (which would need an actual audio file on disk,
+    /// unrelated to what those tests prove).
+    ///
+    /// It returns the loaded manager's OBJECT IDENTITY, never the manager. That is not a
+    /// stylistic choice: it is what lets B3's fix hold. `ObjectIdentifier` is a `Sendable` value,
+    /// so this seam widens the actor's exclusive ownership of `DiarizerManager` by exactly
+    /// nothing, while still letting a test assert that two calls resolved the SAME instance.
+    @discardableResult
+    func resolvedManagerIdentity() async throws -> ObjectIdentifier {
+        ObjectIdentifier(try await resolvedManager())
+    }
+
+    private func resolvedManager() async throws -> DiarizerManager {
         if let loadedManager { return loadedManager }
-        startLoadIfNeeded()
-        try await join()
+        let generation = startLoadIfNeeded()
+        try await join(generation: generation)
         if let loadedManager { return loadedManager }
         throw FluidAudioMeetingDiarizerError.loadDidNotProduceManager
     }
 
-    private func startLoadIfNeeded() {
-        guard loadTask == nil else { return }
+    /// Starts a load generation: one unstructured task for the load, one for its deadline.
+    ///
+    /// The two are deliberately siblings, not parent and child. Nothing in this actor ever awaits
+    /// `loadTask`, so nothing in this actor can be delayed by it -- that is the whole of B2's fix.
+    /// Both are `Task`, not `withTaskGroup`/`async let`, because both of those are structured and
+    /// would reintroduce exactly the "cannot return until the child finishes" property that made
+    /// round 2's ceiling fictional.
+    private func startLoadIfNeeded() -> UUID {
+        if let activeLoadID { return activeLoadID }
+        let id = UUID()
+        activeLoadID = id
+
         let loader = loadManager
-        let timeoutSeconds = loadOperationTimeout
         loadTask = Task { [weak self] in
-            let outcome = await Self.runWithDeadline(timeoutSeconds: timeoutSeconds, operation: loader)
-            await self?.finishLoad(outcome)
+            let outcome: Result<LoadedDiarizerBox, Error>
+            do {
+                outcome = .success(LoadedDiarizerBox(manager: try await loader()))
+            } catch {
+                outcome = .failure(error)
+            }
+            await self?.finishLoad(id: id, outcome)
         }
+
+        let timeoutNanoseconds = UInt64(max(loadOperationTimeout, 0) * 1_000_000_000)
+        deadlineTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+            // Reached whether or not the sleep was cancelled: a cancelled sleep throws, `try?`
+            // swallows it, and `expireLoad`'s own id guard makes the call a no-op if this
+            // generation already finished. So a cancelled deadline can never expire a live load.
+            await self?.expireLoad(id: id)
+        }
+
+        return id
     }
 
-    /// Races `operation` against a `timeoutSeconds` sleep; whichever finishes first wins and the
-    /// loser is cancelled. That cancellation is honestly best-effort, not a guarantee -- a
-    /// genuinely hung, cancellation-blind native call (a stuck CoreML compile, matching the real
-    /// incident this fork's own memory records for a DIFFERENT hung native call) may keep
-    /// running in the background regardless. What this DOES guarantee, unconditionally: no
-    /// caller of `resolvedManager()` ever waits past `timeoutSeconds`, whether or not the loser
-    /// actually stops. This is the exact shape the donor's own `timeoutDiarizerLoad` uses too --
-    /// FluidAudio issue reports on real hangs generally do NOT resolve via cooperative
-    /// cancellation, so promising a stronger guarantee here would be dishonest.
-    private static func runWithDeadline(
-        timeoutSeconds: TimeInterval,
-        operation: @escaping @Sendable () async throws -> DiarizerManager
-    ) async -> Result<DiarizerManager, Error> {
-        await withTaskGroup(of: Result<DiarizerManager, Error>.self) { group in
-            group.addTask {
-                do {
-                    return .success(try await operation())
-                } catch {
-                    return .failure(error)
-                }
-            }
-            group.addTask {
-                try? await Task.sleep(nanoseconds: UInt64(max(timeoutSeconds, 0) * 1_000_000_000))
-                return .failure(FluidAudioMeetingDiarizerError.loadTimedOut)
-            }
-            let first = await group.next() ?? .failure(FluidAudioMeetingDiarizerError.loadDidNotProduceManager)
-            group.cancelAll()
-            return first
-        }
-    }
-
-    private func finishLoad(_ result: Result<DiarizerManager, Error>) {
+    /// Called by the load task when the loader finally returns -- which may be long after this
+    /// generation was abandoned. The id guard is the quarantine: a late result from a load the
+    /// actor already gave up on is dropped, never installed.
+    private func finishLoad(id: UUID, _ outcome: Result<LoadedDiarizerBox, Error>) {
+        guard activeLoadID == id else { return }
+        activeLoadID = nil
         loadTask = nil
-        switch result {
-        case .success(let manager):
-            loadedManager = manager
+        deadlineTask?.cancel()
+        deadlineTask = nil
+        switch outcome {
+        case .success(let box):
+            loadedManager = box.manager
             resumeAllWaiters(with: .success(()))
         case .failure(let error):
             resumeAllWaiters(with: .failure(error))
         }
     }
 
+    /// The ceiling. Resumes every waiter and returns; it does NOT await the load task, so how
+    /// long the loader takes -- or whether it ever stops -- has no bearing on when the caller of
+    /// `diarize`/`resolvedManagerIdentity` gets control back.
+    ///
+    /// `loadTask?.cancel()` is honestly best-effort and is not what makes the bound hold: a stuck
+    /// CoreML compile may ignore it entirely. It is here so a loader that DOES cooperate stops
+    /// burning CPU, nothing more.
+    private func expireLoad(id: UUID) {
+        guard activeLoadID == id else { return }
+        activeLoadID = nil
+        loadTask?.cancel()
+        loadTask = nil
+        deadlineTask = nil
+        resumeAllWaiters(with: .failure(FluidAudioMeetingDiarizerError.loadTimedOut))
+    }
+
     /// Registers this call as a waiter on the in-flight load and suspends until either the load
-    /// finishes -- broadcast to every waiter by `finishLoad` -- or THIS call's own Task is
-    /// cancelled, in which case `cancelWaiter` resumes just this continuation with
-    /// `CancellationError` and removes it, WITHOUT touching `loadTask` or any other waiter.
-    private func join() async throws {
-        guard loadTask != nil else { return }
+    /// generation ends -- broadcast to every waiter by `finishLoad` or `expireLoad` -- or THIS
+    /// call's own Task is cancelled, in which case `cancelWaiter` resumes just this continuation
+    /// with `CancellationError` and removes it, WITHOUT touching the load or any other waiter.
+    private func join(generation: UUID) async throws {
         let id = UUID()
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                guard activeLoadID == generation else {
+                    // The generation ended between `startLoadIfNeeded()` returning and this
+                    // closure running. Not reachable today -- both run in one uninterrupted
+                    // actor-isolated step, since `withCheckedThrowingContinuation` invokes its
+                    // body synchronously -- but parking on a generation nobody will ever
+                    // broadcast to is the one way this state machine could hang, so it is
+                    // guarded rather than argued. Resume immediately and let `resolvedManager`
+                    // re-read `loadedManager`: a generation that ended in success has already
+                    // installed it, and one that ended any other way surfaces as
+                    // `.loadDidNotProduceManager` instead of an indefinite wait.
+                    continuation.resume()
+                    return
+                }
                 waiters[id] = continuation
             }
         } onCancel: {

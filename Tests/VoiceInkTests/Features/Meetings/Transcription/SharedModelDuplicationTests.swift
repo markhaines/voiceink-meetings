@@ -1,20 +1,25 @@
 // New for this fork (Stage 2c fix round, cross-vendor review finding B1). Not a port.
 //
-// B1's PROOF requirement was object-instance identity ("show that the meeting path obtains the
-// SAME instance dictation uses"). Stated plainly: that specific proof is NOT possible in this
-// environment. `FluidAudioMeetingSegmentTranscriber.resolveSharedManager()` and
-// `TranscribeCppMeetingSegmentTranscriber.transcribe(chunkAt:)` both reach a real loaded model
-// only by calling into `FluidAudioTranscriptionService.sharedAsrManager(for:)` /
-// `OfflineTranscribeCppService.borrowModel(for:)`, which require real Parakeet CoreML models /
-// a real transcribe-cpp GGUF file on disk -- neither is present in this environment, and this
-// suite does not fake that (a faked identity check would prove nothing about the real path).
+// WHAT THIS SUITE IS, AND EXPLICITLY IS NOT. It is a regression tripwire over the TEXT of two
+// adapter files. It is NOT an identity proof, and review has already recorded that it cannot be
+// one -- indirection defeats a substring scan (a call reached through a stored or
+// partially-applied reference matches nothing here), and no static scan can show that a
+// composition root injects the same instance into dictation and into the meeting seam. That
+// language is deliberate and must not be upgraded: the accepted position is that this catches a
+// regression, not that it proves the property.
 //
-// What CAN be proven, and is proven here, is the structural half of B1: that neither adapter
-// file constructs its OWN independent model/manager anymore. This is the same "cheap,
-// deterministic static text scan" pattern `MeetingVadStreamsTests.swift` already uses in this
-// repo for an analogous "a bypass must not exist in production code" property -- not a parser,
-// a substring scan, with the same disclosed limits (does not catch a call reached only through a
-// stored or partially-applied reference).
+// The identity proof B1 originally asked for ("show the meeting path obtains the SAME instance
+// dictation uses") is not possible here: both accessors only produce a real manager against real
+// Parakeet CoreML models / a real transcribe-cpp GGUF file, neither of which exists in this
+// environment, and this suite does not fake that -- a faked identity check would prove nothing
+// about the real path.
+//
+// The structural half that IS proven elsewhere, and is much stronger than this scan:
+// `scripts/negative-controls/FluidAudioSharedModelAttacks.swift` is compiled into the app target
+// on every CI run and MUST NOT COMPILE. That is a compiler-enforced statement that the
+// eviction-capable methods on `FluidAudioTranscriptionService` are unreachable, which no amount
+// of text scanning could establish. This file covers the complementary, weaker question of
+// whether the adapters have started doing their own loading again.
 
 import Foundation
 import Testing
@@ -40,10 +45,14 @@ struct SharedModelDuplicationTests {
         )
     }
 
-    @Test("FluidAudioMeetingSegmentTranscriber.swift reaches models only through the shared accessor")
+    @Test("FluidAudioMeetingSegmentTranscriber.swift reaches models only through the borrow-only accessor")
     func fluidAudioAdapterUsesTheSharedAccessor() throws {
         let contents = try Self.readFile("FluidAudioMeetingSegmentTranscriber.swift")
-        #expect(contents.contains("sharedService.sharedAsrManager(for:"))
+        // `borrowedAsrManager()` takes no argument by construction (fix round 3, B1): there is
+        // no version to pass, so the meeting seam cannot request a switch. Asserting the exact
+        // no-argument call shape means reintroducing a parameterised accessor would fail here as
+        // well as failing the negative control.
+        #expect(contents.contains("sharedService.borrowedAsrManager()"))
     }
 
     @Test("TranscribeCppMeetingSegmentTranscriber.swift no longer constructs its own native Model or initializes backends itself")
@@ -75,6 +84,39 @@ struct SharedModelDuplicationTests {
         let contents = try Self.readFile("TranscribeCppMeetingSegmentTranscriber.swift")
         #expect(contents.contains("sharedService.borrowModel(for:"))
         #expect(contents.contains("borrowed.release()"))
+    }
+
+    @Test("FluidAudioMeetingDiarizer.swift does not retroactively conform a FluidAudio package type to Sendable")
+    func diarizerDoesNotRetroactivelyConformAPackageType() throws {
+        // B3. Round 2 shipped `extension DiarizerManager: @unchecked Sendable {}` in production
+        // code: a MODULE-WIDE promise about a third-party mutable class, inherited silently by
+        // every future FluidAudio bump, no matter what the comment above it said.
+        //
+        // This is a TEXT SCAN and nothing more, for a reason worth recording rather than
+        // glossing: the natural compile-time control ("assert `DiarizerManager` is not
+        // `Sendable`") does not work in this target, which builds in the Swift 5 language mode
+        // where a missing `Sendable` conformance is a warning, not an error. It was tried in
+        // `scripts/negative-controls/FluidAudioSharedModelAttacks.swift` and produced no
+        // diagnostic at all. So this catches the exact regression by name; it does not prove the
+        // absence of every possible retroactive conformance.
+        // The needle is anchored to a line start, for the same reason the transcribe-cpp scan
+        // above uses call-site shapes: the file's own header comment quotes the offending
+        // declaration verbatim while explaining what B3 was, and a bare substring scan
+        // false-positived on that prose (it did, on the first run of this test).
+        let offenders = try Self.scanFile(
+            "FluidAudioMeetingDiarizer.swift",
+            forSubstrings: ["\nextension DiarizerManager"]
+        )
+
+        #expect(
+            offenders.isEmpty,
+            """
+            FluidAudioMeetingDiarizer.swift extends a FluidAudio package type again. B3 was \
+            specifically about `extension DiarizerManager: @unchecked Sendable {}`; the scoped \
+            `LoadedDiarizerBox` wrapper exists so that is not needed:
+            \(offenders.joined(separator: "\n"))
+            """
+        )
     }
 
     // MARK: - Scan helpers

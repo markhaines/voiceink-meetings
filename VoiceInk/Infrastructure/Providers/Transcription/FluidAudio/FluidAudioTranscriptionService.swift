@@ -121,6 +121,32 @@ class FluidAudioTranscriptionService: TranscriptionService {
         }
     }
 
+    // Fork-owned accessor (FORK-PATCHES.md touchpoint 4, "meeting-transcription-coordinator fix
+    // round"): lets the meeting transcription seam reuse the SAME loaded `AsrManager` dictation
+    // uses, instead of loading an independent second copy of the Parakeet models. Authorised
+    // specifically to avoid that duplication on Mark's 16GB M2 Pro. Calls the SAME
+    // `ensureModelsLoaded(for:)` that `transcribe(audioURL:model:context:)` below already calls
+    // for dictation -- no existing method's behavior is changed by this addition, and the
+    // fast path (`asrManager != nil, activeVersion == version`) is a complete no-op relative to
+    // whatever dictation already has loaded.
+    //
+    // SAFETY: this class carries no actor isolation of its own -- like every other method here,
+    // it relies on callers serializing their access, which today means "only ever called from
+    // `@MainActor` code, via `TranscriptionServiceRegistry`." The meeting seam's caller hops to
+    // `@MainActor` before calling this (see `FluidAudioMeetingSegmentTranscriber.swift`), so
+    // both dictation's and meetings' calls into this instance run serialized on the same
+    // executor. Requesting a DIFFERENT version than dictation currently has loaded evicts
+    // dictation's manager via the existing `cleanupLoadedManagers()` path -- identical to what
+    // happens today if dictation itself switches models; this is not new eviction behavior,
+    // only a new (and disclosed) second caller able to trigger it.
+    func sharedAsrManager(for version: AsrModelVersion) async throws -> AsrManager {
+        try await ensureModelsLoaded(for: version)
+        guard let asrManager else {
+            throw ASRError.notInitialized
+        }
+        return asrManager
+    }
+
     func loadModel(for model: FluidAudioModel) async throws {
         if FluidAudioModelManager.isNemotronModel(named: model.name) {
             // Realtime Nemotron uses a dedicated streaming manager; batch loads lazily in transcribe().

@@ -264,3 +264,36 @@ whatever queue/thread actually detects a route change (e.g. a CoreAudio device-c
 since that is very unlikely to be the same queue. Not built here — this file only defines the
 protocol seam and reads through it; the synchronization is the integration owner's to add when
 wiring the real classifier in.
+
+## Real-audio / real-model smoke testing is a PREREQUISITE to wiring the meeting transcription seam, not optional
+
+`FluidAudioMeetingSegmentTranscriber`, `TranscribeCppMeetingSegmentTranscriber`, and
+`FluidAudioMeetingDiarizer` (`Features/Meetings/Transcription/`) compile against the real
+FluidAudio/TranscribeCpp package APIs and pass `xcodebuild build-for-testing`, but NONE of their
+real model-loading/inference paths have ever run against real audio or real downloaded models —
+no Parakeet, transcribe-cpp, or diarizer models are present in the environment these were built
+in. Before any composition root constructs a real `MeetingTranscriptionCoordinator` and wires it
+into `MeetingEngine` (currently nothing does — see `FORK-PATCHES.md`'s
+`meeting-transcription-coordinator` section), the following must be run for real, on a Mac with
+the actual models downloaded:
+
+- **`.segment` timestamp support, per transcribe-cpp catalog model.** `segment-timing-design.md`
+  §B and `FORK-PATCHES.md` both flag this as unresolved: whether `cohereTranscribe` or
+  `senseVoiceSmall` (or both, or neither) actually populates `Transcript.segments` when asked for
+  `timestamps: .segment`, versus silently resolving to a coarser kind. Requesting `.segment` and
+  getting back an empty `segments` array is NOT a crash — it silently degrades to
+  `TranscribeCppMeetingSegmentTranscriber`'s own empty-segments fallback (one flat, zero-duration
+  segment) — so this needs an explicit real-audio check, not just "it didn't throw."
+- **Actual resource measurement**, now that B1's fix round shares the loaded model with
+  dictation instead of duplicating it: confirm on real hardware (ideally Mark's own 16GB M2 Pro)
+  that a meeting running concurrently with dictation does NOT, in practice, cause the
+  version-switch eviction race disclosed in `FORK-PATCHES.md`'s touchpoint 4 section, and that
+  memory stays within an acceptable envelope for the actual model(s) wired in.
+- **`FluidAudioMeetingDiarizer`'s real `DiarizerModels.load`/`performCompleteDiarization` path**,
+  including a real timing measurement against the `loadOperationTimeout` default (30s) chosen
+  without any real-hardware data point for how long a genuine model load takes on Mark's
+  machine — the ceiling exists and is proven to bite (`FluidAudioMeetingDiarizerTests`), but
+  whether 30s is the RIGHT number, as opposed to just A number, is unverified.
+
+None of this can be substituted with more unit tests against injected fakes — the whole point is
+verifying the REAL backend/model behavior the fakes stand in for.

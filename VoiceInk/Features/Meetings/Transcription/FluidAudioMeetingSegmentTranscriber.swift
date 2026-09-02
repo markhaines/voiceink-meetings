@@ -1,13 +1,28 @@
 // Fork-owned (no donor equivalent). Not a port.
 //
 // Direct FluidAudio integration for the meeting transcription seam (`DECISION-transcription-seam.md`,
-// Option (ii)). Deliberately independent of `FluidAudioTranscriptionService.swift`: this stage's
-// brief forbids editing that file (it is the dictation path's FluidAudio backend, touched daily),
-// and its `asrManager` is `private` with no seam to reach a segment-bearing call through it
-// without an edit. This type owns its own `AsrManager` and its own model load instead. The cost,
-// stated plainly: the meeting pipeline keeps a second copy of the Parakeet models resident in
-// memory alongside dictation's own copy if both are active at once. That is the accepted price
-// of not touching the upstream file, not an oversight.
+// Option (ii)). FIX ROUND (cross-vendor review, B1/B2): the first version of this file loaded
+// its own independent `AsrManager` + Parakeet models, permanently duplicating whatever dictation
+// already has loaded via `FluidAudioTranscriptionService`. On Mark's 16GB M2 Pro, where he
+// dictates with local Parakeet every day, that is unacceptable -- Mark explicitly authorised an
+// upstream touchpoint to fix it rather than ship it. This version instead SHARES dictation's
+// already-loaded `AsrManager` through `FluidAudioTranscriptionService.sharedAsrManager(for:)`
+// (a new, narrow, additive accessor on that file -- see FORK-PATCHES.md touchpoint 4). No model
+// duplication, no independent lifecycle to manage here: eviction/lifecycle is delegated wholesale
+// to the existing service's own (version-switch and `cleanup()`) behavior.
+//
+// SAFETY / actor isolation: `FluidAudioTranscriptionService` carries no actor isolation of its
+// own (see that file) -- its existing safety today comes entirely from every caller initiating
+// calls from `@MainActor` (via `TranscriptionServiceRegistry`), not from any compiler-enforced
+// mutual exclusion. `resolveSharedManager()` below is THIS actor's own method, annotated
+// `@MainActor` so calling it hops onto the main actor before touching the shared service --
+// putting the meeting seam's access pattern in the SAME shape dictation's own existing calls
+// already have (MainActor-initiated), not a new, less-disciplined bypass of it. This is a real,
+// disclosed limit, not a stronger guarantee: like dictation's own existing calls, it does not
+// itself prove no two overlapping calls can ever race past an internal `await` inside
+// `ensureModelsLoaded`; it proves the meeting seam is exactly as disciplined as dictation
+// already is, no more, no less. See FORK-PATCHES.md for the full reasoning and what remains
+// unproven without real hardware/model measurement.
 //
 // Segment mapping matches the donor's own `transcribeWithFluidAudio`
 // (`segment-timing-design.md` §A/§C exactly): one `SpeechSegment` per FluidAudio `TokenTiming`
@@ -21,25 +36,16 @@ import FluidAudio
 import Foundation
 
 actor FluidAudioMeetingSegmentTranscriber: MeetingSegmentTranscribing {
+    private let sharedService: FluidAudioTranscriptionService
     private let version: AsrModelVersion
-    private let encoderPrecision: ParakeetEncoderPrecision
-    private let modelsDirectory: URL?
 
-    private var loadedManager: AsrManager?
-    private var loadingTask: Task<AsrManager, Error>?
-
-    init(
-        version: AsrModelVersion = .v3,
-        encoderPrecision: ParakeetEncoderPrecision = .int8,
-        modelsDirectory: URL? = nil
-    ) {
+    init(sharedService: FluidAudioTranscriptionService, version: AsrModelVersion = .v3) {
+        self.sharedService = sharedService
         self.version = version
-        self.encoderPrecision = encoderPrecision
-        self.modelsDirectory = modelsDirectory
     }
 
     func transcribe(chunkAt url: URL) async throws -> SpeechTranscriptionResult {
-        let manager = try await resolvedManager()
+        let manager = try await resolveSharedManager()
         var decoderState = TdtDecoderState.make(decoderLayers: await manager.decoderLayerCount)
         // `AsrManager.transcribe(_:decoderState:language:)` reads and (for large files)
         // disk-backs the URL itself -- never routes through `AudioFileProcessor`, which would
@@ -80,33 +86,8 @@ actor FluidAudioMeetingSegmentTranscriber: MeetingSegmentTranscribing {
         }
     }
 
-    private func resolvedManager() async throws -> AsrManager {
-        if let loadedManager { return loadedManager }
-        if let loadingTask { return try await loadingTask.value }
-
-        let version = version
-        let encoderPrecision = encoderPrecision
-        let directory = modelsDirectory ?? AsrModels.defaultCacheDirectory(for: version)
-
-        let task = Task<AsrManager, Error> {
-            let models = try await AsrModels.load(
-                from: directory,
-                version: version,
-                encoderPrecision: encoderPrecision
-            )
-            let manager = AsrManager(config: .default)
-            try await manager.loadModels(models)
-            return manager
-        }
-        loadingTask = task
-        do {
-            let manager = try await task.value
-            loadedManager = manager
-            loadingTask = nil
-            return manager
-        } catch {
-            loadingTask = nil
-            throw error
-        }
+    @MainActor
+    private func resolveSharedManager() async throws -> AsrManager {
+        try await sharedService.sharedAsrManager(for: version)
     }
 }

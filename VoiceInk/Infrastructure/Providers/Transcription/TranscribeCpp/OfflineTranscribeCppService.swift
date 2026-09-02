@@ -88,6 +88,32 @@ final class OfflineTranscribeCppService: TranscriptionService, @unchecked Sendab
         _ = try await getOrLoadModel(for: model, artifact: artifact)
     }
 
+    // Fork-owned accessor (FORK-PATCHES.md touchpoint 4, "meeting-transcription-coordinator fix
+    // round"): lets the meeting transcription seam borrow the SAME native `Model` dictation
+    // uses -- resolved and retain-counted through the exact same `resolveArtifact` /
+    // `getOrLoadModel` / `retainModel` path `transcribe(audioURL:model:context:)` below already
+    // uses, going through the SAME `backendInitializationLock`/`modelInitializationLock`/
+    // `stateLock` this class already serializes native construction with. Authorised
+    // specifically to avoid a second independently-loaded transcribe-cpp `Model` instance
+    // beside dictation's, and to avoid a second, parallel lock over the same non-cancellable
+    // native resource. No existing method's behavior is changed by this addition. This class is
+    // already `@unchecked Sendable` and internally lock-protected, so unlike the FluidAudio
+    // accessor this needs no additional actor-isolation discipline from its caller.
+    //
+    // Callers MUST call the returned `release` closure exactly once when done with the model
+    // (mirroring `transcribe(audioURL:model:context:)`'s own `defer { releaseModel(...) }`) --
+    // holding it open longer than needed blocks this service's existing memory-pressure and
+    // model-switch eviction (`activeTranscriptionCount` never reaches 0 while a borrow is open).
+    func borrowModel(
+        for model: TranscribeCppModel
+    ) async throws -> (model: Model, artifact: TranscribeCppModelArtifact, release: @Sendable () -> Void) {
+        let artifact = try resolveArtifact(for: model)
+        let nativeModel = try await getOrLoadModel(for: model, artifact: artifact)
+        retainModel(nativeModel, named: model.name)
+        let modelName = model.name
+        return (nativeModel, artifact, { [weak self] in self?.releaseModel(named: modelName) })
+    }
+
     func transcribe(
         audioURL: URL,
         model: any TranscriptionModel,

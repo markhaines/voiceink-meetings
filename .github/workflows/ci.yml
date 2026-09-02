@@ -335,6 +335,17 @@ jobs:
             -skipPackagePluginValidation \
             -onlyUsePackageVersionsFromResolvedFile
 
+      # Compiles the MeetingStore negative controls -- source files that MUST NOT COMPILE --
+      # into the app target, and fails if any of them builds or if any expected compiler
+      # diagnostic goes missing. MeetingStore claims a structural guarantee (no code outside
+      # its file can reach the ModelContext it mutates); two earlier designs of that boundary
+      # were each hand-verified as correct and then defeated in one line by review, so the
+      # claim is re-attacked on every run rather than trusted. Runs AFTER the test step and
+      # reuses .ci-test-build on purpose, so each attack is an incremental one-file compile
+      # rather than a cold build. It is the last step that builds anything.
+      - name: Verify MeetingStore isolation negative controls
+        run: scripts/verify-meeting-store-isolation.sh --derived-data .ci-test-build
+
       # The trust check above runs before the build, against the COMMITTED Package.resolved.
       # -onlyUsePackageVersionsFromResolvedFile is supposed to stop xcodebuild re-resolving,
       # but "supposed to" is not a guarantee, and a build-time re-resolution that pulled in a

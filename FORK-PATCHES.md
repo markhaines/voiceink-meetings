@@ -656,7 +656,7 @@ These changed what the app does. Read the reason before merging upstream changes
 - `VoiceInk/Infrastructure/Licensing/PolarService.swift` -- licensing (section 5)
 - `VoiceInk/Infrastructure/RemoteConfig/AnnouncementsService.swift` -- polled upstream's GitHub Pages host every 4 hours and rendered upstream-supplied content with a clickable link (section 2b)
 
-### A5. New fork-only files (8 files)
+### A5. New fork-only files (10 files)
 
 - `.github/workflows/ci.yml` -- the CI pipeline (section 6)
 - `FORK-PATCHES.md` -- this file
@@ -665,6 +665,7 @@ These changed what the app does. Read the reason before merging upstream changes
 - `package-trust.json` -- the reviewed build-time input: the whole pinned package graph (every pin's location, revision, root tree and manifest blob ids, plus sha256 of `Package.resolved`), and the reviewed macro/build-tool plugin components with their source-tree hashes (section 6)
 - `scripts/assert-fork-identity.sh` -- the fork-identity guard, run against the built app and the project configuration (section 6)
 - `scripts/verify-package-trust.sh` -- enforces `package-trust.json` before anything is built (section 6)
+- `scripts/verify-meeting-store-isolation.sh` + `scripts/negative-controls/` -- source files that MUST NOT COMPILE, re-attacking `MeetingStore`'s isolation boundary on every CI run (stage2-models-store escalation round, section 4)
 - `whisper-cpp.rev` -- the pinned whisper.cpp revision (section 6)
 
 
@@ -1302,3 +1303,281 @@ isolated new-test-only run (non-parallel) used to bisect each crash down to its 
 call site. `scripts/verify-package-trust.sh` passes unchanged (no new dependency). Diagnostic
 report paths for both crash discoveries are cited above rather than only described, so they can
 be re-read if this ever needs re-verifying.
+
+## stage2-models-store escalation round (second review response)
+
+The fix round above was reviewed again and returned CHANGES-REQUIRED on the same property for
+the second time: the `@ModelActor` boundary is structurally defeatable. Everything else that
+round established stands and is untouched — the schema design, the 4-store wiring in
+`VoiceInk/App/VoiceInk.swift` (still the only upstream file this stage edits), the
+`registeredModel`-then-fetch identifier lookup, and both `PersistentIdentifier` landmines
+recorded above. This entry covers only what changed and why.
+
+### 1. The defect: a `@ModelActor` conformance IS the leak
+
+The previous round checked whether `actor.modelContext` (the convenience property in
+`extension ModelActor`) was `nonisolated`, read the SDK's `.swiftinterface` to confirm it is
+not, and proved with a compile error that the property could not be reached. All of that was
+correct — and it missed the door next to the one it was watching. `ModelActor` has two
+requirements of its own:
+
+```swift
+public protocol ModelActor : _Concurrency.Actor {
+  nonisolated var modelContainer: SwiftData.ModelContainer { get }
+  nonisolated var modelExecutor: any SwiftData.ModelExecutor { get }
+}
+public protocol ModelExecutor : _Concurrency.Executor {
+  var modelContext: SwiftData.ModelContext { get }
+}
+```
+(`MacOSX26.5.sdk/System/Library/Frameworks/SwiftData.framework/.../arm64e-apple-macos.swiftinterface`,
+lines 120-128.)
+
+`modelExecutor` is `nonisolated` and public; `ModelExecutor.modelContext` is public and, on a
+non-actor conformer such as `DefaultSerialModelExecutor`, plainly non-isolated. So any caller
+can obtain the actor's exact live `ModelContext` synchronously, fetch managed objects from it,
+and mutate them off the actor's executor:
+
+```swift
+func attack<A: ModelActor>(_ actor: A) {
+    let context = actor.modelExecutor.modelContext
+    context.autosaveEnabled = false
+}
+```
+
+Note it is generic over `any ModelActor`, so it does not even name the conforming type. Hiding,
+renaming or documenting the type would have done nothing. **The conformance itself is the
+public surface**, and no amount of care applied to the members we wrote could have closed it.
+
+### 2. The fix: own the executor, conform to nothing, and hand back a receipt
+
+`MeetingSegmentPersistenceActor.swift` → `MeetingStore.swift`. Three types, one file:
+
+- `MeetingStore` — a **`struct`**, the only thing anything outside the file can name. Its
+  methods are all `async`, and take/return `MeetingHandle`/`MeetingSegmentHandle`.
+- `MeetingHandle` / `MeetingSegmentHandle` — `Sendable` value receipts wrapping a
+  `PersistentIdentifier` in a `fileprivate` field.
+- `MeetingPersistenceEngine` — a **`private`** actor that owns the `ModelContext`, and
+  **conforms to nothing**.
+
+The engine is not a `@ModelActor`. That macro's whole substantive output is three lines of
+`init` plus the `ModelActor` conformance, and the conformance is the defect, so the file writes
+the three lines itself:
+
+```swift
+private actor MeetingPersistenceEngine {
+    private let executor: DefaultSerialModelExecutor
+    nonisolated var unownedExecutor: UnownedSerialExecutor { executor.asUnownedSerialExecutor() }
+    private var modelContext: ModelContext { executor.modelContext }
+
+    init(modelContainer: ModelContainer) {
+        let context = ModelContext(modelContainer)
+        context.autosaveEnabled = false
+        executor = DefaultSerialModelExecutor(modelContext: context)
+    }
+}
+```
+
+This is behaviourally identical to `@ModelActor` — a context created from the container, bound
+to a `DefaultSerialModelExecutor` that is also the actor's own executor — minus the two things
+the conformance adds: the `modelExecutor` requirement (the leak) and the `self[id, as:]`
+subscript (the landmine recorded in the previous entry, which returns a non-nil INVALID object
+for a foreign identifier). Losing both is the point, not a side effect.
+
+This is the inversion the project has learned to reach for. The old design accepted "the caller
+will only use the identifier API" and tried to defend that claim against attack. The new one
+removes the alternative: there is no `ModelActor` conformance to reach through, no engine type
+to name, and no context-shaped value in the API at all — only receipts the store issues after
+doing the work itself.
+
+### 3. The property guaranteed, stated exactly
+
+> **G.** The `ModelContext` this component mutates, and every managed `Meeting`/`MeetingSegment`
+> registered in it, are unreachable from any code outside `MeetingStore.swift`, using the
+> language's checked features. Every mutation of a meeting's persisted graph therefore happens
+> on one serial executor, in call order, with one explicit `save()` per mutation.
+
+Scope, stated so it is not over-read: **G** is about *this component's* context. Anyone holding
+the `ModelContainer` can still make their own `ModelContext` over the same rows — that is
+SwiftData's supported model, contexts are independent and conflicts resolve at save. What **G**
+rules out is a second isolation domain mutating the objects *this* executor owns, which is a
+data race on non-`Sendable` reference types rather than an ordinary write conflict.
+
+Four mechanisms enforce it, each closing a route the previous designs left open:
+
+1. **No `ModelActor` conformance** on the exposed type or the engine (§1, §2).
+2. **The engine type is `private` at file scope**, so it cannot be named, extended, or
+   instantiated elsewhere.
+3. **`MeetingStore` is a `struct`.** `ModelActor` refines `Actor`, which only a class or actor
+   can conform to, so the conformance cannot be added back retroactively. The choice of `struct`
+   is load-bearing.
+4. **The engine is a closure capture, never a stored property**, because `Mirror` needs no
+   access and no compiler permission (§5).
+
+### 4. Attack transcript (full `xcodebuild`, verbatim)
+
+Attacks live in `scripts/negative-controls/`, permanently, and are run by
+`scripts/verify-meeting-store-isolation.sh`, which stages each into the **app target** (not the
+test target: `private`/`fileprivate` are file-scoped, so same-module code is the realistic
+attacker, and the MeetingEngine will live in that module), builds with a full `xcodebuild`, and
+fails if the build SUCCEEDS **or if any expected diagnostic goes missing** — a control that
+quietly stops firing still leaves a red build and would otherwise read as green. Wired into CI
+after the test step.
+
+Run: `scripts/verify-meeting-store-isolation.sh --derived-data .ci-test-build`, Xcode 26.6
+(17F113), macOS 15 deployment target, Swift 5 language mode. Every diagnostic below is a hard
+language error, not a strict-concurrency diagnostic, so none of them depends on a build setting
+that could be turned down later. Exit 0 (all controls failed to compile, for the expected
+reasons). `__NegativeControl.swift` is the staged copy of the attack file.
+
+```
+==> MeetingStoreIsolationAttacks.swift
+  --- compiler diagnostics ---
+    __NegativeControl.swift:40:5: error: global function 'a1_genericModelExecutorEscape' requires that 'MeetingStore' conform to 'ModelActor'
+    __NegativeControl.swift:44:33: error: 'MeetingPersistenceEngine' is inaccessible due to 'private' protection level
+    __NegativeControl.swift:48:15: error: 'dispatch' is inaccessible due to 'private' protection level
+    __NegativeControl.swift:53:53: error: 'persistentID' is inaccessible due to 'fileprivate' protection level
+    __NegativeControl.swift:58:9: error: 'async' call in a function that does not support concurrency
+    __NegativeControl.swift:65:34: error: cannot convert value of type 'Meeting' to expected argument type 'MeetingHandle'
+    __NegativeControl.swift:71:44: error: cannot convert value of type 'M' to expected argument type 'MeetingHandle'
+    __NegativeControl.swift:76:5: error: 'MeetingHandle' initializer is inaccessible due to 'fileprivate' protection level
+    __NegativeControl.swift:82:23: error: instance method 'decode(_:from:)' requires that 'MeetingHandle' conform to 'Decodable'
+    __NegativeControl.swift:88:17: error: incorrect argument label in call (have 'modelContext:', expected 'modelContainer:')
+    __NegativeControl.swift:88:32: error: cannot convert value of type 'ModelContext' to expected argument type 'ModelContainer'
+    __NegativeControl.swift:92:13: error: inheritance from non-protocol, non-class type 'MeetingStore'
+    __NegativeControl.swift:97:11: error: value of type 'MeetingStore' has no member 'modelContainer'
+    __NegativeControl.swift:103:5: error: 'dispatch' is inaccessible due to 'private' protection level
+    __NegativeControl.swift:108:11: error: value of type 'MeetingStore' has no member 'modelContext'
+  --- end diagnostics ---
+==> MeetingStoreRetroactiveConformanceAttack.swift
+  --- compiler diagnostics ---
+    __NegativeControl.swift:16:1: error: non-class type 'MeetingStore' cannot conform to class protocol 'Actor'
+    __NegativeControl.swift:16:1: error: non-class type 'MeetingStore' cannot conform to class protocol 'ModelActor'
+  --- end diagnostics ---
+All MeetingStore negative controls still fail to compile, for the expected reasons.
+```
+
+Attack by attack, in the order they appear in the file:
+
+| # | Attack | Line | Outcome |
+|---|---|---|---|
+| A1 | The reviewer's exact attack, generalised: `func attack<A: ModelActor>` reading `actor.modelExecutor.modelContext`, applied to `MeetingStore` | 40 | **blocked** — no `ModelActor` conformance to bite on. The generic function itself still compiles; there is simply no value of ours it accepts. |
+| A2 | Name the engine actor directly | 44 | **blocked** — `private` at file scope |
+| A3 | Read the private dispatch table (member reference) | 48 | **blocked** — `private` |
+| A4 | Add the `ModelActor` conformance back retroactively | 16 (own file) | **blocked** — a `struct` cannot conform to `Actor` |
+| A5 | Extension unwrapping a handle into a `PersistentIdentifier` | 53 | **blocked** — `fileprivate` payload |
+| A6 | Call the store synchronously, no `await` | 58 | **blocked** — every method is `async` |
+| A7 | Pass a managed `Meeting` across the boundary | 65 | **blocked** — no overload accepts one |
+| A8 | The same, laundered through `<M: PersistentModel>` so no model type is named | 71 | **blocked** — same |
+| A9 | Forge a handle from an identifier obtained elsewhere | 76 | **blocked** — `fileprivate` init |
+| A10 | Reconstruct a handle via `Codable` (`PersistentIdentifier` is `Codable`; the handle is deliberately not) | 82 | **blocked** — not `Decodable` |
+| A11 | Hand the store a `ModelContext` somebody else owns | 88 | **blocked** — it only takes a `ModelContainer` |
+| A12 | Subclass to override or expose internals | 92 | **blocked** — `MeetingStore` is a struct |
+| A13 | Read the container back off the store (`@ModelActor` exposes this `nonisolated`) | 97 | **blocked** — no such member |
+| A14 | Key-path route to the dispatch table (a different access mechanism from A3) | 103 | **blocked** — `private` |
+| A15 | Read `store.modelContext` by any name it might expose | 108 | **blocked** — no such member |
+| A16 | `Mirror` recursion from a live store to its context | — | **COMPILES.** Closed by construction, not by the type system: the engine is a closure capture, so the walk terminates at six function values. Proved at runtime by `MeetingStoreIsolationTests`. |
+| A17 | `unsafeBitCast` / raw-memory forgery | — | **COMPILES, and is a disclosed residual hole.** Outside **G** by definition; see FOLLOWUPS.md. |
+| A18 | `Mirror` on a `MeetingHandle` to recover its `PersistentIdentifier` | — | **COMPILES, and is a disclosed residual hole.** Recovers no authority over this store's context; asserted by a test so the disclosure cannot go stale. See FOLLOWUPS.md. |
+
+### 5. The one attack that still compiles, and what closes it: `Mirror`
+
+`Mirror(reflecting:)` walks a value's stored properties regardless of `private`, needs no
+`@testable`, and cannot be refused. If `MeetingStore` held `private let engine: ...`, then
+
+```swift
+Mirror(reflecting: store).children.first!.value          // the engine, as Any
+```
+
+hands it over — and from there `as? DefaultSerialModelExecutor` (a **public** class with a
+public `modelContext`) recovers the live context at runtime, with no compiler involvement at
+all. Access control is a compile-time construct; reflection is not.
+
+So the store holds no engine property. It holds `EngineDispatch`, a struct of six `@Sendable`
+closures, each capturing the engine. `Mirror` reports no children for a closure and there is no
+API that reads a closure's captures, so the walk terminates at six function values.
+
+Proved at runtime, not asserted: `MeetingStoreIsolationTests.swift` does a bounded
+breadth-first `Mirror` walk from a live `MeetingStore` (depth 8, 10k nodes) and fails if any
+reachable value is a `ModelContext`, a `ModelExecutor`, a `ModelActor` or a `PersistentModel` —
+once on a fresh store, and again after it has written a meeting and a segment, because
+`startMeeting` is what causes the context to register managed objects. A third test pins the
+mechanism rather than its effect: every leaf reachable from the store must be a closure, so
+reintroducing a plain stored property fails immediately and by name.
+
+### 6. Autosave is now OFF, which is what makes the durability test mean anything
+
+`MeetingPersistenceEngine.init` sets `context.autosaveEnabled = false`.
+
+The durability test added in the previous round reads as if it pins the "one explicit `save()`
+per mutation" contract. It did not. With autosave left on, SwiftData flushes pending changes on
+its own, so deleting every `try modelContext.save()` from the store would have left the test
+green: it was asserting durability the store was not responsible for.
+
+Proved by doing it. With autosave off, removing the `save()` from `appendSegment`:
+
+```
+MeetingStoreDurabilityTests.swift:118: Expectation failed: (reread.segments.count → 0) == 5
+MeetingStoreDurabilityTests.swift:123: Expectation failed: (ordered.map(\.text) → []) == (expectedTexts → ["minute 0 update", "minute 60 update", "minute 120 update", "minute 180 update", "minute 240 update"])
+** TEST FAILED **
+Failing tests:
+	MeetingStoreDurabilityTests.survivesContainerTeardown()
+```
+
+Zero of the five segments survived the teardown — which is the correct answer for a store that
+never saved them, and was NOT the answer this test gave before autosave was turned off.
+
+Restored, the suite is green again. The check now fails closed: an edit that drops an explicit
+save cannot reach `main`.
+
+Turning autosave off is also correct on its own terms. This component's contract is that each
+finalized segment is durable by the time its call returns; an autosave timer firing at moments
+nothing here chose is at best redundant and at worst hides a missing save.
+
+### 7. Test changes
+
+- `MeetingSegmentPersistenceActorTests.swift` → `MeetingStoreTests.swift`; likewise the
+  durability file. New `MeetingStoreIsolationTests.swift` (§5).
+- **All `ModelContext.model(for:)` calls removed from the test helpers**, flagged non-blocking
+  by review and worth doing: that API fatal-errors the process for an identifier the receiving
+  context has not registered, which is precisely the situation a "read it back through a
+  separate context" helper creates. Every lookup is now a `FetchDescriptor`, which is also the
+  more honest way to ask whether something reached the store.
+- The tests no longer unwrap identifiers, because they cannot: `MeetingHandle`'s payload is
+  `fileprivate`, and the test target gets no more access than production code does. Read-backs
+  fetch by content instead. `foreignHandleThrows` (was `unknownIdentifierThrows`) still passes a
+  handle from a genuinely different container, so the `registeredModel`-then-fetch lookup
+  recorded in the previous entry stays exercised against a foreign identifier.
+
+### 8. Methodology note: an attack file can defeat its own attacks
+
+Worth recording, because it nearly produced a false all-clear in this very round. All fifteen
+attacks started in one file. Two of them — A1 (the generic `modelExecutor` escape, i.e. the
+reviewer's exact attack) and A15 (`store.modelContext`) — compiled **clean**, and a careless
+reading would have reported "no error" for the single most important attack in the set.
+
+The cause was A4, `extension MeetingStore: ModelActor {}`, sitting a few lines below them. Swift
+records a retroactive conformance for the rest of the file even when the conformance itself is
+an error, so A4 handed A1 and A15 the very conformance they were probing for. A4 now lives
+alone in `MeetingStoreRetroactiveConformanceAttack.swift`, and both files say why.
+
+The general rule, now that it has cost something: **one conformance-mutating attack per file**,
+and treat "attack produced no error" as a result to be explained, never as a result to be
+reported.
+
+### Verification
+
+Local, Xcode 26.6 (17F113):
+
+- Full `xcodebuild test` (CI's exact invocation, `-destination 'platform=macOS'`, parallel):
+  green except `RouteAwareMeetingMicRecorderTests.liveRouteChangeWaitsForFirstBuffer()`, which
+  lives in `Features/Meetings/Capture/`, is untouched by this change, and is the same
+  pre-existing flake the previous round hit and re-ran clean. All 15 tests across the three
+  MeetingStore suites pass.
+- `scripts/verify-meeting-store-isolation.sh --derived-data .ci-test-build`: exit 0, transcript
+  above.
+- Autosave proof above: save removed -> red, save restored -> green.
+- `scripts/verify-package-trust.sh` unchanged and passing; no new dependency (the fail-closed
+  supply-chain guard is untouched).
+- `VoiceInk/App/VoiceInk.swift` still the only upstream file this stage edits. Zero PRs against
+  `Beingpax/VoiceInk`.

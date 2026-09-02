@@ -3,20 +3,49 @@
 Known gaps deliberately left open, with the reasoning, so they are decisions rather than
 accidents. See each entry for the evidence.
 
+## `MeetingStore`'s isolation guarantee excludes raw-memory forgery and `Mirror` on a handle
+
+Source: `VoiceInk/Features/Meetings/Models/MeetingStore.swift`. `MeetingStore` guarantees that
+no code outside that file can reach the `ModelContext` it mutates or the managed objects
+registered in it, and enforces that four ways (no `ModelActor` conformance, a file-`private`
+engine actor, a `struct` facade that cannot be made to conform retroactively, and the engine
+held only as a closure capture). The guarantee is explicitly scoped to the language's CHECKED
+features. Two things fall outside it, disclosed here rather than papered over:
+
+1. **`unsafeBitCast` and raw-memory access.** These defeat any Swift boundary; this one is no
+   exception, and no design short of process separation would change that. The closure
+   indirection does raise the cost from a one-line cast on a stored property to reconstructing
+   an undocumented closure-context layout, but that is a cost, not a defence, and is not
+   claimed as one.
+2. **`Mirror` on a `MeetingHandle`** recovers the `PersistentIdentifier` inside it, even though
+   the field is `fileprivate`. This is asserted by a test
+   (`MeetingStoreIsolationTests.handleReflectionIsADisclosedHole`) so the disclosure cannot go
+   stale. It grants no authority: a `PersistentIdentifier` is only usable with a
+   `ModelContext`, and anyone who can make one already has `fetch(FetchDescriptor<Meeting>())`
+   over the same rows. It does not reach the store's own context, so the guarantee above is
+   unaffected. The `fileprivate` exists to keep ordinary checked code away from
+   `ModelContext.model(for:)` (which fatal-errors on an unrecognised identifier rather than
+   returning nil), not to hide a secret.
+
+**Would need revisiting** if meeting data ever becomes something a hostile in-process component
+could be interested in — a plugin host, or a scripting surface. Today every caller is
+first-party code in the same binary, where the boundary's job is to make the wrong thing hard
+to write by accident, not to withstand a determined attacker who already has code execution.
+
 ## `Meeting.id` / `MeetingSegment.id` are not declared `@Attribute(.unique)`
 
 Source: `VoiceInk/Features/Meetings/Models/Meeting.swift`,
 `VoiceInk/Features/Meetings/Models/MeetingSegment.swift`. Both `id: UUID` fields are plain
 stored properties, not marked unique. This is fine today because every `id` is locally
 constructed (`UUID()` in each model's own `init`, never accepted as external input) and nothing
-currently queries by `id` for identity purposes — `MeetingSegmentPersistenceActor` looks meetings
+currently queries by `id` for identity purposes — `MeetingStore` looks meetings
 up by `PersistentIdentifier`, SwiftData's own row identity, not by this field.
 
 **Would need revisiting** if a future import or sync path (e.g. a Transcripted-compatible
 importer, or cross-device sync) ever admits externally supplied `id` values: without a
 uniqueness constraint, two rows could silently share an `id`, and any code written later that
 assumes `id` is a reliable lookup key (following the pattern `Meeting.id` is already documented
-as suited for — see `MeetingSegmentPersistenceActorDurabilityTests.swift`'s note on why
+as suited for — see `MeetingStoreDurabilityTests.swift`'s note on why
 `PersistentIdentifier` doesn't survive a container reopen but `Meeting.id` does) would need the
 constraint added first. Not fixed here: no current caller needs it, and adding `@Attribute
 (.unique)` to an already-shipped model is the kind of change worth making deliberately, with a

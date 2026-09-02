@@ -32,6 +32,11 @@ playground.xcworkspace
 .build/
 build/
 .local-build/
+# Derived-data paths used by CI's test step and by
+# scripts/verify-meeting-store-isolation.sh (which reuses the former when given
+# --derived-data, so the negative controls stay a one-file incremental compile).
+.ci-test-build/
+.negative-control-build/
 .local-dependencies/
 
 # CocoaPods

@@ -47,7 +47,7 @@ final class MeetingSegment {
 
     /// Inverse of `Meeting.segments`. Optional because SwiftData relationships must be
     /// optional/defaultable on at least one side; a segment is always constructed with a
-    /// meeting in practice (see `MeetingSegmentPersistenceActor`).
+    /// meeting in practice (see `MeetingStore`).
     var meeting: Meeting?
 
     var sourceChannel: MeetingSegmentChannel {

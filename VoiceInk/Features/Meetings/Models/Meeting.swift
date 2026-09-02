@@ -22,7 +22,7 @@ final class Meeting {
     var audioDirectoryPath: String = ""
 
     /// Wall-clock length of the meeting so far. Updated incrementally during recording (see
-    /// `MeetingSegmentPersistenceActor.updateDuration`) so a crash mid-meeting still leaves a
+    /// `MeetingStore.updateDuration`) so a crash mid-meeting still leaves a
     /// usable value, rather than only ever being computed once from `endDate - startDate`.
     var duration: TimeInterval = 0
 

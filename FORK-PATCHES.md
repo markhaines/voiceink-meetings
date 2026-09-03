@@ -2951,3 +2951,73 @@ and remains a secondary safety net, not the mechanism this round relies on.
 
 Files changed for this round: `VoiceInk/App/VoiceInk.swift`,
 `VoiceInk/App/Navigation/ContentView.swift`, `FOLLOWUPS.md`, this file.
+
+### `Makefile`: `local`'s `LOCAL_CODESIGN_IDENTITY` hook was inert -- silently ad-hoc-signed anyway
+
+Not a new upstream touchpoint (`Makefile` is already touchpoint 4, above) -- logged as its own
+entry per instruction, since the defect and the fix are unrelated to the launch-crash fix that
+touchpoint originally described.
+
+**The bug:** `make local LOCAL_CODESIGN_IDENTITY="<name>"` printed "Using stable local signing
+identity: <name>" and exited 0, but the produced app was always `Signature=adhoc,
+TeamIdentifier=not set` regardless of the identity passed. Consequence: no stable designated
+requirement across rebuilds, so macOS TCC re-prompts for Microphone and Audio Capture after
+every single rebuild.
+
+**Root cause, confirmed with `-showBuildSettings -target VoiceInk` (not scheme-wide, which
+conflates the app target with SPM package sub-targets and hid this):** `local`'s `xcodebuild`
+invocation passes `-xcconfig LocalBuild.xcconfig` alongside `CODE_SIGN_IDENTITY="$SIGNING_IDENTITY"`
+on the same command line. `LocalBuild.xcconfig` hardcoded `CODE_SIGN_IDENTITY = -` and
+`CODE_SIGN_STYLE = Manual`. Per `man xcodebuild`: "`-xcconfig filename` ... These settings will
+override all other settings, **including settings passed individually on the command line**."
+Verified empirically, not just quoted: `-showBuildSettings` with both an xcconfig-set value and
+a differing command-line value for the same key (tried with `CODE_SIGN_IDENTITY` and separately
+with `CODE_SIGN_STYLE`) always resolved to the xcconfig's value. So the Makefile's per-invocation
+`CODE_SIGN_IDENTITY` override was structurally unable to take effect while the xcconfig set the
+same key -- not a pbxproj conditional-setting precedence issue (the originally suspected
+`CODE_SIGN_IDENTITY[sdk=macosx*] = "Apple Development"` target setting was a red herring: it's
+lower priority than command-line settings and was never reached, because the xcconfig setting
+was already deciding the outcome before target-level settings were even consulted).
+
+**The fix:** removed `CODE_SIGN_IDENTITY` and `CODE_SIGN_STYLE` from `LocalBuild.xcconfig`
+entirely (fork-owned file, not upstream) with a comment explaining why, so the Makefile's
+command-line values are the only source for those two keys and can actually vary per
+invocation. `local`'s xcodebuild call now also passes `CODE_SIGN_STYLE=Manual` explicitly on
+the command line (previously implicit via the now-removed xcconfig line), so the project's
+target-level `CODE_SIGN_STYLE = Automatic` default doesn't reassert itself.
+
+**Made the failure loud (was silent before):** after the build, if an identity was requested
+(`SIGNING_IDENTITY != "-"`), the Makefile now runs `codesign -dvvv` on the built `.app`,
+extracts the `Authority=` line, and compares it to the requested identity. A mismatch (adhoc
+fallback, wrong identity, anything) prints the full `codesign -dvvv` output and exits 1 instead
+of reporting success -- the previous defect was exactly a success message masking the opposite
+outcome, so the fix cannot leave that lie in place. The two previously separate `@`-prefixed
+recipe lines (build, then copy-to-Downloads) were merged into one continuous shell block
+(`make` runs each `@` line in its own subshell with no `.ONESHELL`), because the verification
+step needs `$SIGNING_IDENTITY` from the identity-resolution logic earlier in the same recipe.
+
+**Verified end to end** (`~/code/voiceink-meetings-ui`, identity `VoiceInk Local Dev`, SHA1
+`298F4EB5050E05F0E30793B9DE68D0CF6007FEBC`, dedicated `voiceink-signing.keychain-db`):
+- `make local LOCAL_CODESIGN_IDENTITY="VoiceInk Local Dev"`: build succeeded, printed
+  "Verified: ... is signed by 'VoiceInk Local Dev' (not ad-hoc)." Both the `.app` and the
+  embedded `Contents/Frameworks/whisper.framework` show `Authority=VoiceInk Local Dev` (not
+  `Signature=adhoc`) under `codesign -dvvv`.
+- Two independent full builds (`rm -rf .local-build` between them via the target's own
+  `local:` recipe) produced a byte-identical designated requirement both times:
+  `identifier "com.hainesy.VoiceInkMeetings" and certificate leaf =
+  H"298f4eb5050e05f0e30793b9de68d0cf6007febc"` -- the property that stops TCC re-prompting
+  across rebuilds, which is the actual user-visible goal, not merely "codesign exits 0."
+- `make local LOCAL_CODESIGN_IDENTITY=` (no identity, the CI/fresh-clone path): still built and
+  copied successfully with `Signature=adhoc`, and did not run or fail the new verification
+  check (it's gated on `SIGNING_IDENTITY != "-"`) -- the ad-hoc fallback path is unchanged.
+- Installed the signed build to `~/Applications/VoiceInk Meetings.app` (`ditto` + `xattr -cr`,
+  not left in `~/Downloads` where the downloads-cruft sweep would delete it). Launched it:
+  process stayed alive 14+ seconds, zero new entries in
+  `~/Library/Logs/DiagnosticReports/VoiceInk-*.ips` (two pre-existing ones from earlier
+  unrelated testing were confirmed unchanged, not new), quit cleanly via AppleScript. The
+  `com.apple.security.cs.disable-library-validation` entitlement in
+  `VoiceInk.local.entitlements` (needed because a self-signed cert has no Team ID, so
+  `whisper.framework`'s different-Team-ID library validation would otherwise fail at launch)
+  was not touched and is still what makes this launch succeed.
+
+Files changed for this fix: `LocalBuild.xcconfig`, `Makefile`, this file.

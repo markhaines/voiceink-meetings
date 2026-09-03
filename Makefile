@@ -87,30 +87,41 @@ local: check setup
 		-derivedDataPath "$(LOCAL_DERIVED_DATA)" \
 		-xcconfig LocalBuild.xcconfig \
 		CODE_SIGN_IDENTITY="$$SIGNING_IDENTITY" \
+		CODE_SIGN_STYLE=Manual \
 		CODE_SIGNING_REQUIRED="$$SIGNING_REQUIRED" \
 		CODE_SIGNING_ALLOWED=YES \
 		DEVELOPMENT_TEAM="" \
 		CODE_SIGN_ENTITLEMENTS="$(CURDIR)/VoiceInk/VoiceInk.local.entitlements" \
 		SWIFT_ACTIVE_COMPILATION_CONDITIONS='$$(inherited) LOCAL_BUILD' \
 		$(LOCAL_XCODEBUILD_FLAGS) \
-		build
-	@APP_PATH="$(LOCAL_DERIVED_DATA)/Build/Products/Release/VoiceInk.app" && \
-	if [ -d "$$APP_PATH" ]; then \
-		echo "Copying VoiceInk.app to ~/Downloads..."; \
-		rm -rf "$$HOME/Downloads/VoiceInk.app"; \
-		ditto "$$APP_PATH" "$$HOME/Downloads/VoiceInk.app"; \
-		xattr -cr "$$HOME/Downloads/VoiceInk.app"; \
-		echo ""; \
-		echo "Build complete! App saved to: ~/Downloads/VoiceInk.app"; \
-		echo "Run with: open ~/Downloads/VoiceInk.app"; \
-		echo ""; \
-		echo "Limitations of local builds:"; \
-		echo "  - No iCloud dictionary sync"; \
-		echo "  - No automatic updates (pull new code and rebuild to update)"; \
-	else \
+		build || exit 1; \
+	APP_PATH="$(LOCAL_DERIVED_DATA)/Build/Products/Release/VoiceInk.app"; \
+	if [ ! -d "$$APP_PATH" ]; then \
 		echo "Error: Could not find built VoiceInk.app at $$APP_PATH"; \
 		exit 1; \
-	fi
+	fi; \
+	if [ "$$SIGNING_IDENTITY" != "-" ]; then \
+		ACTUAL_AUTHORITY=$$(codesign -dvvv "$$APP_PATH" 2>&1 | awk -F'=' '/^Authority=/ { print $$2; exit }'); \
+		if [ "$$ACTUAL_AUTHORITY" != "$$SIGNING_IDENTITY" ]; then \
+			echo ""; \
+			echo "ERROR: requested signing identity '$$SIGNING_IDENTITY' but the built app is actually signed by: $${ACTUAL_AUTHORITY:-<ad-hoc, no Authority>}"; \
+			echo "This is the silent ad-hoc-fallback bug -- refusing to report success. codesign -dvvv output:"; \
+			codesign -dvvv "$$APP_PATH" 2>&1 | sed 's/^/  /'; \
+			exit 1; \
+		fi; \
+		echo "Verified: $$APP_PATH is signed by '$$SIGNING_IDENTITY' (not ad-hoc)."; \
+	fi; \
+	echo "Copying VoiceInk.app to ~/Downloads..."; \
+	rm -rf "$$HOME/Downloads/VoiceInk.app"; \
+	ditto "$$APP_PATH" "$$HOME/Downloads/VoiceInk.app"; \
+	xattr -cr "$$HOME/Downloads/VoiceInk.app"; \
+	echo ""; \
+	echo "Build complete! App saved to: ~/Downloads/VoiceInk.app"; \
+	echo "Run with: open ~/Downloads/VoiceInk.app"; \
+	echo ""; \
+	echo "Limitations of local builds:"; \
+	echo "  - No iCloud dictionary sync"; \
+	echo "  - No automatic updates (pull new code and rebuild to update)"
 
 # Run application
 run:

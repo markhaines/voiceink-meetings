@@ -2586,11 +2586,12 @@ Before this branch, `Features/Meetings/Views/` was empty and nothing outside
 `Features/Meetings/` referenced `MeetingEngine`/`MeetingStore`/`MeetingMonitor` (grep-verified):
 the entire meetings subsystem built by every stage above was unreachable from the running app.
 This adds the list + detail screen and wires it into navigation. This section originally
-shipped with three upstream touchpoints; a later section on this same branch ("Launch fix"
-below) adds a fourth. **The branch total, kept accurate here rather than left to whichever
-section a reader opens first, is FOUR upstream files: `ContentView.swift`, `AppSidebar.swift`,
-`AppTheme.swift`, and `Makefile`.** `VoiceInk/VoiceInk.local.entitlements` is touched by the
-Launch fix section below too, but is fork-owned, not an upstream touchpoint (see that section).
+shipped with three upstream touchpoints; two later sections on this same branch ("Launch fix"
+and "Cross-vendor review fix round 2", both below) add a fourth and fifth. **The branch total,
+kept accurate here rather than left to whichever section a reader opens first, is FIVE upstream
+files: `ContentView.swift`, `AppSidebar.swift`, `AppTheme.swift`, `Makefile`, and
+`VoiceInk/App/VoiceInk.swift`.** `VoiceInk/VoiceInk.local.entitlements` is touched by the Launch
+fix section below too, but is fork-owned, not an upstream touchpoint (see that section).
 
 ### Upstream touchpoints for this section: THREE, not the two this branch was budgeted
 
@@ -2617,8 +2618,16 @@ Launch fix section below too, but is fork-owned, not an upstream touchpoint (see
 
 **Touchpoint 1 update (cross-vendor review fix round, B3):** `ContentView.swift` gained a
 `MeetingRecordingController` `@StateObject` and an `.environmentObject`/`.onAppear` configure
-call — see this branch's "Cross-vendor review fix round" section below for why. This is the
-same file as touchpoint 1 above, not a new one: the branch total stays at four.
+call — see this branch's "Cross-vendor review fix round" section below for why. This was the
+same file as touchpoint 1 above, not a new one, at the time: the branch total stayed at four.
+
+**Touchpoint 1 update, superseded (cross-vendor review fix round 2, B1):** the `@StateObject`/
+`.environmentObject`/configure call this note just described was REMOVED from `ContentView
+.swift` in round 2 — a second door (onboarding reset) destroyed `ContentView` the same way the
+first door destroyed `MeetingsView`, so ownership moved again, this time to `VoiceInkApp`
+itself (`VoiceInk/App/VoiceInk.swift`, the fifth touchpoint — see "Cross-vendor review fix round
+2" below). `ContentView.swift`'s only remaining involvement is receiving the controller through
+the environment like any other descendant.
 
 `VoiceInkEngine`, `RecordingState`, and `Features/Recording/Capture/Recorder.swift` are
 untouched — grep-verified after this branch's changes, not just before.
@@ -2778,9 +2787,10 @@ Files changed for this fix: `VoiceInk/VoiceInk.local.entitlements`, `Makefile`.
 ### Cross-vendor review fix round: five blocking findings (B1-B5), zero new upstream touchpoints
 
 Cross-vendor review of the launch fix above returned CHANGES-REQUIRED with five blocking
-findings. None required a new upstream file; the branch total stays at four
+findings. None required a new upstream file; the branch total stayed at four as of this round
 (`ContentView.swift`, `AppSidebar.swift`, `AppTheme.swift`, `Makefile`) — see this section's own
-`ContentView.swift` note under touchpoint 1, above.
+`ContentView.swift` note under touchpoint 1, above. **Round 2 below adds a fifth
+(`VoiceInk/App/VoiceInk.swift`); this bullet is not the final count.**
 
 - **B1 (UI overstated retention):** `MeetingsView`'s empty-state copy said Start Meeting "keeps
   a durable record" — true of metadata, false of audio and transcript. Judgement call on
@@ -2802,13 +2812,17 @@ findings. None required a new upstream file; the branch total stays at four
   drives) mid-recording, with no `engine.stop()` ever called, leaving the row stuck `.recording`
   forever with no Stop control left to press. **Fixed structurally, not defensively**: hoisted
   `MeetingRecordingController` to `ContentView` (`@StateObject`, injected via
-  `.environmentObject`), which is created once by the `WindowGroup` and outlives every
-  `detailView(for:)` switch — only the switch's *content* changes on navigation, not
-  `ContentView` itself. This makes the bad state structurally impossible rather than merely
-  unlikely: there is no code path left in which selecting another sidebar item can deallocate
-  the controller or the engine it owns, because neither is reachable from anything the switch
-  destroys. No fifth upstream touchpoint needed — `ContentView.swift` is touchpoint 1, already
-  logged above; this only extends that same file's diff.
+  `.environmentObject`), which is created once (the app declares a single `Window`, not a
+  `WindowGroup` — that "WindowGroup" wording here was wrong from when this bullet was first
+  written, corrected now) and outlives every `detailView(for:)` switch — only the switch's
+  *content* changes on navigation, not `ContentView` itself. This closed the navigation door,
+  but NOT every door: see "Cross-vendor review fix round 2" below for the onboarding-reset door
+  this same shape reopened, and where `MeetingRecordingController` actually lives now (app
+  scope, not `ContentView`). This makes the bad state structurally impossible rather than
+  merely unlikely: there is no code path left in which selecting another sidebar item can
+  deallocate the controller or the engine it owns, because neither is reachable from anything
+  the switch destroys. No fifth upstream touchpoint needed — `ContentView.swift` is touchpoint
+  1, already logged above; this only extends that same file's diff.
 - **B4 (silent persistence failures):** `MeetingRecordingController.stopMeeting()` discarded
   `engine.stop()`'s entire result (`_ = try await engine.stop()`), including
   `MeetingEngineResult.persistenceFailures` — the field an earlier review round added
@@ -2820,8 +2834,9 @@ findings. None required a new upstream file; the branch total stays at four
   then "no upstream file touched beyond the two budgeted," then "two more upstream touchpoints"
   for a launch fix that only added one (`Makefile` — `VoiceInk.local.entitlements` is fork-owned,
   not a touchpoint, per the reasoning added to that section above). Rewritten throughout so
-  every statement agrees: **four upstream touchpoints total for this branch, no more, no
-  fewer.**
+  every statement agrees: **four upstream touchpoints as of this round, no more, no fewer** (a
+  fifth, `VoiceInk/App/VoiceInk.swift`, is added by round 2 below — see that section; this
+  bullet describes what was true when round 1 shipped, not the final count).
 
 **Non-blocking, recorded rather than fixed this round:** `MeetingsView`'s `@Query` and
 `MeetingDetailView`'s segment rendering are both unbounded — see `FOLLOWUPS.md`'s entry on
@@ -2832,3 +2847,107 @@ Files changed for this round: `App/Navigation/ContentView.swift`,
 `Features/Meetings/Views/MeetingsView.swift`,
 `Features/Meetings/Views/MeetingDetailView.swift`,
 `Features/Meetings/Views/MeetingRecordingController.swift`, `FOLLOWUPS.md`, this file.
+
+### Cross-vendor review fix round 2: the onboarding-reset door (B1), and a wrong comment (B2)
+
+Round 2 review confirmed the round-1 fix (`MeetingRecordingController` hoisted to
+`ContentView`) closed the navigation door, but found a second, structurally identical door:
+`SettingsView.swift`'s "Reset Onboarding" action sets `hasCompletedOnboardingV2 = false`, and
+`VoiceInk.swift`'s `Window("VoiceInk", ...) { Group { if hasCompletedOnboardingV2 {
+ContentView()... } else { OnboardingView()... } } }` then destroys `ContentView` -- and
+everything it owned, `meetingRecordingController` included -- to show `OnboardingView`
+instead. Same shape as the round-1 defect (a conditionally-swapped view owning state that must
+outlive the swap), reached through a different conditional.
+
+**Fifth upstream touchpoint, authorized: `VoiceInk/App/VoiceInk.swift`.** Not spent defending
+`ContentView` against this one specific door (blocking or deferring the reset would leave the
+underlying shape -- state owned by a swappable view -- intact for the next door found the same
+way); the controller now lives at app scope instead, one level above every conditional that
+swaps what the `Window` scene shows. `VoiceInkApp` itself is never swapped: it is `@main`'s own
+struct, and the `App` protocol guarantees exactly one instance for the process's lifetime, its
+`@StateObject`s persisting until the process terminates -- ENFORCED by the language/framework
+contract, not a convention this codebase happens to follow. Wired the same way the file's other
+init-time-configured `@StateObject`s already are (`_engine = StateObject(wrappedValue: ...)`
+after `container` is resolved): `meetingRecordingController.configure(modelContainer:)` is
+called directly in `init()`, synchronously, since `resolvedContainer` is already in hand there
+-- no `onAppear`/environment round-trip needed the way a view requires. Injected via
+`.environmentObject` on the `Group` wrapping BOTH branches of the `if`, so `ContentView` and
+`OnboardingView` see the same object identity regardless of which is showing.
+`ContentView.swift` no longer owns or configures it at all; `MeetingsView` is unchanged (still
+`@EnvironmentObject`, now resolved from two levels up instead of one).
+
+**Enumeration of every place this app swaps its root view or rebuilds its view tree**,
+checked against this fix (`VoiceInk.swift`'s `body: some Scene`, the only place a `Scene` is
+declared in this app):
+
+1. **`hasCompletedOnboardingV2` (the `Window`'s `if`/`else`)** -- the door this round closes.
+   Now safe: neither branch owns the controller: it comes from the environment above both.
+2. **`MenuBarExtra(isInserted: $showMenuBarIcon) { MenuBarView()... }`** -- a second, entirely
+   separate `Scene`, not a swap of the `Window`'s content. `MeetingRecordingController` is not
+   injected into it and `MeetingsView`/meetings UI has no menu-bar presence to lose -- nothing
+   to check here.
+3. **One more `Scene` exists, and it needed checking, not assuming away: `WindowGroup("Debug")`**
+   (`VoiceInk.swift`, gated `#if DEBUG`). Grepping `VoiceInk.swift` for every top-level
+   `Scene`-producing call (`Window(`, `WindowGroup(`, `Settings {`, `MenuBarExtra(`) finds four,
+   not two -- an earlier draft of this enumeration said "no second `Window` or `WindowGroup`"
+   before this grep was actually re-run against the full file, which would have been exactly
+   the kind of false claim this round's B2 already flagged once. Checked, not just found: its
+   content is a single `Button("Toggle Menu Bar Only")`, nothing else -- it never constructs
+   `ContentView`, never references `meetingRecordingController`, and has no `.environmentObject`
+   applied to it, so it is not a fourth door, it is an unrelated scene. It is also `#if DEBUG`
+   only, so it does not exist at all in the Release configuration `make local`/`make release`
+   actually build -- Mark cannot reach it from any build he runs.
+4. **Scene phase changes** (`@Environment(\.scenePhase)`, background/foreground/inactive) --
+   not observed anywhere in this app (grepped: zero references to `scenePhase` in
+   `VoiceInk/`). Nothing rebuilds the view tree on a phase transition because nothing listens
+   for one.
+5. **`WindowManager.configureWindow`'s own-window-replacement branch** (`if let existingWindow
+   = ... { window.close(); ... }`, `WindowManager.swift`): this closes a *second* `NSWindow`
+   instance SwiftUI creates when something re-triggers the `Window` scene while one already
+   exists (e.g. Dock reopen), redirecting focus to the original -- it does not touch
+   `ContentView`/`OnboardingView`'s own view-tree identity or SwiftUI's state for the surviving
+   window's content. Not a third door: the survivor keeps its existing environment object
+   unchanged; the closed duplicate never had a `MeetingRecordingController` recording anything
+   in the first place.
+
+**App termination: the row IS stranded, and this is NOT fixed this round.**
+`AppDelegate.swift` (grepped in full) implements no `applicationWillTerminate` and no
+`applicationShouldTerminate(_:)` override at all -- `NSApplication`'s default is to terminate
+immediately. So on Cmd-Q, Dock "Quit", or a system logout/shutdown, while a meeting is
+recording: the process exits immediately, `engine.stop()` never runs (there is no controlled
+shutdown path calling it), and the `Meeting` row is left permanently at `.recording`, with no
+`endDate` and no final `duration` -- indistinguishable in `MeetingsView`'s
+`MeetingStateBadge`/`MeetingDetailView`'s header from a meeting still genuinely in progress,
+forever, since nothing will ever call `stop()` on that row again. A real fix needs
+`NSApplication.TerminateReply.terminateLater` (return it from
+`applicationShouldTerminate(_:)`, run `engine.stop()` in a `Task`, then call
+`sender.reply(toApplicationShouldTerminate:)`) plus wiring a reference to
+`meetingRecordingController` into `AppDelegate` (which currently only holds a weak
+`menuBarManager`, set post-init the same way this would need to be) -- real design work with
+its own tradeoffs (how long to block quit, what happens if `stop()` itself hangs), not a
+bolt-on to this round. Recorded in `FOLLOWUPS.md` with this exact consequence rather than left
+undiscussed.
+
+**B2: `WindowGroup` was factually wrong.** The app declares `Window("VoiceInk", id:
+AppWindowID.main)`, not `WindowGroup` -- corrected in this file's B3 bullet above and in
+`ContentView.swift`'s comment (rewritten this round regardless, since ownership moved away from
+`ContentView` entirely).
+
+**The actual lifetime boundary, stated precisely:** `meetingRecordingController` now lives as
+long as `VoiceInkApp`'s own `@StateObject` storage -- i.e., the process. This is ENFORCED by
+the `App` protocol (exactly one instance, `@StateObject`s persist until termination), not
+conventional. Separately, and no longer load-bearing for this controller specifically since it
+sits above the `Window` scene now: `WindowManager.configureWindow` sets `window
+.isReleasedWhenClosed = false` on the single `NSWindow` backing that scene
+(`WindowManager.swift`), which is why Cmd-W / the red button does not deallocate the window or
+its SwiftUI content -- AppKit's default is to release an `NSWindow` on close, and this flag
+opts out of that, so closing and later reopening (Dock icon / `applicationShouldHandleReopen`)
+reconnects to the same window and the same SwiftUI state rather than recreating it. This is
+CONVENTIONAL: it is how this codebase's AppKit/SwiftUI bridge happens to behave given the flag
+this file sets, not a guarantee the `Window` scene API documents -- SwiftUI does not commit to
+never tearing down a scene's content independently of its backing `NSWindow`'s lifecycle. It
+was already true before this round (nothing in round 1 or round 2 changed `WindowManager.swift`)
+and remains a secondary safety net, not the mechanism this round relies on.
+
+Files changed for this round: `VoiceInk/App/VoiceInk.swift`,
+`VoiceInk/App/Navigation/ContentView.swift`, `FOLLOWUPS.md`, this file.

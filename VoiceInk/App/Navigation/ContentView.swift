@@ -1,5 +1,4 @@
 import OSLog
-import SwiftData
 import SwiftUI
 
 enum ViewType: String, CaseIterable, Identifiable {
@@ -40,19 +39,21 @@ struct ContentView: View {
     private let logger = Logger(subsystem: "com.hainesy.voiceinkmeetings", category: "ContentView")
     private static let detailBackgroundTintOpacity = 0.50
     @EnvironmentObject private var navigation: MainWindowNavigation
-    @Environment(\.modelContext) private var modelContext
-    // Owned here, not by `MeetingsView`: `detailView(for:)` below is a `@ViewBuilder` switch
-    // over `navigation.selectedView`, so navigating away from `.meetings` destroys and
-    // recreates that case's view entirely. A `MeetingRecordingController` owned as
-    // `MeetingsView`'s own `@StateObject` would be torn down mid-recording the moment the
-    // user clicked any other sidebar item, with no `engine.stop()` ever called -- silently
-    // orphaning the capture and leaving the persisted row stuck `.recording` forever. Hoisted
-    // to `ContentView` instead, which is created once by `VoiceInk.swift`'s `WindowGroup` and
-    // outlives every `detailView(for:)` switch: only the switch's *content* changes when
-    // `selectedView` changes, not `ContentView` itself, so this survives navigating away and
-    // back. Injected via `.environmentObject` rather than passed as an init parameter because
-    // `MeetingsView` is instantiated bare (`MeetingsView()`) from inside that switch.
-    @StateObject private var meetingRecordingController = MeetingRecordingController()
+    // `MeetingRecordingController` (consumed by `MeetingsView` via `@EnvironmentObject`) is
+    // deliberately NOT owned here any more. It was originally hoisted from `MeetingsView` to
+    // this view specifically so it would outlive `detailView(for:)`'s `@ViewBuilder` switch
+    // over `navigation.selectedView` (which destroys/recreates whichever case's view is not
+    // selected) -- but `ContentView` itself turned out to be a second door to the same defect:
+    // `VoiceInk.swift`'s `Group { if hasCompletedOnboardingV2 { ContentView() } else {
+    // OnboardingView() } }` destroys `ContentView`, and everything it owns, the moment
+    // Settings resets that flag (`SettingsView.swift`'s "Reset Onboarding" action). A
+    // `@StateObject` here would have been torn down exactly like the `MeetingsView` one was.
+    // Now owned by `VoiceInkApp` itself (`VoiceInk.swift`), the one thing in this object graph
+    // that is never conditionally swapped, and injected into environment above both branches
+    // of that `if` -- so it reaches `ContentView` (and `MeetingsView` beneath it) the same way
+    // regardless of which branch is showing. See `VoiceInk.swift`'s own comment for the full
+    // reasoning and `FORK-PATCHES.md`'s "onboarding-reset" entry for the enumeration of every
+    // root-view swap this was checked against.
 
     var body: some View {
         HStack(spacing: 0) {
@@ -62,10 +63,8 @@ struct ContentView: View {
         }
         .frame(width: AppWindowLayout.width)
         .frame(minHeight: AppWindowLayout.minimumHeight)
-        .environmentObject(meetingRecordingController)
         .onAppear {
             logger.notice("ContentView appeared")
-            meetingRecordingController.configure(modelContainer: modelContext.container)
         }
         .onDisappear {
             logger.notice("ContentView disappeared")

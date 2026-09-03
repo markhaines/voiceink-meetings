@@ -22,6 +22,19 @@ struct VoiceInkApp: App {
     @StateObject private var aiService = AIService()
     @StateObject private var enhancementService: AIEnhancementService
     @StateObject private var activeWindowService = ActiveWindowService.shared
+    // Owned at app scope, not by `ContentView` (where it lived before this comment was
+    // written) and not by `MeetingsView` (where it lived before that): both are child views
+    // this `body` conditionally destroys and recreates -- `MeetingsView` by
+    // `ContentView.detailView(for:)`'s sidebar switch, `ContentView` itself by the
+    // `hasCompletedOnboardingV2` branch below swapping it for `OnboardingView` (Settings'
+    // "Reset Onboarding" flips that flag at runtime). `VoiceInkApp` is the one thing in this
+    // graph that is never conditionally swapped -- it is the `@main` entry point's own struct,
+    // re-evaluated but never replaced -- so this is the actual lifetime boundary a live
+    // recording needs. Injected into environment above BOTH branches of that `if`, not just
+    // the `ContentView` one, so the object identity is the same regardless of which is
+    // showing (see `body`, below). See `FORK-PATCHES.md`'s "onboarding-reset" entry for the
+    // enumeration of every place this app swaps its root view, checked against this fix.
+    @StateObject private var meetingRecordingController: MeetingRecordingController
     @AppStorage("hasCompletedOnboardingV2") private var hasCompletedOnboardingV2 = false
     @State private var showMenuBarIcon = true
     @State private var didShowLaunchReminders = false
@@ -90,6 +103,14 @@ struct VoiceInkApp: App {
 
         container = resolvedContainer
         DictionaryService.removeExactDuplicateContent(context: resolvedContainer.mainContext, source: "launch")
+
+        // `MeetingRecordingController.configure(modelContainer:)` can be called directly here,
+        // synchronously, rather than deferred to a view's `onAppear` -- `resolvedContainer` is
+        // already resolved above, unlike in a view (where the `\.modelContext` environment key
+        // it originally read isn't available until a view's own lifecycle callbacks run).
+        let meetingRecordingController = MeetingRecordingController()
+        meetingRecordingController.configure(modelContainer: resolvedContainer)
+        _meetingRecordingController = StateObject(wrappedValue: meetingRecordingController)
 
         // Initialize services with proper sharing of instances
         let aiService = AIService()
@@ -361,6 +382,10 @@ struct VoiceInkApp: App {
                             })
                 }
             }
+            // Injected above BOTH branches of the `if`, not only the `ContentView` one, so
+            // `meetingRecordingController`'s identity is the same object whichever branch is
+            // showing -- see that property's own declaration comment above.
+            .environmentObject(meetingRecordingController)
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: AppWindowLayout.width, height: AppWindowLayout.minimumHeight)

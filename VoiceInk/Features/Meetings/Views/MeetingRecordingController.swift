@@ -23,11 +23,15 @@
 // rotation, but an empty transcript — see `MeetingsView.recordingDisclosureText`, which states
 // this plainly rather than pretending nothing was recorded.
 //
-// Owned by `ContentView` (`@StateObject`), not by `MeetingsView` -- see that file's
-// `meetingRecordingController` comment for why: `MeetingsView` is destroyed and recreated by
-// `ContentView`'s navigation switch every time the sidebar selection leaves and returns to
-// `.meetings`, and this controller (and the `MeetingEngine` it drives) must outlive that so a
-// recording in progress survives the user clicking around the sidebar.
+// Owned by `VoiceInkApp` itself (`VoiceInk.swift`, `@StateObject`), not by any view. It was
+// owned by `MeetingsView`, then by `ContentView`, in earlier rounds of this same fix -- both
+// were wrong for the same reason: each is a child view something above it conditionally
+// destroys and recreates (`MeetingsView` by `ContentView.detailView(for:)`'s sidebar switch;
+// `ContentView` by `VoiceInk.swift`'s `hasCompletedOnboardingV2` branch, flipped by Settings'
+// "Reset Onboarding" action). `VoiceInkApp` is the one thing in the object graph that is never
+// conditionally swapped, so this is the actual lifetime boundary a live recording needs -- see
+// that file's own comment on this property and `FORK-PATCHES.md`'s "onboarding-reset" entry for
+// the full reasoning and the enumeration of every root-view swap this was checked against.
 
 import Combine
 import Foundation
@@ -45,11 +49,11 @@ final class MeetingRecordingController: ObservableObject {
     @Published private(set) var phase: Phase = .idle
     @Published var lastErrorMessage: String?
 
-    // `ModelContainer` is not available at `init` time from a SwiftUI view's `@StateObject`
-    // (the environment that carries it, `\.modelContext`, is only readable from a view's body/
-    // lifecycle callbacks, not its init) — so this is configured once, right after creation,
-    // via `configure(modelContainer:)` rather than taken as an init parameter. See
-    // `ContentView.onAppear`.
+    // Configured once, right after creation, via `configure(modelContainer:)` rather than
+    // taken as an init parameter -- kept that way even now that the call site is
+    // `VoiceInkApp.init()` (which resolves its `ModelContainer` synchronously and could pass it
+    // straight to a real init parameter) so this type's own public surface doesn't change
+    // depending on which caller currently owns it. See `VoiceInk.swift`'s `init()`.
     private var modelContainer: ModelContainer?
     private var engine: MeetingEngine?
 

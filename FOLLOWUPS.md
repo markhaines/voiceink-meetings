@@ -556,3 +556,33 @@ the fix is the same admission-control shape B4.2 already establishes, applied to
 `TranscribeCppMeetingSegmentTranscriber`. If they are fine, transcribe.cpp is simply the better
 sharing model of the two and no change is needed.
 
+## `StreamingVadControllerTests.serializesChunkProcessing` flaked once on CI (2026-09-05) — FIXED
+
+`Tests/VoiceInkTests/Features/Meetings/Transcription/StreamingVadControllerTests.swift`. Failed on
+CI run **33965544410** (attempt 1) during PR #16 round 8, in a change that touched only comments,
+two test files, a negative control, the verifier script and this file. Evidence it was a flake and
+not a regression:
+
+- **The same commit (`01e85ce7`) passed on attempt 2**, with no code change between attempts.
+- The change in flight touches nothing this test exercises: `StreamingVadController` and its tests
+  were not modified, and the round-8 diff under `VoiceInk/` is comment-only.
+- It passed locally in the same round at **0.568s**.
+- The CI failure took **2.324s** against a **2-second** deadline, i.e. it exhausted the wait and
+  then failed the count assertion. That is the signature of the deadline expiring, not of a
+  behavioural fault.
+
+**Root cause.** The test enqueues 10 chunks processed serially at 25ms each (~250ms of work) and
+polls for completion under a 2s ceiling. The ceiling is a hang guard, not a latency assertion, but
+it was only ~8x the expected work, and a loaded GitHub runner stretched the real duration past it.
+
+**Fix.** Raised that ceiling and its sibling in `buffersChunksBeforeStateReady` to 10s, with the
+reasoning recorded at both sites. This cannot mask a real defect: the assertions
+(`processedCount == 10`, `maxConcurrentCount == 1`) are unchanged, a genuine serialization
+regression still fails on `maxConcurrentCount` immediately, and a genuine hang still fails after
+10s. It is the same idiom this file already prescribes in the `RouteAwareMeetingMicRecorderTests`
+audit above: extend the wait to cover the state actually being asserted, never a fixed sleep.
+
+**Not fixed here:** the remaining 1s/2s deadlines in that file (lines ~211-258) gate on a single
+in-flight operation rather than N serialized ones, so their margins are far wider. If either ever
+flakes, apply the same reasoning rather than assuming a behavioural cause.
+

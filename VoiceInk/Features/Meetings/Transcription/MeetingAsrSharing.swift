@@ -20,9 +20,13 @@
 // `@testable` -- was aimed at RECOVERING THE SERVICE. All of them correctly failed. Not one
 // followed the capability's own RETURN VALUE. The suite tested the routes its author imagined,
 // and the object being protected was being handed out the front door the whole time.
-// `scripts/negative-controls/MeetingCapabilityReturnValue*.swift` exist so that class of miss
-// cannot recur silently: they follow what the capability returns and try to reach mutating API
-// on it.
+// Three negative controls exist so that class of miss cannot recur silently, and they are named
+// individually rather than behind a glob because the glob this comment used to cite
+// (`MeetingCapabilityReturnValue*.swift`) matched only the first of them:
+// `MeetingCapabilityReturnValueEvictionAttack.swift` (the exact round-5 defeat),
+// `MeetingReceiptMutatingApiAttack.swift` (reaching mutating API transitively through the
+// receipt), and `MeetingSeamCannotNameAsrManagerAttack.swift` (can any returned value BE or
+// CONTAIN a manager, down to the leaf fields).
 //
 // THE FIX -- inversion, not defence. The meeting side no longer receives an `AsrManager`,
 // because there is no longer any way to ask for one. It receives a closure that PERFORMS one
@@ -38,14 +42,20 @@
 // distinguish compile errors from warnings from runtime properties from convention, and never
 // write the guarantee wider than the code.
 //
-//   * ENFORCED, by the type system, and checked on every CI run: nothing the meeting seam can
-//     name has an eviction-capable or state-mutating member. The capability's ONLY member is
-//     `transcribeChunk`, a closure (which has no members of its own); its return type is
+//   * TODAY'S DECLARED SURFACE, which is an observation about the source and NOT a guarantee the
+//     compiler maintains: the capability's only member is `transcribeChunk`, a closure (which has
+//     no members of its own). A COMPUTED member could be added in an extension and nothing here
+//     would fire -- see the FAILS OPEN list below, which this bullet used to contradict by
+//     calling itself "enforced ... on every CI run".
+//
+//     What IS enforced, by nominal typing, is what any member can hand back: the return type is
 //     `MeetingChunkTranscriptionOutcome`, an enum whose one payload is
 //     `MeetingChunkTranscription`, whose entire transitive surface is exactly `String`,
 //     `TimeInterval`, and `[MeetingTokenSpan]?` -- and `MeetingTokenSpan` is one `String` and two
 //     `TimeInterval`s. That is the complete enumeration, not a sample of it, which is what lets
-//     the return-value controls be exhaustive rather than a list of imagined routes.
+//     the return-value controls be exhaustive rather than a list of imagined routes. It is also
+//     why the return-type boundary is the load-bearing claim in this file: it holds however many
+//     members exist, because every member would still have to return one of those types.
 //   * ENFORCED, stated exactly, because round 6 stated it too broadly: **safe Swift cannot
 //     recover the LIVE SHARED `AsrManager` -- the one dictation is using -- through this
 //     capability's declared return types.** The mechanism is nominal typing of the stored
@@ -70,20 +80,21 @@
 //     which of those routes a guard would actually catch. "A new member fails closed" was FALSE:
 //     it is true of STORED properties and of nothing else.
 //
-//       FAILS CLOSED (a guard stops compiling, so the change cannot land unnoticed):
-//         - a new STORED property on `MeetingAsrRuntimeAccess`, including one holding or vending
-//           a manager: the synthesised memberwise initializer gains a required parameter and
-//           `MeetingCapabilitySurfaceGuardTests` stops compiling, and a stored-property count
-//           assertion in the same file fails independently if the property is defaulted.
-//         - a new case on `MeetingChunkTranscriptionOutcome`, including one carrying a manager.
-//           The default-free exhaustive switches in that test file and in
+//       FAILS CLOSED (the build or the test run fails, so the change cannot land unnoticed).
+//       WHICH of the two matters, because they fail at different times and one of them is
+//       skippable: a COMPILE-TIME guard breaks the build itself, whereas a RUNTIME guard is an
+//       assertion that only fires when the test suite is actually executed.
+//         - COMPILE-TIME. A new STORED property on `MeetingAsrRuntimeAccess` that is NOT
+//           defaulted: the synthesised memberwise initializer gains a required parameter and
+//           `MeetingCapabilitySurfaceGuardTests` stops compiling.
+//         - COMPILE-TIME. A new case on `MeetingChunkTranscriptionOutcome`, including one
+//           carrying a manager: the default-free exhaustive switches in that test file and in
 //           `MeetingSeamCannotNameAsrManagerAttack.swift` stop compiling.
-//         - a new STORED property on `MeetingChunkTranscription` or `MeetingTokenSpan`, caught
-//           by a stored-property COUNT assertion over `Mirror`, one per type. The count is what
-//           does the work here, not the memberwise initializer: a property declared with an
-//           initial value (`let leak: LeakBox? = nil`) is not a required initializer parameter,
-//           so the initializer mechanism alone would miss it. Verified in round 8 by planting
-//           exactly that shape.
+//         - RUNTIME ONLY. A new stored property that IS defaulted, on any of the three types
+//           (`let leak: LeakBox? = nil`). It is not a required initializer parameter, so nothing
+//           stops compiling; it is caught by the stored-property COUNT assertions over `Mirror`,
+//           one per type, when the tests RUN. Verified in round 8 by planting exactly that shape:
+//           the negative control passed and only the count assertion failed.
 //
 //       FAILS OPEN (compiles, and NO guard here catches it):
 //         - a new COMPUTED member or method, added to any of these types in an extension:

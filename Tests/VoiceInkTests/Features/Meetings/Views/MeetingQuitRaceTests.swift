@@ -150,23 +150,33 @@ struct RaceOrderingTests {
         #expect(recorded.first?.workFinished == false)
     }
 
+    // PR #15 review round 5, B1: this test previously parked BOTH `work` and the injected
+    // `sleep` on the SAME `ReleaseGate` and released it once, leaving which continuation
+    // actually resumed first to unspecified actor scheduling -- so the "work wins,
+    // deterministically" claim was false: the test could pass or fail with no production
+    // change at all, which is exactly the class of flaky test this file exists to replace.
+    // Fixed with SEPARATE gates: only `workGate` is released, so `work` can win by
+    // construction -- `sleepGate` is never touched until the second half below, so there is
+    // nothing left for scheduling order to decide. Verified genuinely deterministic by running
+    // this test 20 times in a row locally: 20/20 passed (see this round's report).
     @Test("work completing before the injected sleep ever resolves makes work win, deterministically")
     func workWinsWhenReleasedBeforeSleepResolves() async throws {
-        let gate = ReleaseGate()
+        let workGate = ReleaseGate()
+        let sleepGate = ReleaseGate()
         let recorder = RaceCompletionRecorder()
 
         raceAgainstCeiling(
             ceilingNanoseconds: 0,
-            work: { await gate.waitForRelease() },
+            work: { await workGate.waitForRelease() },
             onComplete: { workFinished in
                 Task { await recorder.record(workFinished: workFinished, elapsed: 0) }
             },
-            // Never resolves during this test -- simulates a ceiling that would fire, but not
-            // before `work` is released below.
-            sleep: { _ in await gate.waitForRelease() }
+            // Held on its OWN gate, untouched below until the second half of this test --
+            // nothing here can make it resolve before `workGate` does.
+            sleep: { _ in await sleepGate.waitForRelease() }
         )
 
-        await gate.release()
+        await workGate.release()
 
         let deadline = Date().addingTimeInterval(5)
         while await recorder.count == 0 && Date() < deadline {
@@ -176,6 +186,13 @@ struct RaceOrderingTests {
         let recorded = await recorder.all
         #expect(recorded.count == 1)
         #expect(recorded.first?.workFinished == true)
+
+        // The loser arriving late must not produce a second `onComplete` -- releasing the
+        // sleep gate now, after work has already won, must be a no-op.
+        await sleepGate.release()
+        try await Task.sleep(nanoseconds: 50_000_000)
+        let recordedAfterLoserArrives = await recorder.all
+        #expect(recordedAfterLoserArrives.count == 1, "the loser's late arrival must not produce a second onComplete")
     }
 }
 
@@ -278,10 +295,13 @@ struct SingleFlightTaskTests {
 /// any real CoreAudio/`MeetingEngine` involved.
 private actor ReleaseGate {
     private(set) var startedCount = 0
-    // A single stored continuation would drop a second SIMULTANEOUS waiter (its continuation
-    // would overwrite the first's, which would then never resume) -- `RaceOrderingTests
-    // .workWinsWhenReleasedBeforeSleepResolves()` parks both `work` and the fake `sleep` on
-    // the same gate at once, so this holds every waiter, not just the most recent.
+    // A single stored continuation would drop a second SIMULTANEOUS waiter on the same gate
+    // instance (its continuation would overwrite the first's, which would then never resume).
+    // No current test relies on two waiters sharing one gate at once -- `RaceOrderingTests
+    // .workWinsWhenReleasedBeforeSleepResolves()` was rewritten to use SEPARATE gates for
+    // `work` and `sleep` specifically to avoid that ambiguity (see that test's own comment,
+    // PR #15 review round 5, B1) -- but holding every waiter, not just the most recent, is
+    // cheap and correct regardless of how a future test uses this type.
     private var continuations: [CheckedContinuation<Void, Never>] = []
     private var released = false
 

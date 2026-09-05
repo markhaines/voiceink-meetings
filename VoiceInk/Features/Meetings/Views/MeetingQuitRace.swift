@@ -131,11 +131,18 @@ func raceAgainstCeiling(
 /// meeting finalize, given the recording controller's current phase. Extracted into its own
 /// pure, directly-testable function specifically because the PREVIOUS shape of this decision
 /// (`controller.phase == .recording`, inlined in `AppDelegate.swift`) silently missed the
-/// natural "press Stop, then quit" sequence: by the time a user does that,
-/// `MeetingRecordingController.stopMeeting()` has already flipped `phase` to `.stopping`
-/// synchronously, so the old `== .recording` check failed, `applicationShouldTerminate`
-/// returned `.terminateNow`, and AppKit killed the IN-FLIGHT finalize -- losing the final chunk
-/// transcription and the terminal `persistence.finish` write. See `MeetingQuitRaceTests
+/// natural "press Stop, then quit" sequence: `MeetingRecordingController.stopMeeting()` starts
+/// a `Task` (via `stopTask()`) that flips `phase` to `.stopping` once it runs -- not
+/// synchronously within `stopMeeting()`'s own call, but on the main actor, very soon after, and
+/// before `stopMeeting()`'s caller (a UI button) can do anything else. A quit that arrives
+/// after that task has run finds `phase == .stopping`, not `.recording`; the old `== .recording`
+/// check failed for exactly that case, so `applicationShouldTerminate` returned
+/// `.terminateNow`, and AppKit killed the IN-FLIGHT finalize -- losing the final chunk
+/// transcription and the terminal `persistence.finish` write. (A quit that instead arrives
+/// BEFORE that task has run still finds `phase == .recording`, enters the race on that branch,
+/// and via `stopTask()`'s single-flight guard ends up awaiting the very same task the Stop
+/// button already started -- so the fix does not depend on exactly when the flip happens,
+/// only on covering both phases it could be observed in.) See `MeetingQuitRaceTests
 /// .shouldRaceMeetingFinalizeTests` for a test that reproduces exactly that regression against
 /// the pre-fix single-case shape and confirms the current one covers it.
 ///
@@ -145,12 +152,22 @@ func raceAgainstCeiling(
 /// - `.starting`: `MeetingEngine.start()` is in flight, and it calls `persistence
 ///   .startMeeting(...)` near the top of its own body -- before the audio pipeline is even set
 ///   up -- so a `Meeting` row may already exist as `.recording` by the time this phase is
-///   externally visible. Quitting here CAN strand a row, the same shape as `.recording`. But
-///   nothing valuable has been captured yet to lose: transcription is stubbed regardless
-///   (`NullMeetingTranscriptionCoordinator`) and no segments exist yet, so `MeetingStore
-///   .reconcileInterruptedRecordings(in:)` on the NEXT launch recovers exactly the same end
-///   state (`.failed`, zero segments) that racing this phase would produce. Blocking
-///   termination here would only delay quitting for zero additional data preserved.
+///   externally visible. Quitting here CAN strand a row, the same shape as `.recording`, AND
+///   mic/system capture may already be underway by then too -- `start()`'s own sequencing is
+///   not being claimed as "nothing has happened yet." What the conclusion actually rests on,
+///   narrowly: no TRANSCRIPT segments can exist to lose regardless of how much audio has been
+///   captured, because transcription is stubbed (`NullMeetingTranscriptionCoordinator` produces
+///   none no matter what); no audio recording is being kept either way (`retainRecording:
+///   false`, set at the one production call site -- `MeetingRecordingController
+///   .startMeeting(title:)`); and any `Meeting` row/duration that WAS persisted survives
+///   untouched and is reconciled to `.failed` on the NEXT launch
+///   (`MeetingStore.reconcileInterruptedRecordings(in:)`) -- the same end state racing this
+///   phase would produce. Blocking termination here would only delay quitting, for zero
+///   additional data preserved under TODAY's null coordinator. **This reasoning is scoped to
+///   that coordinator and must be revisited once a real one is wired**: a real coordinator
+///   could plausibly produce segments from audio captured during `.starting`, at which point
+///   "no segments can exist" stops being true and this phase's answer needs re-deriving from
+///   scratch, not assumed to still be `false`.
 ///   Deliberately `false`, not raced.
 /// - `.recording`: a live recording with segments/duration that a graceful `stop()` can still
 ///   flush. `true` -- covered since round 3.

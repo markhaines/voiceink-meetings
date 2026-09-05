@@ -42,19 +42,31 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // replacement for it.
     static let meetingFinalizeTimeoutSeconds: UInt64 = 5
 
+    // PR #15 review round 4, B1: the round-3 version only engaged while `phase == .recording`
+    // and silently missed the natural "press Stop, then quit" sequence -- by then `phase` is
+    // already `.stopping`, so it fell through to `.terminateNow` and killed the IN-FLIGHT
+    // finalize (the final chunk transcription and the terminal `persistence.finish` write).
+    // The decision of which phases to race, and the full per-phase reasoning (including why
+    // `.starting` is deliberately NOT raced and why there is no `.paused` case to cover), now
+    // lives in `shouldRaceMeetingFinalize(forPhase:)` (`MeetingQuitRace.swift`) -- extracted so
+    // it is directly unit-testable without a real `NSApplication` termination cycle. `stopTask()`
+    // (not `stopMeetingAndWait()` directly) is what lets both `.recording` and `.stopping` share
+    // this one call: from `.recording` it starts the stop, from `.stopping` it finds the SAME
+    // task already running (from the Stop button) and awaits that one -- never a second call
+    // into `engine.stop()`. See that method's own doc comment.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard !isTerminatingForMeetingFinalize else { return .terminateLater }
-        guard let controller = meetingRecordingController, controller.phase == .recording else {
+        guard let controller = meetingRecordingController,
+              shouldRaceMeetingFinalize(forPhase: controller.phase) else {
             return .terminateNow
         }
-        isTerminatingForMeetingFinalize = true
 
+        isTerminatingForMeetingFinalize = true
         raceAgainstCeiling(
             ceilingNanoseconds: Self.meetingFinalizeTimeoutSeconds * 1_000_000_000,
-            work: { _ = await controller.stopMeetingAndWait() },
+            work: { _ = await controller.stopTask().value },
             onComplete: { _ in NSApp.reply(toApplicationShouldTerminate: true) }
         )
-
         return .terminateLater
     }
 

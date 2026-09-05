@@ -91,11 +91,22 @@ import Foundation
 /// `async`/non-blocking by design: the caller (`AppDelegate.applicationShouldTerminate(_:)`)
 /// must return `.terminateLater` to AppKit synchronously, before either race participant has
 /// necessarily run at all.
+/// `sleep`, PR #15 review round 4 (non-blocking suggestion, accepted): defaults to real
+/// `Task.sleep`, but is injectable so a test can prove the WINNER-SELECTION LOGIC (whichever
+/// side calls `complete` first) deterministically -- ordering, not wall-clock timing -- immune
+/// to CI-runner scheduling jitter. `MeetingQuitRaceTests.RaceOrderingTests` uses this to make
+/// the ceiling "fire" essentially instantly while `work` is held open on a manually-controlled
+/// gate, with no real-time assertion anywhere in that test. The existing wall-clock test
+/// (`ceilingWinsOverNonCancellableWork`, using the real default `sleep` and a real
+/// `DispatchSemaphore`-blocked thread) stays alongside it as a smoke test of the actual
+/// production code path end to end -- the deterministic test proves the LOGIC is right; the
+/// wall-clock one proves the REAL default wiring still behaves the same way.
 @MainActor
 func raceAgainstCeiling(
     ceilingNanoseconds: UInt64,
     work: @escaping () async -> Void,
-    onComplete: @escaping @MainActor (_ workFinished: Bool) -> Void
+    onComplete: @escaping @MainActor (_ workFinished: Bool) -> Void,
+    sleep: @escaping (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) }
 ) {
     var didComplete = false
     func complete(_ workFinished: Bool) {
@@ -109,7 +120,92 @@ func raceAgainstCeiling(
         complete(true)
     }
     Task { @MainActor in
-        try? await Task.sleep(nanoseconds: ceilingNanoseconds)
+        try? await sleep(ceilingNanoseconds)
         complete(false)
+    }
+}
+
+// MARK: - Phase coverage (PR #15 review round 4, B1)
+
+/// Whether `AppDelegate.applicationShouldTerminate(_:)` should hold termination to let a
+/// meeting finalize, given the recording controller's current phase. Extracted into its own
+/// pure, directly-testable function specifically because the PREVIOUS shape of this decision
+/// (`controller.phase == .recording`, inlined in `AppDelegate.swift`) silently missed the
+/// natural "press Stop, then quit" sequence: by the time a user does that,
+/// `MeetingRecordingController.stopMeeting()` has already flipped `phase` to `.stopping`
+/// synchronously, so the old `== .recording` check failed, `applicationShouldTerminate`
+/// returned `.terminateNow`, and AppKit killed the IN-FLIGHT finalize -- losing the final chunk
+/// transcription and the terminal `persistence.finish` write. See `MeetingQuitRaceTests
+/// .shouldRaceMeetingFinalizeTests` for a test that reproduces exactly that regression against
+/// the pre-fix single-case shape and confirms the current one covers it.
+///
+/// Every value `MeetingRecordingController.Phase` can take, and why each answer is what it is:
+///
+/// - `.idle`: no meeting is open. Nothing to strand or lose. `false`.
+/// - `.starting`: `MeetingEngine.start()` is in flight, and it calls `persistence
+///   .startMeeting(...)` near the top of its own body -- before the audio pipeline is even set
+///   up -- so a `Meeting` row may already exist as `.recording` by the time this phase is
+///   externally visible. Quitting here CAN strand a row, the same shape as `.recording`. But
+///   nothing valuable has been captured yet to lose: transcription is stubbed regardless
+///   (`NullMeetingTranscriptionCoordinator`) and no segments exist yet, so `MeetingStore
+///   .reconcileInterruptedRecordings(in:)` on the NEXT launch recovers exactly the same end
+///   state (`.failed`, zero segments) that racing this phase would produce. Blocking
+///   termination here would only delay quitting for zero additional data preserved.
+///   Deliberately `false`, not raced.
+/// - `.recording`: a live recording with segments/duration that a graceful `stop()` can still
+///   flush. `true` -- covered since round 3.
+/// - `.stopping`: THIS round's fix. A `stop()` is already in flight, whose final chunk
+///   transcription and terminal `persistence.finish` write would otherwise be killed mid-flight
+///   by an unguarded `.terminateNow`. `true` -- raced against the SAME task already running,
+///   via `MeetingRecordingController.stopTask()`, never a second call into `engine.stop()`.
+///
+/// There is no `.paused` case of `Phase` to cover: `MeetingRecordingController` never calls
+/// `MeetingEngine.pause()`/`resume()` at all -- `MeetingsView` exposes only Start/Stop, no
+/// Pause control (grep-verified: no `pause`/`resume` call anywhere under `Features/Meetings/
+/// Views/`). The `.paused` case a reviewer might expect belongs to the separate, PERSISTED
+/// `MeetingState` enum (rendered by `MeetingStateBadge` for rows in the list) -- reachable in
+/// principle if some other caller ever drove the engine's pause/resume, but no caller in this
+/// codebase does, so it cannot occur through this controller today.
+func shouldRaceMeetingFinalize(forPhase phase: MeetingRecordingController.Phase) -> Bool {
+    switch phase {
+    case .idle, .starting:
+        return false
+    case .recording, .stopping:
+        return true
+    }
+}
+
+// MARK: - Single-flight stop task (PR #15 review round 4, B1)
+
+/// A single-flight cache for one in-progress `Task`: `run(_:)` returns the currently running
+/// task if one exists, or starts a new one via `operation` if not, and clears itself once that
+/// task completes (success, failure, or early return -- the `defer` covers every exit path).
+///
+/// Extracted as its own small, generic, directly-testable type (rather than the bespoke
+/// `activeStopTask` bookkeeping this replaced) for the same reason `raceAgainstCeiling` above
+/// was extracted in round 3: the property it guarantees --- `operation` is never invoked a
+/// second time while a first call is still running --- needs to be provably true independent
+/// of `MeetingEngine`/CoreAudio, which a `MeetingRecordingController`-level test cannot reach
+/// without real audio hardware and TCC consent this CI runner does not have. See
+/// `MeetingRecordingController.stopTask()` for the real call site, and
+/// `MeetingQuitRaceTests.SingleFlightTaskTests` for the proof.
+@MainActor
+final class SingleFlightTask<Success: Sendable> {
+    private var active: Task<Success, Never>?
+
+    /// Returns the in-flight task if one exists; otherwise starts `operation` on a new task and
+    /// returns that. `operation` itself is never invoked while a previous call's task is still
+    /// running -- a caller that arrives in between gets the SAME task back, so awaiting its
+    /// `.value` waits for the REAL, already-in-progress work, not a second, independent one.
+    func run(_ operation: @escaping () async -> Success) -> Task<Success, Never> {
+        if let active {
+            return active
+        }
+        let task = Task { [weak self] () -> Success in
+            defer { self?.active = nil }
+            return await operation()
+        }
+        active = task
+        return task
     }
 }

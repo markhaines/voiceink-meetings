@@ -57,6 +57,13 @@ final class MeetingRecordingController: ObservableObject {
     private var modelContainer: ModelContainer?
     private var engine: MeetingEngine?
 
+    /// Single-flight guard (`MeetingQuitRace.swift`, PR #15 review round 4, B1) so a SECOND
+    /// caller that wants a meeting stopped (`AppDelegate.applicationShouldTerminate(_:)`
+    /// finding `phase == .stopping`) gets the SAME task back via `stopTask()`, rather than
+    /// starting a second one. Two concurrent calls into `engine.stop()` for one meeting would
+    /// be a worse bug than the one this fixes -- see `stopTask()`'s own doc comment.
+    private let stopSingleFlight = SingleFlightTask<Bool>()
+
     var isBusy: Bool {
         phase == .starting || phase == .stopping
     }
@@ -93,16 +100,32 @@ final class MeetingRecordingController: ObservableObject {
     }
 
     func stopMeeting() {
-        Task { await stopMeetingAndWait() }
+        _ = stopTask()
     }
 
-    /// The actual stop logic, `await`-able to completion -- unlike `stopMeeting()` above, whose
-    /// `Task { ... }` is fire-and-forget for a UI button and gives a caller no way to learn when
-    /// the work inside finishes. Added for PR #15 review round 3 (B1-i):
-    /// `AppDelegate.applicationShouldTerminate(_:)` needs exactly that, to bound how long it
-    /// waits for a live recording to finalize before letting the app quit. `stopMeeting()` now
-    /// just launches this on a `Task` and returns immediately, so the two call sites share one
-    /// implementation instead of the termination path duplicating this method's body.
+    /// Returns the currently in-flight stop `Task`, starting one only if none is already
+    /// running (`stopSingleFlight`, above). Every caller that wants a meeting stopped -- the
+    /// UI's Stop button (`stopMeeting()`, above) and `AppDelegate.applicationShouldTerminate(_:)`
+    /// (which must cover BOTH `phase == .recording`, where nothing has started stopping yet,
+    /// and `phase == .stopping`, where the user already pressed Stop and quit before it
+    /// finished -- PR #15 review round 4, B1) -- goes through this single entry point. A
+    /// caller that arrives after `phase` is already `.stopping` gets the SAME task back instead
+    /// of creating a new one, so awaiting its `.value` waits for the REAL, already-in-progress
+    /// finalize rather than a second, independent call into `engine.stop()` -- which would
+    /// itself be a data race on `MeetingEngine`'s internal teardown state, a worse bug than the
+    /// stranded row or lost finalize this whole fix exists to prevent.
+    @discardableResult
+    func stopTask() -> Task<Bool, Never> {
+        stopSingleFlight.run { [weak self] in
+            await self?.stopMeetingAndWait() ?? false
+        }
+    }
+
+    /// The actual stop logic. Not called directly by any external caller any more (PR #15
+    /// review round 4) -- `stopTask()` above is the shared entry point; this stays `internal`
+    /// (not `private`) only because `MeetingQuitRaceTests`-style unit tests exercise it
+    /// directly for its own guard behavior, matching this file's existing test-visibility
+    /// convention.
     @discardableResult
     func stopMeetingAndWait() async -> Bool {
         guard let engine, phase == .recording else { return false }

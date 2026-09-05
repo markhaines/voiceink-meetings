@@ -204,7 +204,7 @@ struct MeetingStoreTests {
 
         try context.save()
 
-        let changed = MeetingStore.reconcileInterruptedRecordings(in: container)
+        let changed = try MeetingStore.reconcileInterruptedRecordings(in: container)
         #expect(changed == 2)
 
         let reread = try context.fetch(FetchDescriptor<Meeting>())
@@ -231,7 +231,7 @@ struct MeetingStoreTests {
 
         try context.save()
 
-        let changed = MeetingStore.reconcileInterruptedRecordings(in: container)
+        let changed = try MeetingStore.reconcileInterruptedRecordings(in: container)
         #expect(changed == 0)
 
         let reread = try context.fetch(FetchDescriptor<Meeting>())
@@ -243,7 +243,7 @@ struct MeetingStoreTests {
     func reconcileOnEmptyStoreIsANoOp() throws {
         let container = try makeContainer()
 
-        let changed = MeetingStore.reconcileInterruptedRecordings(in: container)
+        let changed = try MeetingStore.reconcileInterruptedRecordings(in: container)
 
         #expect(changed == 0)
     }

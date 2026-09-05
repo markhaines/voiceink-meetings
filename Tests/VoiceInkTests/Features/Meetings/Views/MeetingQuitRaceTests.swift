@@ -114,3 +114,192 @@ private actor RaceCompletionRecorder {
         all.append((workFinished, elapsed))
     }
 }
+
+// MARK: - Deterministic ordering (PR #15 review round 4, non-blocking suggestion accepted)
+
+/// Proves `raceAgainstCeiling`'s winner-selection logic by controlling ORDER, not wall-clock
+/// time: the injected `sleep` resolves with no real delay, and `work` is held open on a
+/// manually-released gate, so which side "wins" is deterministic regardless of CI-runner
+/// scheduling jitter. Complements, rather than replaces, `MeetingQuitRaceTests
+/// .ceilingWinsOverNonCancellableWork()` above, which stays as a wall-clock smoke test of the
+/// real default `Task.sleep` wiring end to end.
+@Suite("raceAgainstCeiling ordering (deterministic)")
+@MainActor
+struct RaceOrderingTests {
+    @Test("the injected sleep resolving before work is released makes the ceiling win, deterministically")
+    func ceilingWinsWhenSleepResolvesFirst() async throws {
+        let gate = ReleaseGate()
+        let recorder = RaceCompletionRecorder()
+
+        raceAgainstCeiling(
+            ceilingNanoseconds: 0,
+            work: { await gate.waitForRelease() }, // never released in this test
+            onComplete: { workFinished in
+                Task { await recorder.record(workFinished: workFinished, elapsed: 0) }
+            },
+            sleep: { _ in /* resolves with no delay -- simulates the ceiling firing first */ }
+        )
+
+        let deadline = Date().addingTimeInterval(5)
+        while await recorder.count == 0 && Date() < deadline {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+
+        let recorded = await recorder.all
+        #expect(recorded.count == 1)
+        #expect(recorded.first?.workFinished == false)
+    }
+
+    @Test("work completing before the injected sleep ever resolves makes work win, deterministically")
+    func workWinsWhenReleasedBeforeSleepResolves() async throws {
+        let gate = ReleaseGate()
+        let recorder = RaceCompletionRecorder()
+
+        raceAgainstCeiling(
+            ceilingNanoseconds: 0,
+            work: { await gate.waitForRelease() },
+            onComplete: { workFinished in
+                Task { await recorder.record(workFinished: workFinished, elapsed: 0) }
+            },
+            // Never resolves during this test -- simulates a ceiling that would fire, but not
+            // before `work` is released below.
+            sleep: { _ in await gate.waitForRelease() }
+        )
+
+        await gate.release()
+
+        let deadline = Date().addingTimeInterval(5)
+        while await recorder.count == 0 && Date() < deadline {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+
+        let recorded = await recorder.all
+        #expect(recorded.count == 1)
+        #expect(recorded.first?.workFinished == true)
+    }
+}
+
+// MARK: - shouldRaceMeetingFinalize (PR #15 review round 4, B1)
+
+/// Reproduces the exact regression B1 describes: the round-3 guard only covered `phase ==
+/// .recording`, so the natural "press Stop, then quit" sequence (where `phase` is already
+/// `.stopping` by the time the user quits) fell through to `.terminateNow` and killed the
+/// in-flight finalize. `.stoppingIsRaced()` below is written against the CURRENT, real
+/// `shouldRaceMeetingFinalize(forPhase:)` and passes; it was run against a deliberately
+/// reverted, pre-fix copy of that function (`== .recording` only) first, and failed there --
+/// see `FORK-PATCHES.md`'s "PR #15 review round 3/4 report" for the verbatim before/after
+/// `xcodebuild test` output. This test is what would catch a future regression back to that
+/// shape; it does not itself demonstrate the historical failure (the reverted code no longer
+/// exists in this file).
+@Suite("shouldRaceMeetingFinalize")
+struct ShouldRaceMeetingFinalizeTests {
+    @Test("idle and starting are not raced")
+    func idleAndStartingAreNotRaced() {
+        #expect(shouldRaceMeetingFinalize(forPhase: .idle) == false)
+        #expect(shouldRaceMeetingFinalize(forPhase: .starting) == false)
+    }
+
+    @Test("recording is raced")
+    func recordingIsRaced() {
+        #expect(shouldRaceMeetingFinalize(forPhase: .recording) == true)
+    }
+
+    @Test("stopping is raced -- the exact case B1 found missing")
+    func stoppingIsRaced() {
+        #expect(shouldRaceMeetingFinalize(forPhase: .stopping) == true)
+    }
+}
+
+// MARK: - SingleFlightTask (PR #15 review round 4, B1)
+
+/// Proves the property `MeetingRecordingController.stopTask()` depends on to guarantee "never
+/// more than one live call into `engine.stop()`": `run(_:)` called a second time while a first
+/// call's task is still in flight must return that SAME task, not start a second one -- proven
+/// here by a `work` closure that increments a counter and blocks on a continuation until the
+/// test releases it, so the test can assert the counter stays at 1 across two `run(_:)` calls
+/// while the first is deliberately held open, then reaches exactly 1 (not 2) once released.
+@Suite("SingleFlightTask")
+@MainActor
+struct SingleFlightTaskTests {
+    @Test("a second run() while the first is still in flight returns the same task and does not invoke operation again")
+    func secondRunWhileInFlightDoesNotDuplicateWork() async throws {
+        let single = SingleFlightTask<Int>()
+        let gate = ReleaseGate()
+
+        let firstTask = single.run {
+            await gate.invocationStarted()
+            await gate.waitForRelease()
+            return 1
+        }
+
+        // Called again before the first has any chance to finish (it's parked on `gate`) --
+        // this must NOT start a second `operation`.
+        let secondTask = single.run {
+            await gate.invocationStarted()
+            await gate.waitForRelease()
+            return 2
+        }
+
+        // Give the first task a chance to actually start running (enter `operation` and park on
+        // the gate) before asserting the invocation count -- otherwise this could pass trivially
+        // because neither task has been scheduled yet.
+        let startDeadline = Date().addingTimeInterval(5)
+        while await gate.startedCount == 0 && Date() < startDeadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        #expect(await gate.startedCount == 1, "operation must have started exactly once by now")
+
+        await gate.release()
+
+        let firstResult = await firstTask.value
+        let secondResult = await secondTask.value
+
+        #expect(await gate.startedCount == 1, "operation must never have started a second time")
+        // Both callers observe the SAME task's result -- `1`, from the first operation closure,
+        // never `2` from the second, which never ran.
+        #expect(firstResult == 1)
+        #expect(secondResult == 1)
+    }
+
+    @Test("run() after a prior call has completed starts a genuinely new task")
+    func runAfterCompletionStartsFresh() async throws {
+        let single = SingleFlightTask<Int>()
+
+        let first = await single.run { 1 }.value
+        let second = await single.run { 2 }.value
+
+        #expect(first == 1)
+        #expect(second == 2)
+    }
+}
+
+/// Test-only synchronization: lets a test hold an `operation` closure open (simulating a
+/// still-in-progress `engine.stop()`) and observe exactly how many times it started, without
+/// any real CoreAudio/`MeetingEngine` involved.
+private actor ReleaseGate {
+    private(set) var startedCount = 0
+    // A single stored continuation would drop a second SIMULTANEOUS waiter (its continuation
+    // would overwrite the first's, which would then never resume) -- `RaceOrderingTests
+    // .workWinsWhenReleasedBeforeSleepResolves()` parks both `work` and the fake `sleep` on
+    // the same gate at once, so this holds every waiter, not just the most recent.
+    private var continuations: [CheckedContinuation<Void, Never>] = []
+    private var released = false
+
+    func invocationStarted() {
+        startedCount += 1
+    }
+
+    func waitForRelease() async {
+        if released { return }
+        await withCheckedContinuation { continuations.append($0) }
+    }
+
+    func release() {
+        released = true
+        let waiters = continuations
+        continuations = []
+        for continuation in waiters {
+            continuation.resume()
+        }
+    }
+}

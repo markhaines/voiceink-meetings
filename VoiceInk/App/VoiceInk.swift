@@ -117,7 +117,41 @@ struct VoiceInkApp: App {
         // launched directly and racing each other, rather than through the Dock/LaunchServices).
         // Same idiom as dictation's own `recorderUIManager.resetOnLaunch()` below, applied to
         // meetings' separate persisted lifecycle.
-        MeetingStore.reconcileInterruptedRecordings(in: resolvedContainer)
+        //
+        // PR #15 review round 4, B2: a failed reconciliation write used to be swallowed
+        // silently (see `reconcileInterruptedRecordings`'s own doc comment) -- a stale
+        // `.recording` row would then reappear at the NEXT launch too, with nothing having
+        // told anyone the first attempt failed. Caught here and surfaced the same way this
+        // `init()` already surfaces the in-memory-storage-fallback warning earlier above:
+        // logged at `.critical`, plus a blocking `NSAlert` so Mark cannot miss it. NOT a
+        // `fatalError` -- the container itself already resolved fine to get this far, so
+        // hard-failing the whole app's launch (dictation included) over a meetings-only
+        // housekeeping write would be a disproportionate response to a narrower problem than
+        // the one that alert-vs-crash decision above is guarding against. The alert's wording
+        // says plainly that a "Recording" badge in the Meetings list may not be trustworthy --
+        // the specific harm this fix exists to prevent is Mark trusting a live-looking UI that
+        // reconciliation could not actually make true.
+        do {
+            let reconciledCount = try MeetingStore.reconcileInterruptedRecordings(in: resolvedContainer)
+            if reconciledCount > 0 {
+                logger.notice("Reconciled \(reconciledCount) interrupted meeting(s) from a previous session.")
+            }
+        } catch {
+            logger.critical(
+                "Failed to reconcile interrupted meetings at launch: \(Self.fullErrorDescription(error), privacy: .public)"
+            )
+            DispatchQueue.main.async {
+                let alert = NSAlert()
+                alert.messageText = String(localized: "Meetings Storage Warning")
+                alert.informativeText = String(
+                    localized:
+                        "VoiceInk couldn't check for meetings left over from a previous session. If any meeting in the Meetings list still shows as \"Recording,\" it may not actually be active -- treat that status as unreliable until this is resolved."
+                )
+                alert.alertStyle = .warning
+                alert.addButton(withTitle: String(localized: "OK"))
+                alert.runModal()
+            }
+        }
 
         // `MeetingRecordingController.configure(modelContainer:)` can be called directly here,
         // synchronously, rather than deferred to a view's `onAppear` -- `resolvedContainer` is

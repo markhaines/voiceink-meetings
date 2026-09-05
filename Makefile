@@ -101,7 +101,7 @@ local: check setup
 		exit 1; \
 	fi; \
 	if [ "$$SIGNING_IDENTITY" != "-" ]; then \
-		ACTUAL_AUTHORITY=$$(codesign -dvvv "$$APP_PATH" 2>&1 | awk -F'=' '/^Authority=/ { print $$2; exit }'); \
+		ACTUAL_AUTHORITY=$$(codesign -dvvv "$$APP_PATH" 2>&1 | awk '/^Authority=/ { sub(/^Authority=/, ""); print; exit }' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$$//'); \
 		if [ "$$ACTUAL_AUTHORITY" != "$$SIGNING_IDENTITY" ]; then \
 			echo ""; \
 			echo "ERROR: requested signing identity '$$SIGNING_IDENTITY' but the built app is actually signed by: $${ACTUAL_AUTHORITY:-<ad-hoc, no Authority>}"; \
@@ -109,7 +109,14 @@ local: check setup
 			codesign -dvvv "$$APP_PATH" 2>&1 | sed 's/^/  /'; \
 			exit 1; \
 		fi; \
-		echo "Verified: $$APP_PATH is signed by '$$SIGNING_IDENTITY' (not ad-hoc)."; \
+		VERIFY_OUTPUT=$$(codesign --verify --deep --strict "$$APP_PATH" 2>&1); VERIFY_STATUS=$$?; \
+		if [ $$VERIFY_STATUS -ne 0 ]; then \
+			echo ""; \
+			echo "ERROR: outer app reports Authority '$$SIGNING_IDENTITY', but 'codesign --verify --deep --strict' failed (exit $$VERIFY_STATUS) -- an embedded framework or other nested code is unsigned, altered, or otherwise invalid. This is the exact class of bug the Authority check above cannot catch on its own: it only inspects the outer app's own signature. Refusing to report success."; \
+			echo "$$VERIFY_OUTPUT" | sed 's/^/  /'; \
+			exit 1; \
+		fi; \
+		echo "Verified: $$APP_PATH is signed by '$$SIGNING_IDENTITY' (not ad-hoc), and 'codesign --verify --deep --strict' passes (embedded frameworks and nested code are validly signed too)."; \
 	fi; \
 	echo "Copying VoiceInk.app to ~/Downloads..."; \
 	rm -rf "$$HOME/Downloads/VoiceInk.app"; \
@@ -167,6 +174,11 @@ help:
 	@echo "  build              Build the VoiceInk Xcode project"
 	@echo "  local              Build locally with stable signing when available"
 	@echo "    LOCAL_CODESIGN_IDENTITY=<SHA or name> overrides automatic Apple Development detection"
+	@echo "      (required for a self-signed identity: automatic detection only finds valid"
+	@echo "      'Apple Development: ...' identities via 'security find-identity -v', and a"
+	@echo "      self-signed cert reports CSSMERR_TP_NOT_TRUSTED there so it is invisible to"
+	@echo "      that scan even though 'codesign -s <name>' signs with it fine -- e.g. this"
+	@echo "      Mac's own 'VoiceInk Local Dev' identity)"
 	@echo "  run                Launch the built VoiceInk app"
 	@echo "  dev                Build and run the app (for development)"
 	@echo "  release            Build DMG and Appcast using release-notes/<version>.html"

@@ -104,6 +104,21 @@ struct VoiceInkApp: App {
         container = resolvedContainer
         DictionaryService.removeExactDuplicateContent(context: resolvedContainer.mainContext, source: "launch")
 
+        // PR #15 review round 3, B1-ii: reconciles any `Meeting` left `.recording`/`.paused` by
+        // a process that no longer exists (crash, `kill -9`, power cut, or simply a quit that
+        // outran `AppDelegate.applicationShouldTerminate(_:)`'s bounded finalize window -- see
+        // that method's own comment). Must run here, synchronously, in `init()`, BEFORE this
+        // `App`'s `body` -- and therefore any UI, and therefore any `MeetingRecordingController
+        // .startMeeting` call in THIS process -- is ever evaluated: that ordering is what makes
+        // "no live recording in this process yet" true by construction rather than merely
+        // likely, so this can never race a meeting this same process is actively recording. See
+        // `MeetingStore.reconcileInterruptedRecordings(in:)`'s own doc comment for the full
+        // reasoning, including the residual it does not cover (two processes of the same build
+        // launched directly and racing each other, rather than through the Dock/LaunchServices).
+        // Same idiom as dictation's own `recorderUIManager.resetOnLaunch()` below, applied to
+        // meetings' separate persisted lifecycle.
+        MeetingStore.reconcileInterruptedRecordings(in: resolvedContainer)
+
         // `MeetingRecordingController.configure(modelContainer:)` can be called directly here,
         // synchronously, rather than deferred to a view's `onAppear` -- `resolvedContainer` is
         // already resolved above, unlike in a view (where the `\.modelContext` environment key
@@ -184,6 +199,9 @@ struct VoiceInkApp: App {
         _prewarmService = StateObject(wrappedValue: prewarmService)
 
         appDelegate.menuBarManager = menuBarManager
+        // PR #15 review round 3, B1-i: lets `applicationShouldTerminate(_:)` find a live
+        // recording to finalize before the app quits. See that method's own comment.
+        appDelegate.meetingRecordingController = meetingRecordingController
 
         // Ensure no lingering recording state from previous runs
         Task {

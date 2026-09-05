@@ -16,10 +16,13 @@ import SwiftUI
 struct MeetingsView: View {
     @Query(sort: \Meeting.startDate, order: .reverse) private var meetings: [Meeting]
 
-    // Owned by `ContentView`, not here -- see that file's `meetingRecordingController` comment
-    // for why: this view is destroyed and recreated every time the sidebar selection leaves
-    // and returns to `.meetings`, and an in-progress recording must not be tied to that
-    // lifecycle.
+    // Owned by `VoiceInkApp` (`VoiceInk.swift`), not here -- see that type's own
+    // `meetingRecordingController` property comment and `MeetingRecordingController.swift`'s
+    // own header for why: this view is destroyed and recreated every time the sidebar
+    // selection leaves and returns to `.meetings` (and `ContentView`, an earlier owner, is
+    // itself destroyed by the separate onboarding-reset door -- see `FORK-PATCHES.md`'s
+    // "cross-vendor review fix round 2" entry), and an in-progress recording must not be tied
+    // to either lifecycle.
     @EnvironmentObject private var recordingController: MeetingRecordingController
     @State private var selectedMeetingID: UUID?
     @State private var isPanelPresented = false

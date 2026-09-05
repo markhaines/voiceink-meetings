@@ -2588,10 +2588,16 @@ the entire meetings subsystem built by every stage above was unreachable from th
 This adds the list + detail screen and wires it into navigation. This section originally
 shipped with three upstream touchpoints; two later sections on this same branch ("Launch fix"
 and "Cross-vendor review fix round 2", both below) add a fourth and fifth. **The branch total,
-kept accurate here rather than left to whichever section a reader opens first, is FIVE upstream
-files: `ContentView.swift`, `AppSidebar.swift`, `AppTheme.swift`, `Makefile`, and
-`VoiceInk/App/VoiceInk.swift`.** `VoiceInk/VoiceInk.local.entitlements` is touched by the Launch
-fix section below too, but is fork-owned, not an upstream touchpoint (see that section).
+kept accurate here rather than left to whichever section a reader opens first, is SEVEN
+upstream files: `ContentView.swift`, `AppSidebar.swift`, `AppTheme.swift`, `Makefile`,
+`VoiceInk/App/VoiceInk.swift`, `LocalBuild.xcconfig`, and `VoiceInk/App/Lifecycle/
+AppDelegate.swift`.** The sixth, `LocalBuild.xcconfig`, was already edited by an earlier round
+on this branch (the "`LOCAL_CODESIGN_IDENTITY` was inert" fix, further down this file) but
+mis-logged there as fork-owned; corrected in that section (PR #15 review round 3, B3) rather
+than silently updating the number here with no trail. The seventh, `AppDelegate.swift`, is new
+in review round 3 (B1) — see that round's own section for the full reasoning. `VoiceInk/
+VoiceInk.local.entitlements` is touched by the Launch fix section below too, but is fork-owned,
+not an upstream touchpoint (see that section).
 
 ### Upstream touchpoints for this section: THREE, not the two this branch was budgeted
 
@@ -2980,11 +2986,23 @@ lower priority than command-line settings and was never reached, because the xcc
 was already deciding the outcome before target-level settings were even consulted).
 
 **The fix:** removed `CODE_SIGN_IDENTITY` and `CODE_SIGN_STYLE` from `LocalBuild.xcconfig`
-entirely (fork-owned file, not upstream) with a comment explaining why, so the Makefile's
-command-line values are the only source for those two keys and can actually vary per
-invocation. `local`'s xcodebuild call now also passes `CODE_SIGN_STYLE=Manual` explicitly on
-the command line (previously implicit via the now-removed xcconfig line), so the project's
-target-level `CODE_SIGN_STYLE = Automatic` default doesn't reassert itself.
+entirely, with a comment explaining why, so the Makefile's command-line values are the only
+source for those two keys and can actually vary per invocation. `local`'s xcodebuild call now
+also passes `CODE_SIGN_STYLE=Manual` explicitly on the command line (previously implicit via
+the now-removed xcconfig line), so the project's target-level `CODE_SIGN_STYLE = Automatic`
+default doesn't reassert itself.
+
+**Correction (PR #15 review round 3, B3): `LocalBuild.xcconfig` IS upstream-owned, and this
+edit is a sixth touchpoint, not a fork-owned-file non-event.** This section originally called
+it "fork-owned, not upstream" — wrong, and this document's own fork-point section
+(`## Fork point: 711297b`, near the top of this file) already had the evidence needed to catch
+it: `711297b` is upstream's commit, and `git log --follow --diff-filter=A -- LocalBuild.xcconfig`
+shows it was created by upstream (`Beingpax`, commit `36427ebf`, "Add make local target for
+building without Apple Developer certificate") and is untouched by any fork commit through the
+fork point itself. Editing the two `CODE_SIGN_IDENTITY`/`CODE_SIGN_STYLE` lines above is
+therefore a real edit to a real upstream, actively-maintained file — this ledger's own
+definition of a touchpoint — and the "meetings-ui-shell" section's summary paragraph above is
+corrected to count it as the sixth.
 
 **Made the failure loud (was silent before):** after the build, if an identity was requested
 (`SIGNING_IDENTITY != "-"`), the Makefile now runs `codesign -dvvv` on the built `.app`,
@@ -3021,3 +3039,260 @@ step needs `$SIGNING_IDENTITY` from the identity-resolution logic earlier in the
   was not touched and is still what makes this launch succeed.
 
 Files changed for this fix: `LocalBuild.xcconfig`, `Makefile`, this file.
+
+### PR #15 review round 3: quit-while-recording strands a meeting (B1), a signing gate that can pass on a bad signature (B2), the ledger's own undercount (B3), a stale comment (B4)
+
+Four blocking findings. Verified each against the code before acting rather than assuming the
+review's premise: all four reproduced exactly as described.
+
+**B1: quitting mid-recording (Cmd-Q, Dock > Quit, logout, shutdown) never called
+`MeetingEngine.stop()`, stranding the meeting `.recording` forever.** Confirmed:
+`AppDelegate.swift` had no `applicationShouldTerminate(_:)` or any other termination hook at
+all before this round. This is the third time on this branch a "structural" fix has defended
+one door onto the same shape (sidebar navigation, then onboarding reset, both above) while the
+underlying shape -- a live recording with nothing guaranteeing it gets finalized -- stayed
+intact. Fixed the shape this time, in two independent halves, per instruction:
+
+**(i) Graceful quit, bounded.** `AppDelegate.applicationShouldTerminate(_:)` (new) checks
+`meetingRecordingController?.phase == .recording`; if so, it holds termination with
+`.terminateLater`, races `controller.stopMeetingAndWait()` (new, on
+`MeetingRecordingController`) against a ceiling, then replies `NSApp.reply
+(toApplicationShouldTerminate: true)` from whichever side wins. `stopMeeting()` (the existing
+UI-button entry point) is refactored to call the same new `stopMeetingAndWait()` via
+`Task { await stopMeetingAndWait() }`, so there is exactly one implementation of "stop and
+finalize," not two copies that could drift.
+
+`NSApplication.willTerminateNotification` was checked FIRST, per instruction, and rejected
+rather than reached for out of habit: it fires only after AppKit has already committed to
+terminating, with no way to delay that decision, so a `Task` started from it races the
+process's own teardown with no guarantee the finalize work runs to completion at all -- it
+cannot deliver what this fix actually needs (an awaited, bounded wait before termination
+proceeds). Only `applicationShouldTerminate(_:)`'s `.terminateLater` return gives a delegate
+that hold.
+
+**Round-2-of-this-fix correction: the first shape of the bound was itself broken, and did not
+bound anything.** The version that first shipped here raced the two sides inside
+`withTaskGroup(of: Void.self) { ... }`, called `group.next()` once, then `group.cancelAll()`.
+That does not work, and Mark caught it before it merged: a task group cannot return from its
+closure until EVERY child task it started has actually finished -- `cancelAll()` only
+*requests* cancellation, it does not detach or abandon a running child. Swift's cancellation is
+cooperative: a task that never checks `Task.isCancelled`, and isn't suspended on something
+that itself responds to cancellation (like `Task.sleep`), keeps running to completion
+regardless of being marked cancelled. Checked against the actual code rather than assumed:
+`Task.isCancelled` appears exactly twice in the whole of `MeetingEngine.swift`, and both sit
+inside `rotateChunkOnQueue()`/`rotateSystemChunkOnQueue()` -- unrelated, MID-MEETING
+chunk-rotation tasks, not `stop()`'s own body at all. `stop()` itself is a straight-line
+sequence of synchronous CoreAudio teardown calls (`meetingMicRecorder.stop()`,
+`systemAudioRecorder.stop()`) and actor-isolated SwiftData saves (`persistence.finish`,
+`persistSegments`) with no cancellation check anywhere in that chain -- and a synchronous call
+blocking a thread cannot be preempted by cancellation regardless, because there is no
+suspension point for cancellation to be observed at. So the original shape would, in EXACTLY
+the scenario it exists to guard against (a wedged finalize -- a blocked CoreAudio teardown, a
+stuck file write), hang the task group forever, never call `NSApp.reply`, and leave Mark
+unable to quit his Mac at all -- strictly worse than the stranded row this fix exists to
+prevent, and the exact opposite of what the code's own comment at the time claimed.
+
+**Fixed shape:** `raceAgainstCeiling` (new, `MeetingQuitRace.swift`, fork-owned, extracted so
+this property is independently unit-testable) starts `work` and the ceiling as two
+INDEPENDENT, UNSTRUCTURED `Task`s -- neither a structured child of the other or of any group --
+and calls `onComplete` from whichever finishes first; a second call is a no-op. Because neither
+task is a structured child of anything, the ceiling's own `Task.sleep` fires on its own
+schedule no matter what `work` is doing: nothing here ever waits on `work` to decide when to
+reply. If `work` is still running when the ceiling wins, it is not cancelled and not awaited --
+it is abandoned, left running against a process about to be torn down regardless. If it
+manages to persist anything before the process actually exits, that write survives
+(incremental persistence already tolerates a meeting stopping mid-write, the entire reason it
+exists); if it doesn't, the row is left exactly where it was, for `MeetingStore
+.reconcileInterruptedRecordings(in:)` (part (ii), below) to catch on next launch.
+
+Ceiling: 5 seconds (`AppDelegate.meetingFinalizeTimeoutSeconds`). Justified in-code and here:
+every `MeetingEngineTests.swift` `stop()`-path test observed in this project's own test output
+completes in under one second (`MeetingEngineTests/stopFinalizesMeeting()` — 0.111s,
+`.../stopPersistsChunkStillInFlightAtCallTime()` — 0.412s, the slowest — `.../stopAwaitsRacingChunkPersistenceAndSurfacesItsFailure()` — 0.402s), so 5 seconds is roughly
+an order of magnitude of headroom over the slowest observed real teardown, without holding a
+user who wants to quit hostage to a slow disk or a wedged store for long. The reply always
+fires `true` after the race resolves either way -- a hung finalize delays quitting by at most
+the ceiling; it never blocks it outright, per instruction ("a user who cannot quit their Mac
+is a worse outcome than a stranded row"). This bound now actually holds in the "work never
+returns" case, not just the "work responds to cancellation" case -- see the proof below.
+
+**Proof, against a fixture that ignores cancellation entirely (a real OS thread blocked on
+`DispatchSemaphore.wait()`, bridged into `async` through `withCheckedContinuation`), not
+`Task.sleep`** -- `Task.sleep` cancels cooperatively the instant it's asked to, so a fixture
+built on it would only exercise the EASY case and would have passed against the broken
+`withTaskGroup` version too. `MeetingQuitRaceTests
+.ceilingWinsOverNonCancellableWork()` holds a thread parked on a 30-second semaphore wait (far
+longer than the test's own 2-second failure deadline) as the `work` side of a race against a
+200ms ceiling, and asserts BOTH that `onComplete` fired within the ceiling (`elapsed < 1.0s`)
+AND that it fired with `workFinished == false` -- i.e. that it was genuinely the ceiling that
+won, not the (structurally impossible, within the test's own window) work finishing. Both
+assertions are necessary: timing alone cannot distinguish "the ceiling bounded this" from "the
+race happened to resolve quickly for some other reason." A companion test,
+`workWinsWhenFasterThanCeiling`, confirms the opposite side of the race also completes exactly
+once when `work` returns immediately.
+
+Files for the race fix: `VoiceInk/Features/Meetings/Views/MeetingQuitRace.swift` (new,
+fork-owned), `Tests/VoiceInkTests/Features/Meetings/Views/MeetingQuitRaceTests.swift` (new),
+`VoiceInk/App/Lifecycle/AppDelegate.swift` (touchpoint 7, below -- updated in place, no new
+touchpoint).
+
+This is the SEVENTH upstream touchpoint on this branch, authorized explicitly by Mark for
+this fix (`AppDelegate.swift`). Kept minimal and additive per that authorization: one new
+`weak var`, one new `private var` reentrancy guard, one new `static let` constant, and one new
+method (`applicationShouldTerminate(_:)`) that itself delegates the actual race logic to the
+fork-owned `raceAgainstCeiling` above; nothing else in the file was touched, restructured, or
+reformatted. `VoiceInk.swift` (already touchpoint 5) gained two more lines wiring
+`appDelegate.meetingRecordingController = meetingRecordingController`, next to the existing,
+identically-shaped `appDelegate.menuBarManager = menuBarManager` line -- same idiom, not a new
+one.
+
+**(ii) Launch-time reconciliation — the half that actually holds.** (i) is best-effort: it
+cannot run at all for `kill -9`, a kernel panic, or a power cut, and even a clean quit can
+outrun its 5-second ceiling. So `MeetingStore.reconcileInterruptedRecordings(in:)` (new,
+`MeetingStore.swift`, fork-owned) runs unconditionally on every launch, from
+`VoiceInk.swift`'s `init()`, synchronously and BEFORE `resolvedContainer` is handed to
+anything else: it fetches every `Meeting`, and any still `.recording` or `.paused` is set to
+`.failed` -- the existing terminal state this codebase already uses for "capture ended
+abnormally" (`MeetingState.failed`'s own doc comment), not a new state invented for this fix.
+It never sets `.completed` (that would be a lie about what happened) and never leaves a row
+claiming to be live. Only `state` is touched: `endDate`, `duration`, and every segment already
+on disk are left exactly as incremental persistence wrote them, matching
+`MeetingStore.markFailed(_:)`'s own existing behavior (which also never sets `endDate`) and
+literally the entire reason incremental persistence exists — an interrupted meeting keeps what
+it captured.
+
+**How this is known not to race a genuinely live recording in the same process:** by
+construction of WHERE it runs, not by a runtime check. `VoiceInkApp.init()` runs to completion
+before this `App`'s `body` — and therefore any UI, and therefore any tap on "Start Meeting"
+that could call `MeetingRecordingController.startMeeting` — is ever evaluated. No meeting in
+THIS process can be `.recording` yet at the point this call executes, because nothing in this
+process has called `persistence.startMeeting` yet; every `.recording`/`.paused` row this scan
+can possibly find was written by a PRIOR process. This is also why the reconciliation logic is
+a plain synchronous static function over its own freshly-made `ModelContext`
+(`MeetingStore.reconcileInterruptedRecordings(in:)` takes a `ModelContainer`, not routed
+through `MeetingStore`'s own actor-isolated `dispatch`): it must run inside a synchronous
+`init()`, and routing it through `async` dispatch would add an await point with no equivalent
+ordering guarantee. This does not weaken `MeetingStore`'s isolation guarantee (**G**, in that
+file's own doc comment) — **G** is scoped to `MeetingPersistenceEngine`'s own private context,
+and that doc comment already states the `ModelContainer` itself is not a secret and other
+independent contexts over it are an expected, supported SwiftData pattern (contexts are
+independent; conflicts resolve at save), not something **G** claims to prevent.
+
+**Residual, stated plainly, not solved by this fix:** two processes of the SAME build racing
+each other at launch — e.g. the same `.app` executed directly twice rather than through the
+Dock/LaunchServices (which normally just activates the existing instance instead of launching
+a second one) — is not defended against. That would need process-singleton locking, which
+nothing in this codebase provides today and which this fix does not add. Also unaddressed,
+because it is a pre-existing gap this fix's own scope does not extend to: `pause()`/`resume()`
+already have their own known persistence gap (`MeetingEngineResult`'s own doc comment,
+"Still NOT covered, deliberately"), unrelated to this fix.
+
+Test coverage: `MeetingStoreTests.swift` gained three new tests
+(`reconcileMarksLiveStatesFailedAndKeepsSegments`, `reconcileLeavesTerminalStatesAlone`,
+`reconcileOnEmptyStoreIsANoOp`) against a plain in-memory `ModelContainer`, the same fixture
+pattern every other test in that file already uses — inserting `.recording`/`.paused`/
+`.completed`/`.failed` meetings (one with a segment attached) directly via a `ModelContext`,
+calling the new static function, and asserting exactly which rows changed, which stayed put,
+segments survived, and `endDate` was never touched. `MeetingRecordingControllerTests.swift`
+gained one test (`stopMeetingAndWaitWhileIdleReturnsFalse`) covering the new
+`stopMeetingAndWait()` entry point's guard directly, since it is now the function
+`AppDelegate` actually calls, not `stopMeeting()`.
+
+**B2: the signing verification gate compared only the outer app's reported `Authority` and
+never actually validated any signature — the exact class of bug it exists to catch, one level
+up.** Confirmed: `Makefile`'s `local` target's post-build check (added in an earlier round of
+this branch) extracted `Authority=` from `codesign -dvvv "$$APP_PATH"` and compared it to the
+requested identity, but never ran `codesign --verify` at all — so an embedded framework that
+was unsigned, altered, or signed by something else entirely would still pass, because nothing
+ever inspected it.
+
+**Fix:** after the existing Authority comparison succeeds, the gate now also runs `codesign
+--verify --deep --strict "$$APP_PATH"` and requires exit 0 before reporting success; either
+check failing prints the diagnostic output and exits 1. Captured via `VERIFY_OUTPUT=$$(...);
+VERIFY_STATUS=$$?` on one line — NOT piped through `sed`/anything else afterward the way the
+existing failure-path `codesign -dvvv | sed 's/^/  /'` line is, because piping into another
+command replaces the pipeline's exit status with that command's, which would silently defeat
+the very check being added (this project's own `reference_cronicle_exit_code_masking`-class
+mistake, caught before it shipped rather than after).
+
+**Proof it actually catches a bad embedded signature — verbatim, against a COPY of the real
+build, never the build reported to Mark:**
+
+```
+$ cp -R "$HOME/Applications/VoiceInk Meetings.app" /tmp/voiceink-corrupt-test.app
+$ codesign --remove-signature "/tmp/voiceink-corrupt-test.app/Contents/Frameworks/whisper.framework/Versions/A/whisper"
+$ codesign --verify --deep --strict "/tmp/voiceink-corrupt-test.app"; echo "exit: $?"
+/tmp/voiceink-corrupt-test.app: a sealed resource is missing or invalid
+file added: /tmp/voiceink-corrupt-test.app/Contents/Frameworks/whisper.framework/Versions/A/whisper
+exit: 1
+```
+
+against the intact build:
+
+```
+$ codesign --verify --deep --strict "$HOME/Applications/VoiceInk Meetings.app"; echo "exit: $?"
+exit: 0
+```
+
+(Both runs against a `VoiceInk Local Dev`-signed build — see the "`LOCAL_CODESIGN_IDENTITY` was
+inert" section above for that identity's SHA. `--remove-signature` on the nested `whisper`
+binary is exactly the "embedded framework is unsigned" failure mode B2 describes; SwiftData's
+own outer-app resigning after copy did not re-seal the corrupted nested framework, so the
+`--deep --strict` check catches it precisely as intended.)
+
+**Cosmetic parsing issues, fixed while in there (neither could produce a false SUCCESS, so
+non-blocking, per instruction, but worth not leaving wrong in a security-adjacent gate):**
+`awk -F'='` split the `codesign -dvvv` output on EVERY `=`, so an identity name containing `=`
+would have its value truncated at the first one; changed to `awk` with `sub(/^Authority=/,
+"")` on the matched line, which removes only the fixed prefix and leaves the rest of the line
+-- including any further `=` characters -- intact. Also added a `sed` trim for leading/
+trailing whitespace, since the prior code had no defense against a leading/trailing space
+producing a string-inequality false failure (again: false failure, not false success, but
+robustness the gate should have regardless).
+
+**Non-blocking, also done:** `make help`'s `LOCAL_CODESIGN_IDENTITY` line now notes explicitly
+that a self-signed identity (e.g. this Mac's own `VoiceInk Local Dev`) must be passed
+explicitly, because `security find-identity -v`'s automatic-detection scan only finds valid
+`Apple Development: ...` identities and a self-signed cert reports `CSSMERR_TP_NOT_TRUSTED`
+there — invisible to that scan even though `codesign -s <name>` signs with it without issue.
+
+Files changed: `Makefile`.
+
+**B3: the fork ledger's own touchpoint count undercounted itself.** Fixed in the "correction"
+note added directly inside the "`LOCAL_CODESIGN_IDENTITY` was inert" section above, and the
+running total at the top of the "meetings-ui-shell" section corrected from FIVE to SEVEN
+(`LocalBuild.xcconfig`, corrected retroactively to upstream-owned; `AppDelegate.swift`, new
+this round). Verified `LocalBuild.xcconfig`'s ownership from git history myself before
+touching the number, not from the review's say-so: `git log --follow --diff-filter=A --format
+="%H %an %s" -- LocalBuild.xcconfig` shows it was created by upstream (`Beingpax`, commit
+`36427ebf`, "Add make local target for building without Apple Developer certificate") and
+`git show 711297b6 --stat -- LocalBuild.xcconfig` confirms the fork-point commit itself (also
+upstream's, per this file's own "Fork point" section at the top) edited one line of it — so
+the file both exists at, and predates, the fork point, and is upstream-owned by this ledger's
+own definition, full stop.
+
+**B4: `MeetingsView.swift`'s `recordingController` property comment still said "Owned by
+`ContentView`," contradicting the current app-scope ownership** (round 2 above moved
+ownership to `VoiceInkApp` specifically because `ContentView` turned out to be a second door
+onto the same defect). Doubly wrong, not just stale: it also pointed the reader at
+"`ContentView`'s `meetingRecordingController` comment" for the reasoning, and by the time of
+this round `ContentView.swift` has ZERO references to `meetingRecordingController` at all
+(grep-verified) — the pointer led nowhere. Rewritten to name the actual current owner
+(`VoiceInkApp`) and point at that type's own property comment and `MeetingRecordingController
+.swift`'s header, which do carry the reasoning.
+
+**Re-read every comment in every file touched on this branch against the code as it now
+stands** (`ContentView.swift`, `VoiceInk.swift`, `AppSidebar.swift`, `AppTheme.swift`,
+`Makefile`, `MeetingsView.swift`, `MeetingDetailView.swift`, `MeetingRecordingController
+.swift`, `MeetingStore.swift`, `AppDelegate.swift`, plus this file), per instruction, given
+this project's history of a wrong comment surviving multiple review rounds. Found and fixed
+only the one instance above; every other ownership/history comment checked (`ContentView
+.swift`'s own `meetingRecordingController` doc block, `VoiceInk.swift`'s equivalent,
+`MeetingRecordingController.swift`'s file header) already agreed with current code.
+
+Files changed this round: `VoiceInk/App/Lifecycle/AppDelegate.swift`, `VoiceInk/App/VoiceInk
+.swift`, `VoiceInk/Features/Meetings/Models/MeetingStore.swift`, `VoiceInk/Features/Meetings/
+Views/MeetingRecordingController.swift`, `VoiceInk/Features/Meetings/Views/MeetingsView.swift`,
+`Makefile`, `Tests/VoiceInkTests/Features/Meetings/Models/MeetingStoreTests.swift`,
+`Tests/VoiceInkTests/Features/Meetings/Views/MeetingRecordingControllerTests.swift`, this file.
+No SPM dependency added. No deletion in any upstream file.

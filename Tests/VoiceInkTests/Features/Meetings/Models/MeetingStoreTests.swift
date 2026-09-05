@@ -183,4 +183,68 @@ struct MeetingStoreTests {
             try await store.updateDuration(10, for: foreignHandle)
         }
     }
+
+    // MARK: - reconcileInterruptedRecordings (PR #15 review round 3, B1-ii)
+
+    @Test("reconcileInterruptedRecordings marks .recording and .paused meetings .failed, preserving their segments")
+    func reconcileMarksLiveStatesFailedAndKeepsSegments() throws {
+        let container = try makeContainer()
+        let context = ModelContext(container)
+
+        let recording = Meeting(title: "Still recording", audioDirectoryPath: "/tmp/r1")
+        context.insert(recording)
+        let recordingSegment = MeetingSegment(
+            startOffset: 0, endOffset: 3, speakerLabel: "You", text: "hello",
+            sourceChannel: .mic, orderIndex: 0, meeting: recording
+        )
+        context.insert(recordingSegment)
+
+        let paused = Meeting(title: "Was paused", startDate: Date(), audioDirectoryPath: "/tmp/r2", state: .paused)
+        context.insert(paused)
+
+        try context.save()
+
+        let changed = MeetingStore.reconcileInterruptedRecordings(in: container)
+        #expect(changed == 2)
+
+        let reread = try context.fetch(FetchDescriptor<Meeting>())
+        let rereadRecording = try #require(reread.first { $0.title == "Still recording" })
+        let rereadPaused = try #require(reread.first { $0.title == "Was paused" })
+        #expect(rereadRecording.state == .failed)
+        #expect(rereadRecording.endDate == nil)
+        #expect(rereadRecording.segments.count == 1)
+        #expect(rereadRecording.segments.first?.text == "hello")
+        #expect(rereadPaused.state == .failed)
+    }
+
+    @Test("reconcileInterruptedRecordings leaves completed and already-failed meetings untouched")
+    func reconcileLeavesTerminalStatesAlone() throws {
+        let container = try makeContainer()
+        let context = ModelContext(container)
+
+        let completed = Meeting(title: "Done", audioDirectoryPath: "/tmp/r3", state: .completed)
+        completed.endDate = Date()
+        context.insert(completed)
+
+        let failed = Meeting(title: "Already failed", audioDirectoryPath: "/tmp/r4", state: .failed)
+        context.insert(failed)
+
+        try context.save()
+
+        let changed = MeetingStore.reconcileInterruptedRecordings(in: container)
+        #expect(changed == 0)
+
+        let reread = try context.fetch(FetchDescriptor<Meeting>())
+        #expect(reread.first { $0.title == "Done" }?.state == .completed)
+        #expect(reread.first { $0.title == "Already failed" }?.state == .failed)
+    }
+
+    @Test("reconcileInterruptedRecordings on an empty store returns 0 without crashing")
+    func reconcileOnEmptyStoreIsANoOp() throws {
+        let container = try makeContainer()
+
+        let changed = MeetingStore.reconcileInterruptedRecordings(in: container)
+
+        #expect(changed == 0)
+    }
 }

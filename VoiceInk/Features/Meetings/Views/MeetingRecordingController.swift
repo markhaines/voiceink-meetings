@@ -93,27 +93,38 @@ final class MeetingRecordingController: ObservableObject {
     }
 
     func stopMeeting() {
-        guard let engine, phase == .recording else { return }
+        Task { await stopMeetingAndWait() }
+    }
+
+    /// The actual stop logic, `await`-able to completion -- unlike `stopMeeting()` above, whose
+    /// `Task { ... }` is fire-and-forget for a UI button and gives a caller no way to learn when
+    /// the work inside finishes. Added for PR #15 review round 3 (B1-i):
+    /// `AppDelegate.applicationShouldTerminate(_:)` needs exactly that, to bound how long it
+    /// waits for a live recording to finalize before letting the app quit. `stopMeeting()` now
+    /// just launches this on a `Task` and returns immediately, so the two call sites share one
+    /// implementation instead of the termination path duplicating this method's body.
+    @discardableResult
+    func stopMeetingAndWait() async -> Bool {
+        guard let engine, phase == .recording else { return false }
         phase = .stopping
 
-        Task {
-            do {
-                let result = try await engine.stop()
-                // `persistenceFailures` exists BECAUSE an earlier review round found meetings
-                // could be lost silently (see `MeetingEngineResult`'s own doc comment) -- a
-                // non-empty array here can mean the terminal `persistence.finish` write itself
-                // failed, which leaves the row stuck `.recording`/`.paused` forever even though
-                // this call just returned successfully. Surfacing it, not discarding it with
-                // `_ =`, is the whole point of the field existing.
-                if !result.persistenceFailures.isEmpty {
-                    lastErrorMessage = Self.persistenceFailureMessage(count: result.persistenceFailures.count)
-                }
-            } catch {
-                lastErrorMessage = error.localizedDescription
+        do {
+            let result = try await engine.stop()
+            // `persistenceFailures` exists BECAUSE an earlier review round found meetings
+            // could be lost silently (see `MeetingEngineResult`'s own doc comment) -- a
+            // non-empty array here can mean the terminal `persistence.finish` write itself
+            // failed, which leaves the row stuck `.recording`/`.paused` forever even though
+            // this call just returned successfully. Surfacing it, not discarding it with
+            // `_ =`, is the whole point of the field existing.
+            if !result.persistenceFailures.isEmpty {
+                lastErrorMessage = Self.persistenceFailureMessage(count: result.persistenceFailures.count)
             }
-            self.engine = nil
-            phase = .idle
+        } catch {
+            lastErrorMessage = error.localizedDescription
         }
+        self.engine = nil
+        phase = .idle
+        return true
     }
 
     private static func persistenceFailureMessage(count: Int) -> String {

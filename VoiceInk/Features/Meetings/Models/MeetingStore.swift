@@ -235,6 +235,46 @@ struct MeetingStore: Sendable {
     func markFailed(_ meeting: MeetingHandle) async throws {
         try await dispatch.markFailed(meeting)
     }
+
+    /// Launch-time safety net (PR #15 review round 3, B1-ii): any `Meeting` still
+    /// `.recording`/`.paused` when this runs cannot be live -- the process that owned it is
+    /// gone, or this call would never have been reached (see the call site's own comment,
+    /// `VoiceInk.swift`'s `init()`, for exactly why that ordering is safe). Reconciled to
+    /// `.failed`, the existing terminal state for "capture ended abnormally" (see
+    /// `MeetingState.failed`'s own doc comment) -- never silently to `.completed`, and never
+    /// left claiming to be live. Only `state` changes: `endDate` is left untouched (matching
+    /// `markFailed(_:)`'s own behavior above, and because reconciliation at launch has no
+    /// truthful moment to report as when capture actually stopped), and every segment/duration
+    /// already on disk survives unmodified -- the entire point of incremental persistence is
+    /// that an interrupted meeting keeps what it captured.
+    ///
+    /// Deliberately a plain synchronous static function over its OWN fresh `ModelContext`, not
+    /// a `dispatch`-routed call through this store's actor-isolated engine: it must run inside
+    /// `VoiceInkApp.init()`, before the `App`'s `body` -- and therefore any UI, and therefore
+    /// any `MeetingRecordingController.startMeeting` call in THIS process -- is ever evaluated.
+    /// A synchronous call in `init()` is what makes "no live recording in this process yet"
+    /// structurally true rather than merely likely; routing through `async` dispatch would only
+    /// add an await point with no such guarantee. This does not weaken this file's isolation
+    /// guarantee (**G**, in the type-level doc comment above): that guarantee is scoped to
+    /// `MeetingPersistenceEngine`'s own private context, and the doc comment already states
+    /// plainly that the `ModelContainer` itself is not a secret and other independent contexts
+    /// over it are expected. Residual, stated plainly: this does not defend against two
+    /// processes of the SAME build racing each other at launch (e.g. the same `.app` launched
+    /// twice directly rather than through the Dock/LaunchServices, which would normally just
+    /// activate the existing instance) -- that would need process-singleton locking, which
+    /// nothing in this codebase provides today and which this fix does not add.
+    @discardableResult
+    static func reconcileInterruptedRecordings(in modelContainer: ModelContainer) -> Int {
+        let context = ModelContext(modelContainer)
+        guard let allMeetings = try? context.fetch(FetchDescriptor<Meeting>()) else { return 0 }
+        let stale = allMeetings.filter { $0.state == .recording || $0.state == .paused }
+        guard !stale.isEmpty else { return 0 }
+        for meeting in stale {
+            meeting.state = .failed
+        }
+        try? context.save()
+        return stale.count
+    }
 }
 
 // MARK: - File-private implementation

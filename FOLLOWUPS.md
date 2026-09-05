@@ -58,33 +58,24 @@ deserves its own pass rather than a reactive patch inside a wording/lifecycle fi
 **Worth doing before Stage 2c ships real transcription**, at the latest -- that is when segment
 counts per meeting stop being zero.
 
-## App termination while a meeting is recording strands the row at `.recording` forever
+## App termination while a meeting is recording strands the row at `.recording` forever -- RESOLVED (PR #15 review round 3, B1)
 
-Source: `VoiceInk/App/Lifecycle/AppDelegate.swift` (grepped in full: no
-`applicationWillTerminate`, no `applicationShouldTerminate(_:)` override at all). Raised by
-cross-vendor review of PR #15's fix round 2, which hoisted `MeetingRecordingController` to app
-scope (`VoiceInk.swift`) specifically so no *view-tree* swap (sidebar navigation, onboarding
-reset) can destroy it mid-recording. That fix does nothing for process termination, which is a
-different mechanism entirely: nothing SwiftUI-level survives the process actually exiting.
+Both halves this entry called for are now built. See `FORK-PATCHES.md`'s "PR #15 review round
+3" section for the full design and verification:
 
-**User-visible consequence, stated plainly**: if Mark quits VoiceInk (Cmd-Q, Dock "Quit", or the
-system logging out/shutting down) while a meeting is recording, the process exits immediately --
-`NSApplication`'s default behavior with no delegate override -- and `MeetingEngine.stop()` never
-runs. The `Meeting` row is left permanently at `.recording`, with no `endDate` and no final
-`duration`. Reopening the app afterward shows that meeting in `MeetingsView`'s list still
-badged "Recording" (`MeetingStateBadge`) and `MeetingDetailView`'s header still showing no
-duration, indistinguishable from a meeting genuinely in progress -- except nothing is actually
-running, and nothing will ever call `stop()` on that row again. It sits there wrong until
-someone builds a way to reconcile stale `.recording` rows at launch, or a settings/delete
-affordance for it (neither exists on this branch).
+- `AppDelegate.applicationShouldTerminate(_:)` (new) holds termination with `.terminateLater`,
+  races `MeetingRecordingController.stopMeetingAndWait()` (new) against a 5-second ceiling, and
+  replies `true` either way -- answering this entry's "how long should a quit visibly block"
+  question with an explicit, justified number, and its "what if `stop()` hangs" question with
+  "reply anyway; the row is real either way."
+- `MeetingStore.reconcileInterruptedRecordings(in:)` (new), called from `VoiceInk.swift`'s
+  `init()` on every launch, is the actual answer to "someone builds a way to reconcile stale
+  `.recording` rows at launch" this entry asked for -- it is what catches everything (i) cannot:
+  `kill -9`, a panic, a power cut, or a clean quit that outran the 5-second ceiling.
 
-**Would need, when this is picked up**: `applicationShouldTerminate(_:)` returning
-`NSApplication.TerminateReply.terminateLater`, an async `Task` calling `engine.stop()`, then
-`sender.reply(toApplicationShouldTerminate:)` -- plus a reference to
-`meetingRecordingController` wired into `AppDelegate` (which today only holds a weak
-`menuBarManager`, set post-init the same way this would need to be). Real design work with its
-own open questions (how long a quit should visibly block for, what happens if `stop()` itself
-hangs or the store write fails) -- not something to bolt onto a lifetime-ownership fix round.
+Residual, carried forward rather than silently dropped: two processes of the same build racing
+each other at launch (bypassing the Dock/LaunchServices single-instance behavior) is still
+unaddressed -- would need process-singleton locking, which this fix does not add.
 
 ## `MeetingStore`'s isolation guarantee excludes raw-memory forgery and `Mirror` on a handle
 

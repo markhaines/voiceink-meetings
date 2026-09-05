@@ -286,6 +286,30 @@ admission is FluidAudio-only"); items 3 and 5 are covered in the per-file entrie
 | 5 | A diarizer `loadOperationTimeout` chosen from data | **OPEN** | The 30s default was picked without a single real-hardware measurement of how long `DiarizerModels.load` actually takes. |
 | 6 | The capability must not expose an eviction-capable `AsrManager` | **CLOSED** by `MeetingAsrSharing.swift` in round 6 | Kept as a row rather than deleted, because the history is the point. Round 5's capability returned the live shared `AsrManager`, and `AsrManager.cleanup()` is ordinary public FluidAudio API that nils every loaded model: `access.borrowLoadedManager()?.manager.cleanup()` compiled from any meeting-side file with zero diagnostics. Closed by inversion — the capability now performs the transcription on the owning side and returns a fork-owned value receipt, so the meeting side never holds a manager. Enforced by `MeetingCapabilityReturnValueEvictionAttack.swift`, `MeetingReceiptMutatingApiAttack.swift` and `MeetingSeamCannotNameAsrManagerAttack.swift`. |
 
+## The seam's error channel is not type-constrained (safe today by inspection)
+
+Source: `VoiceInk/Features/Meetings/Transcription/MeetingAsrSharing.swift`
+(`MeetingChunkTranscriptionOperation`).
+
+The capability's SUCCESS channel is constrained to fork-owned value types: the operation returns
+`MeetingChunkTranscriptionOutcome`, and negative controls destructure every payload to prove none
+of it is or contains an `AsrManager`. The ERROR channel has no equivalent constraint. The
+operation is `throws`, so it can throw `any Error`, and nothing in the type system stops a future
+error type from carrying a manager or the service across the seam.
+
+**Safe today, by inspection rather than by type.** Everything on the factory's path that can throw
+is `AsrManager.transcribe`, which throws FluidAudio's own `ASRError` and decoding errors; none of
+them embed the manager. Raised by cross-vendor review in round 7, which also found no current
+leaking path.
+
+**Deliberately not fixed.** Constraining it means a typed-throws boundary plus error mapping
+across the seam, which is a larger change than the residual justifies for a channel that is empty
+today. Recorded here so it is a decision rather than an oversight.
+
+**Would need revisiting** if the operation ever grows a second throwing call, or if a fork-owned
+error type is introduced on this path: at that point map errors to a fork-owned enum rather than
+letting `any Error` through.
+
 Item 6 is recorded as CLOSED rather than removed because four successive designs of that boundary
 were each defeated in one line, and the last one was defeated by an attack nobody had listed: the
 suite tested routes to the *service* while the capability handed out the *manager* through its own

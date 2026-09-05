@@ -46,16 +46,48 @@
 //     `TimeInterval`, and `[MeetingTokenSpan]?` -- and `MeetingTokenSpan` is one `String` and two
 //     `TimeInterval`s. That is the complete enumeration, not a sample of it, which is what lets
 //     the return-value controls be exhaustive rather than a list of imagined routes.
-//   * ENFORCED: THIS FILE is the only one in `Features/Meetings/Transcription/` that names
-//     `AsrManager` in code at all -- verified by grep, and the reason the adapter no longer even
-//     imports FluidAudio. Scoped deliberately: the claim is NOT "no `AsrManager` exists in the
-//     seam", because one plainly does, in the factory below. It is that no OTHER file in the seam
-//     can name, hold, store, return or pass one.
+//   * ENFORCED, stated exactly, because round 6 stated it too broadly: **safe Swift cannot
+//     recover the LIVE SHARED `AsrManager` -- the one dictation is using -- through this
+//     capability's declared return types.** The mechanism is nominal typing of the stored
+//     property and of every return type on the path, plus closure-capture opacity: the factory's
+//     closure captures the manager, and a Swift closure's captured context is not addressable
+//     through the type system. Nothing about WHERE the code lives contributes to that guarantee.
+//
+//     What it does NOT say, and what round 6 wrongly implied: it is NOT a claim that other
+//     meeting files cannot have an `AsrManager`. Any file in this target can
+//     `import FluidAudio` and construct its own -- Swift has no mechanism to prevent that, and no
+//     control here attempts to. Constructing a fresh manager is not the hazard; obtaining the one
+//     dictation has loaded is, because that is the instance whose `cleanup()` would evict Mark's
+//     models mid-dictation.
+//
+//   * CONVENTION, not enforcement, and labelled as such: this file is currently the only one in
+//     `Features/Meetings/Transcription/` that names `AsrManager` in code at all. That is an
+//     observation about the source as it stands today, verified by grep and re-checked by a text
+//     tripwire in `SharedModelDuplicationTests`. A tripwire is not the type system: it catches
+//     the shape it greps for, and nothing else.
+//
+//     WHAT WOULD BREAK IT, so a reader knows what to watch for: any future route by which a
+//     meeting-side file obtains the live shared instance rather than a fresh one: a new member
+//     on this capability that returns or embeds a manager, an outcome case carrying one, a
+//     second accessor added to `FluidAudioTranscriptionService` and reached some other way, or a
+//     composition root that passes the manager in alongside the capability. The first two fail
+//     closed: `MeetingSeamCannotNameAsrManagerAttack.swift` destructures every outcome payload,
+//     and `MeetingCapabilitySurfaceGuardTests` stops compiling if the capability grows a stored
+//     property or the outcome grows a case. The last two would not be caught here at all.
 //   * NOT ENFORCED, and NOT claimed: this file names `FluidAudioTranscriptionService` and does
 //     touch an `AsrManager`, inside `sharingDictationRuntime(of:isDictationActiveOrPending:)`.
 //     That is the one place authority is delegated, and it is on the OWNING side of the seam by
 //     construction. Code that already holds the concrete service can still call `cleanup()`;
 //     that is dictation's own lifecycle API and is not this seam's to remove.
+//   * NOT CONSTRAINED BY TYPE, safe today only by inspection: the operation is `throws`, and a
+//     thrown error is `any Error`, so the error channel is not restricted to fork-owned types the
+//     way the success channel is. Nothing on the factory's path currently throws an error that
+//     carries an `AsrManager` or the service -- `AsrManager.transcribe` throws FluidAudio's own
+//     `ASRError`/decoding errors, none of which embed the manager, but that is an inspection of
+//     today's code, not a guarantee the compiler maintains. Recorded rather than restructured:
+//     constraining it would mean a typed-throws boundary and error mapping across the seam, which
+//     is a larger change than the residual justifies.
+//
 //   * NOT ENFORCED: raw memory. `unsafeBitCast` and friends defeat any Swift-level boundary and
 //     are out of scope for the same reason FOLLOWUPS.md already records for `MeetingStore`. The
 //     closure captures the service in its context. That is a cost, not a defence.

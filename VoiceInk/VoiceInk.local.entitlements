@@ -4,6 +4,25 @@
 <dict>
 	<key>com.apple.security.app-sandbox</key>
 	<false/>
+	<!-- Local builds are ad-hoc signed (no Team ID: `security find-identity` shows zero valid
+	     identities on a dev Mac with no Apple Developer certificate). Hardened runtime (set at
+	     the project level, ENABLE_HARDENED_RUNTIME=YES) enforces library validation, which
+	     requires every loaded binary to share the main executable's Team ID. Ad-hoc signatures
+	     never carry a Team ID at all, so this check can never pass for ANY embedded framework
+	     signed as a separate ad-hoc operation (e.g. whisper.xcframework, built independently by
+	     whisper.cpp's own build-xcframework.sh) -- re-signing the whole bundle in one consistent
+	     pass does not help, because the failure is "no Team ID to match", not "mismatched Team
+	     IDs from two signing passes". This entitlement is scoped to VoiceInk.local.entitlements
+	     ONLY: it is referenced solely by `make local`'s explicit CODE_SIGN_ENTITLEMENTS override
+	     (Makefile) and by the equivalent local-build steps in CI and
+	     scripts/verify-meeting-store-isolation.sh -- never by the Xcode project's own Debug
+	     (VoiceInk.debug.entitlements) or Release (VoiceInk.entitlements) configs, so it cannot
+	     reach `make release` or any shipped build. Cost: it lets the process load code not
+	     signed by the same identity as the main binary -- a real, if narrow, security
+	     reduction, accepted here only because local ad-hoc dev builds have no signing identity
+	     to validate against in the first place. -->
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
 	<key>com.apple.security.automation.apple-events</key>
 	<true/>
 	<key>com.apple.security.device.audio-input</key>

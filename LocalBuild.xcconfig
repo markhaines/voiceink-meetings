@@ -2,11 +2,17 @@
 // Build configuration for local builds with an ad-hoc fallback when no Apple Development identity is available.
 // Applied only by `make local` on top of Release; normal Xcode configurations are unchanged.
 
-// Defaults to ad-hoc signing; make local overrides this when an Apple Development identity is available.
-CODE_SIGN_IDENTITY = -
-CODE_SIGN_STYLE = Manual
 DEVELOPMENT_TEAM =
 PROVISIONING_PROFILE_SPECIFIER =
+
+// CODE_SIGN_IDENTITY and CODE_SIGN_STYLE are deliberately NOT set here. Per `man xcodebuild`,
+// "-xcconfig ... settings will override all other settings, including settings passed
+// individually on the command line" -- so a value fixed in this file cannot be varied by the
+// Makefile per invocation. `make local` needs to pick ad-hoc vs. a real local identity at
+// build time, so both are passed on the xcodebuild command line instead (Makefile's `local`
+// target), where they can actually take effect. Setting them here was the cause of a bug
+// where `make local LOCAL_CODESIGN_IDENTITY=...` silently produced an ad-hoc-signed app
+// anyway: this file's hardcoded `CODE_SIGN_IDENTITY = -` always won.
 
 // Entitlements are set via absolute path in the Makefile command line
 // (relative paths break SPM package targets that resolve from their own source root)

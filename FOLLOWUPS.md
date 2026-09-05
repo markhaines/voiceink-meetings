@@ -273,7 +273,9 @@ its adapters have never run against a real model or real audio on any machine, b
 exists in the environment they were built in.
 
 This section exists so that state cannot be left by accident. **Do not wire this seam until every
-item below is resolved.** Each is a link to the full entry; none is a nice-to-have.
+item below is resolved.** None is a nice-to-have. Items 1 and 2 have their own `GATE ITEM`
+sections immediately below; item 4 has its own entry further down ("B4.2's dictation-priority
+admission is FluidAudio-only"); items 3 and 5 are covered in the per-file entries they name.
 
 | # | Prerequisite | Status | Why it blocks wiring |
 |---|---|---|---|

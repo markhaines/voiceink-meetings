@@ -45,11 +45,10 @@ struct MeetingCapabilityReflectionAttackTests {
     /// `MeetingAsrRuntimeAccess.sharingDictationRuntime(of:)` captures the real one.
     private func makeCapability(capturing service: EvictionCapableStandIn) -> MeetingAsrRuntimeAccess {
         MeetingAsrRuntimeAccess(
-            borrowLoadedManager: {
+            transcribeChunk: { _ in
                 _ = service  // the capture the attacks below are trying to reach
-                return nil
-            },
-            isDictationActiveOrPending: { false }
+                return .sharedModelNotLoaded
+            }
         )
     }
 
@@ -60,10 +59,9 @@ struct MeetingCapabilityReflectionAttackTests {
 
         let children = Array(Mirror(reflecting: capability).children)
 
-        // The two stored closures are visible as LABELS...
-        #expect(children.count == 2)
-        #expect(children.contains { $0.label == "borrowLoadedManager" })
-        #expect(children.contains { $0.label == "isDictationActiveOrPending" })
+        // The single stored closure is visible as a LABEL...
+        #expect(children.count == 1)
+        #expect(children.contains { $0.label == "transcribeChunk" })
 
         // ...but nothing reachable through them is the service. The Swift runtime cannot even
         // demangle a `@MainActor @Sendable` closure type, so each value surfaces as an empty
@@ -94,7 +92,7 @@ struct MeetingCapabilityReflectionAttackTests {
         }
         descend(capability, depth: 0)
 
-        #expect(visited >= 3)  // the struct plus its two children were actually walked
+        #expect(visited >= 2)  // the struct plus its child were actually walked
         #expect(found == false)
         #expect(service.cleanupCallCount == 0)
     }
@@ -122,8 +120,8 @@ struct MeetingCapabilityReflectionAttackTests {
         let service = EvictionCapableStandIn()
         let capability = makeCapability(capturing: service)
 
-        #expect(capability.capabilitySurfaceMemberCount == 2)
-        #expect(capability.attackerVisibleService == nil)
+        #expect(capability.capabilitySurfaceMemberCount == 1)
+        #expect(capability.attackerRecoveredServices.isEmpty)
         #expect(service.cleanupCallCount == 0)
     }
 }
@@ -136,12 +134,28 @@ extension MeetingAsrRuntimeAccess {
         Mirror(reflecting: self).children.count
     }
 
-    /// The best an extension can do: there is no expression that yields the captured service, so
-    /// the honest implementation returns nil. If a future edit ever makes this returnable, this
-    /// property becomes writable as something other than `nil` and the test above fails.
-    fileprivate var attackerVisibleService:
-        MeetingCapabilityReflectionAttackTests.EvictionCapableStandIn?
+    /// Strengthened in round 6. The previous version of this property was hand-written as `nil`,
+    /// which demonstrated no recovery technique at all -- it asserted the author's belief rather
+    /// than testing anything, and the reviewer was right to call it weak.
+    ///
+    /// This version actually TRIES: it walks every value reachable from `self` by reflection, to
+    /// a bounded depth, and collects anything that turns out to be the service. An extension is
+    /// the strongest position an in-module attacker has here (it runs with full access to
+    /// `self`), so what it recovers is the real measure. It returns an ARRAY, so the test asserts
+    /// "recovered nothing" rather than trusting a hand-written `nil`, and any future edit that
+    /// puts a reachable service on the capability makes this non-empty and fails the test.
+    fileprivate var attackerRecoveredServices:
+        [MeetingCapabilityReflectionAttackTests.EvictionCapableStandIn]
     {
-        nil
+        var found: [MeetingCapabilityReflectionAttackTests.EvictionCapableStandIn] = []
+        func sweep(_ value: Any, depth: Int) {
+            if let hit = value as? MeetingCapabilityReflectionAttackTests.EvictionCapableStandIn {
+                found.append(hit)
+            }
+            guard depth < 8 else { return }
+            for child in Mirror(reflecting: value).children { sweep(child.value, depth: depth + 1) }
+        }
+        sweep(self, depth: 0)
+        return found
     }
 }

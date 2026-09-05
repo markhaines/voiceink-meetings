@@ -284,6 +284,13 @@ admission is FluidAudio-only"); items 3 and 5 are covered in the per-file entrie
 | 3 | A dictation-priority closure that is actually correct | **OPEN** | `MeetingAsrRuntimeAccess.isDictationActiveOrPending` has no default by design. Admission is only as good as what the composition root passes; passing `{ false }` silently disables item 2's mitigation entirely. |
 | 4 | transcribe.cpp concurrent-session safety | **OPEN** | Unlike FluidAudio, that path runs meeting and dictation inference concurrently rather than serialised, and whether that is safe or affordable on a 16GB M2 Pro is unmeasured. |
 | 5 | A diarizer `loadOperationTimeout` chosen from data | **OPEN** | The 30s default was picked without a single real-hardware measurement of how long `DiarizerModels.load` actually takes. |
+| 6 | The capability must not expose an eviction-capable `AsrManager` | **CLOSED** by `MeetingAsrSharing.swift` in round 6 | Kept as a row rather than deleted, because the history is the point. Round 5's capability returned the live shared `AsrManager`, and `AsrManager.cleanup()` is ordinary public FluidAudio API that nils every loaded model: `access.borrowLoadedManager()?.manager.cleanup()` compiled from any meeting-side file with zero diagnostics. Closed by inversion — the capability now performs the transcription on the owning side and returns a fork-owned value receipt, so the meeting side never holds a manager. Enforced by `MeetingCapabilityReturnValueEvictionAttack.swift`, `MeetingReceiptMutatingApiAttack.swift` and `MeetingSeamCannotNameAsrManagerAttack.swift`. |
+
+Item 6 is recorded as CLOSED rather than removed because four successive designs of that boundary
+were each defeated in one line, and the last one was defeated by an attack nobody had listed: the
+suite tested routes to the *service* while the capability handed out the *manager* through its own
+front door. A future editor who re-exposes any FluidAudio runtime object across this seam should
+see that history before deciding it is safe.
 
 Items 2, 3 and 4 all reduce to the same exposure and the same person's daily flow: **Mark dictates
 with local Parakeet every day, and none of the mitigations above have been measured against real
@@ -330,13 +337,21 @@ verifying the REAL backend/model behavior the fakes stand in for.
 Source: `VoiceInk/Features/Meetings/Transcription/FluidAudioMeetingSegmentTranscriber.swift`
 (`transcribe(chunkAt:)`, `reconfirmDictationIsIdle()`).
 
-**The exact remaining suspension.** After round 5's reordering, `transcribe(chunkAt:)` runs:
+**Where this now lives (round 6).** The sequence moved from
+`FluidAudioMeetingSegmentTranscriber.transcribe(chunkAt:)` into the capability's operation in
+`MeetingAsrSharing.swift`, because the meeting side no longer holds an `AsrManager` to run it
+with. The property is PRESERVED and slightly improved: the whole sequence now runs on
+`@MainActor`, so the final check is a synchronous statement rather than needing its own hop, and
+round 5's `await reconfirmDictationIsIdle()` suspension is gone. Exactly one `await` still
+separates the final check from inference.
 
-1. `await admitAndBorrow()` — hop to `@MainActor`: early priority check + borrow, no `await`
-   between those two statements.
-2. `await manager.decoderLayerCount` — hop into the `AsrManager` actor and back. **Hoisted above
-   the final check in round 5**; round 4 had it below, which is the window review found.
-3. `await reconfirmDictationIsIdle()` — hop to `@MainActor`: the final admission decision.
+**The exact remaining suspension.** The operation runs:
+
+1. Early priority check + borrow — both synchronous, on `@MainActor`, no `await` between them.
+2. `await manager.decoderLayerCount` — hop into the `AsrManager` actor and back. **Above the
+   final check**; round 4 had it below, which is the window review found then.
+3. The final admission decision — **synchronous** on `@MainActor` (round 5 needed an `await` here
+   to hop back; round 6 does not, because it never left).
 4. `await manager.transcribe(url, decoderState:&decoderState)` — **the residual.** One hop, from
    `@MainActor` into the `AsrManager` actor.
 

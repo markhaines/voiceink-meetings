@@ -274,9 +274,24 @@ run_case MeetingCapabilityCoercionAttack.swift 1 must-not-compile
 run_case MeetingCapabilityMemberLookupAttack.swift 2 must-not-compile
 run_case MeetingSeamAdmissionControlRequiredAttack.swift 1 must-not-compile
 run_case MeetingDiarizerSeamManagerInjectionAttack.swift 1 must-not-compile
+# Round 6: FOLLOW THE RETURN VALUE. Every control above and below this block attacks a route to
+# the SERVICE, and all of them passed while round 5's capability was handing out the live shared
+# `AsrManager` through its own front door. These three attack what the capability RETURNS.
+run_case MeetingCapabilityReturnValueEvictionAttack.swift 2 must-not-compile
+run_case MeetingReceiptMutatingApiAttack.swift 5 must-not-compile
+run_case MeetingSeamCannotNameAsrManagerAttack.swift 2 must-not-compile
+
 run_case MeetingCapabilityConditionalDowncastAttack.swift 1 must-warn
 run_case MeetingCapabilityForcedDowncastAttack.swift 1 must-warn
 run_case MeetingCapabilityBorrowClosureDowncastAttack.swift 1 must-warn
 
-echo "All negative controls still fail to compile, for the expected reasons,"
-echo "each on the exact line its marker names, with no unattributed diagnostics."
+# The message says what was actually proven. It used to say every control "fails to compile",
+# which was FALSE for the three `must-warn` cases: a downcast between unrelated concrete types is
+# a warning, so those controls compile ON PURPOSE and what they assert is that the compiler still
+# proves the cast can never succeed. A verification apparatus that misdescribes what it proved is
+# the same class of defect as a wrong comment, and this project has been bitten by that twice.
+echo "All negative controls produced exactly their required diagnostic:"
+echo "  - must-not-compile cases failed to build, each expected error on the line its marker names;"
+echo "  - must-warn cases built successfully and emitted their expected warning (a cast the"
+echo "    compiler proves always fails), which is what those controls assert;"
+echo "  - no unattributed diagnostics in either mode."

@@ -48,11 +48,10 @@ struct SharedModelDuplicationTests {
     @Test("FluidAudioMeetingSegmentTranscriber.swift reaches models only through the borrow-only accessor")
     func fluidAudioAdapterUsesTheSharedAccessor() throws {
         let contents = try Self.readFile("FluidAudioMeetingSegmentTranscriber.swift")
-        // `borrowedAsrManager()` takes no argument by construction (fix round 3, B1): there is
-        // no version to pass, so the meeting seam cannot request a switch. Asserting the exact
-        // no-argument call shape means reintroducing a parameterised accessor would fail here as
-        // well as failing the negative control.
-        #expect(contents.contains("access.borrowLoadedManager()"))
+        // Round 6: the adapter's only contact with dictation's runtime is asking the capability
+        // to transcribe a chunk. It receives a value receipt, never an `AsrManager` -- which is
+        // what round 5 got wrong, and what the return-value negative controls now enforce.
+        #expect(contents.contains("access.transcribeChunk(url)"))
     }
 
     @Test("TranscribeCppMeetingSegmentTranscriber.swift no longer constructs its own native Model or initializes backends itself")
@@ -100,8 +99,15 @@ struct SharedModelDuplicationTests {
         #expect(contents.contains("init(access: MeetingAsrRuntimeAccess)"))
         #expect(contents.contains("private nonisolated let access: MeetingAsrRuntimeAccess"))
 
+        // Round 6 additionally: the file must not import FluidAudio at all. It has no reason to
+        // once the seam carries only fork-owned value types, and not importing it is a stronger
+        // and cheaper tripwire than enumerating type names -- an `AsrManager` cannot be named
+        // here without the import coming back.
+        #expect(!contents.contains("import FluidAudio"))
+
         let offenders = try Self.scanFile("FluidAudioMeetingSegmentTranscriber.swift", forSubstrings: [
             ": FluidAudioTranscriptionService",
+            ": AsrManager",
         ])
         #expect(
             offenders.isEmpty,

@@ -4,16 +4,21 @@
 // MECHANISM UNDER TEST: whether B2's dictation-priority admission can be omitted.
 //
 // The admission check is what stops a meeting chunk making Mark's dictation queue behind its
-// inference. It is a stored property of `MeetingAsrRuntimeAccess` with no default, so a
-// capability cannot be minted without one: there is no "admission off" state to construct, by
-// accident or otherwise. Round 4 enforced the same property through a defaulted initializer
-// parameter; making it a field is stricter, because a field cannot be forgotten at any call site.
+// inference. Round 6 moved admission ONTO THE OWNING SIDE -- it now runs inside the capability's
+// operation, next to the `AsrManager`, because that is where the decision has to be made once the
+// meeting side no longer holds a manager. So the property to defend moved too: the check is a
+// required parameter of the minting factory, with no default, and a capability cannot be minted
+// from a service without one.
+//
+// What this does NOT prevent, said plainly: a composition root can still construct
+// `MeetingAsrRuntimeAccess` directly with any closure it likes, including one that never checks.
+// That is unchanged from round 5 and is FOLLOWUPS.md wiring-gate item 3, not a claim made here.
 
 import FluidAudio
 import Foundation
 
 @MainActor
-private func admissionControlCannotBeOmitted() {
+private func admissionControlCannotBeOmitted(service: FluidAudioTranscriptionService) {
     // expect-error: missing argument for parameter 'isDictationActiveOrPending' in call
-    _ = MeetingAsrRuntimeAccess(borrowLoadedManager: { nil })
+    _ = MeetingAsrRuntimeAccess.sharingDictationRuntime(of: service)
 }

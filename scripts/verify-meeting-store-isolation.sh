@@ -279,7 +279,7 @@ run_case MeetingDiarizerSeamManagerInjectionAttack.swift 1 must-not-compile
 # `AsrManager` through its own front door. These three attack what the capability RETURNS.
 run_case MeetingCapabilityReturnValueEvictionAttack.swift 2 must-not-compile
 run_case MeetingReceiptMutatingApiAttack.swift 5 must-not-compile
-run_case MeetingSeamCannotNameAsrManagerAttack.swift 6 must-not-compile
+run_case MeetingSeamCannotNameAsrManagerAttack.swift 9 must-not-compile
 
 run_case MeetingCapabilityConditionalDowncastAttack.swift 1 must-warn
 run_case MeetingCapabilityForcedDowncastAttack.swift 1 must-warn

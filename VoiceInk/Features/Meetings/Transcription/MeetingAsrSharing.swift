@@ -66,14 +66,37 @@
 //     tripwire in `SharedModelDuplicationTests`. A tripwire is not the type system: it catches
 //     the shape it greps for, and nothing else.
 //
-//     WHAT WOULD BREAK IT, so a reader knows what to watch for: any future route by which a
-//     meeting-side file obtains the live shared instance rather than a fresh one: a new member
-//     on this capability that returns or embeds a manager, an outcome case carrying one, a
-//     second accessor added to `FluidAudioTranscriptionService` and reached some other way, or a
-//     composition root that passes the manager in alongside the capability. The first two fail
-//     closed: `MeetingSeamCannotNameAsrManagerAttack.swift` destructures every outcome payload,
-//     and `MeetingCapabilitySurfaceGuardTests` stops compiling if the capability grows a stored
-//     property or the outcome grows a case. The last two would not be caught here at all.
+//     WHAT WOULD BREAK IT, and -- stated exactly, because round 7 wrote this list too broadly --
+//     which of those routes a guard would actually catch. "A new member fails closed" was FALSE:
+//     it is true of STORED properties and of nothing else.
+//
+//       FAILS CLOSED (a guard stops compiling, so the change cannot land unnoticed):
+//         - a new STORED property on `MeetingAsrRuntimeAccess`, including one holding or vending
+//           a manager: the synthesised memberwise initializer gains a required parameter and
+//           `MeetingCapabilitySurfaceGuardTests` stops compiling, and a stored-property count
+//           assertion in the same file fails independently if the property is defaulted.
+//         - a new case on `MeetingChunkTranscriptionOutcome`, including one carrying a manager.
+//           The default-free exhaustive switches in that test file and in
+//           `MeetingSeamCannotNameAsrManagerAttack.swift` stop compiling.
+//         - a new STORED property on `MeetingChunkTranscription` or `MeetingTokenSpan`, caught
+//           by a stored-property COUNT assertion over `Mirror`, one per type. The count is what
+//           does the work here, not the memberwise initializer: a property declared with an
+//           initial value (`let leak: LeakBox? = nil`) is not a required initializer parameter,
+//           so the initializer mechanism alone would miss it. Verified in round 8 by planting
+//           exactly that shape.
+//
+//       FAILS OPEN (compiles, and NO guard here catches it):
+//         - a new COMPUTED member or method, added to any of these types in an extension:
+//           `extension MeetingAsrRuntimeAccess { var liveManager: AsrManager { ... } }` compiles
+//           and no guard fires. `Mirror` does not see computed properties, the memberwise
+//           initializer gains no parameter, and Swift has no exhaustiveness rule over a type's
+//           method list. An AST/source-signature guard could close it; Mark ruled that out for
+//           this PR as bespoke test infrastructure whose own correctness would need verifying and
+//           which rots when the source layout changes, on a coordinator nothing constructs yet.
+//           It is WIRING GATE item 7 in FOLLOWUPS.md, OPEN, to be re-checked before wiring.
+//         - a second accessor on `FluidAudioTranscriptionService` reached some other way, or a
+//           composition root passing the manager in alongside the capability. Neither is
+//           reachable from anything this file declares.
 //   * NOT ENFORCED, and NOT claimed: this file names `FluidAudioTranscriptionService` and does
 //     touch an `AsrManager`, inside `sharingDictationRuntime(of:isDictationActiveOrPending:)`.
 //     That is the one place authority is delegated, and it is on the OWNING side of the seam by

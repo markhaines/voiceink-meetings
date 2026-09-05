@@ -11,7 +11,9 @@
 // DID carry a manager. A control that cannot fail is not a control.
 //
 // This version DESTRUCTURES. It switches over every case, binds every payload, and attempts to
-// type each bound value, and each value reachable from it, as `AsrManager`. If any payload ever
+// type each bound value, and every value transitively reachable from it DOWN TO THE LEAF FIELDS,
+// as `AsrManager`. Round 8 extended it to the leaves: round 7 stopped at `MeetingTokenSpan?` and
+// still claimed to cover everything reachable, which was the same defect one level deeper. If any payload ever
 // carried one, the corresponding line would stop erroring and the verifier would report a MISSING
 // diagnostic.
 //
@@ -59,15 +61,32 @@ private func noValueTheCapabilityReturnsIsOrContainsAManager(
         // expect-error: cannot convert value of type '[MeetingTokenSpan]?' to specified type 'AsrManager'
         let fromSpans: AsrManager = receipt.tokenSpans
 
-        // ...and two levels down, inside the array element.
+        // ...and two levels down, the array element itself...
         // expect-error: cannot convert value of type 'MeetingTokenSpan?' to specified type 'AsrManager'
         let fromSpan: AsrManager = receipt.tokenSpans?.first
+
+        // ...and three levels down, EVERY LEAF FIELD of that element individually. Round 7
+        // stopped at the element and claimed to have tested everything transitively reachable,
+        // which was not true: a span field carrying a manager would have gone untested. The
+        // reviewer's concrete leak was a defaulted `Equatable` wrapper field on the span, which
+        // is invisible to the memberwise-initializer guard precisely because it is defaulted.
+        // expect-error: cannot convert value of type 'String?' to specified type 'AsrManager'
+        let fromToken: AsrManager = receipt.tokenSpans?.first?.token
+
+        // expect-error: cannot convert value of type 'TimeInterval?' (aka 'Optional<Double>') to specified type 'AsrManager'
+        let fromStart: AsrManager = receipt.tokenSpans?.first?.start
+
+        // expect-error: cannot convert value of type 'TimeInterval?' (aka 'Optional<Double>') to specified type 'AsrManager'
+        let fromEnd: AsrManager = receipt.tokenSpans?.first?.end
 
         _ = fromReceipt
         _ = fromText
         _ = fromDuration
         _ = fromSpans
         _ = fromSpan
+        _ = fromToken
+        _ = fromStart
+        _ = fromEnd
 
     case .dictationHasPriority:
         break

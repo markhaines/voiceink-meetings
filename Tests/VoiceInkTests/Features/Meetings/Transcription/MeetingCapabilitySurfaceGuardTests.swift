@@ -80,37 +80,68 @@ struct MeetingCapabilitySurfaceGuardTests {
         }
     }
 
-    /// GUARD 3 -- the receipt's transitive value-ness.
+    /// GUARD 3 -- `MeetingTokenSpan`'s stored surface, the leaf of the whole reachable set.
     ///
-    /// `MeetingChunkTranscription` and `MeetingTokenSpan` are declared `Equatable`. That is not
-    /// decoration: `AsrManager` is an actor and cannot be `Equatable`, so a field holding one
-    /// would break the synthesised conformance and stop this compiling. It is a weak guard on its
-    /// own (a manager could be smuggled behind a hand-written `==`), which is why it is listed
-    /// third rather than relied on.
-    @Test("the receipt is a value type all the way down")
+    /// ADDED IN ROUND 8, because the guards above stopped one level short. The reviewer's
+    /// concrete leak was a DEFAULTED `Equatable` wrapper field on the span carrying an
+    /// `AsrManager`, and it defeats the memberwise-initializer mechanism by construction: a
+    /// stored property with an initial value is not a required parameter, so Guard 1's technique
+    /// would not fire. `Mirror` DOES see it, because it is still a stored property.
+    ///
+    /// So this guard asserts both, and the `Mirror` half is the load-bearing one:
+    ///   * the memberwise initializer takes exactly these three arguments, and
+    ///   * the span has exactly three stored properties at runtime.
+    ///
+    /// Proven to bite in round 8 by planting exactly that defaulted field. What the plant showed,
+    /// stated as measured rather than as expected: the NEGATIVE CONTROL DID NOT CATCH IT --
+    /// `MeetingSeamCannotNameAsrManagerAttack.swift` passed with all nine markers `ok`, because a
+    /// control can only attempt fields it NAMES, and a newly added field is by definition not one
+    /// of them. This test was the only thing that failed, and only its `children.count == 3`
+    /// assertion. That is the division of labour between the two mechanisms: the control proves
+    /// the fields that exist today cannot yield a manager; this guard is what notices a new field
+    /// at all. Verbatim output in the round-8 report.
+    @Test("a token span has exactly three stored fields, and they are the three value fields")
+    func tokenSpanStoredSurfaceIsExactlyThreeValueFields() {
+        let span = MeetingTokenSpan(token: "t", start: 0, end: 1)
+
+        let children = Array(Mirror(reflecting: span).children)
+        #expect(children.count == 3)
+        #expect(children.map(\.label) == ["token", "start", "end"])
+
+        // Value-ness, kept from round 7. Weak on its own -- a manager can be smuggled behind a
+        // hand-written `==` -- so it supports the count assertion rather than standing alone.
+        #expect(span == MeetingTokenSpan(token: "t", start: 0, end: 1))
+    }
+
+    /// GUARD 4 -- the receipt's own stored surface and value-ness.
+    @Test("the receipt has exactly three stored fields and is a value type")
     func receiptIsAValueTypeAllTheWayDown() {
         let a = MeetingChunkTranscription(text: "x", duration: 1, tokenSpans: nil)
         let b = MeetingChunkTranscription(text: "x", duration: 1, tokenSpans: nil)
         #expect(a == b)
 
-        let span = MeetingTokenSpan(token: "t", start: 0, end: 1)
-        #expect(span == MeetingTokenSpan(token: "t", start: 0, end: 1))
+        let children = Array(Mirror(reflecting: a).children)
+        #expect(children.count == 3)
+        #expect(children.map(\.label) == ["text", "duration", "tokenSpans"])
     }
 
-    /// WHAT NONE OF THESE CATCH, recorded here rather than left to be discovered.
+    /// WHAT NONE OF THESE CATCH. This is a real gap in automated coverage, it FAILS OPEN, and
+    /// `MeetingAsrSharing.swift` now says so in the same words -- round 7 had that file claiming
+    /// "a new member fails closed" while this file admitted the opposite two screens away. The
+    /// comment was the wrong one, and it has been narrowed to STORED properties.
     ///
-    /// A COMPUTED member or method added to `MeetingAsrRuntimeAccess` in an extension --
-    /// `var liveManager: AsrManager { ... }` -- is caught by none of the guards above. `Mirror`
-    /// does not see computed properties, the memberwise initializer does not gain a parameter,
-    /// and no exhaustiveness rule applies to a type's method list. Swift offers no cheap
-    /// structural way to assert "this type has no other members".
+    /// A COMPUTED member or method added to any of these types in an extension --
+    /// `extension MeetingAsrRuntimeAccess { var liveManager: AsrManager { ... } }` -- compiles,
+    /// and no guard above fires. `Mirror` does not see computed properties, the memberwise
+    /// initializer gains no parameter, and Swift has no exhaustiveness rule over a method list.
     ///
-    /// This is why the claim in `MeetingAsrSharing.swift` is scoped to what the capability's
-    /// declared RETURN TYPES can yield, rather than to the whole member surface. That claim stays
-    /// true regardless of what members exist, because every member would still have to return
-    /// something, and a manager-returning member is the thing a reviewer would have to catch.
-    /// Stated plainly rather than papered over: this is a real gap in automated coverage.
-    @Test("documented gap: a computed manager-returning member would not be caught structurally")
+    /// An AST/source-signature guard over the complete declaration surface would close it. Mark
+    /// ruled that out for this PR: it is bespoke test infrastructure whose own correctness would
+    /// then need verifying, it rots silently when the source layout changes, and nothing in
+    /// production constructs this coordinator yet. The gap is therefore carried as **WIRING GATE
+    /// item 7 in FOLLOWUPS.md, OPEN**, to be re-checked before anything wires this seam -- not
+    /// only as a comment, because a comment is exactly what a future reader skims past.
+    @Test("documented gap: a computed manager-returning member FAILS OPEN and is wiring-gate item 7")
     func documentedGapComputedMembersAreNotStructurallyGuarded() {
         // Nothing to assert; the value of this case is that the gap is named in the suite rather
         // than only in a comment, so it shows up when someone reads the test list.

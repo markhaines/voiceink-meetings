@@ -265,7 +265,31 @@ since that is very unlikely to be the same queue. Not built here — this file o
 protocol seam and reads through it; the synchronization is the integration owner's to add when
 wiring the real classifier in.
 
-## Real-audio / real-model smoke testing is a PREREQUISITE to wiring the meeting transcription seam, not optional
+# ⛔ WIRING GATE: what must be true BEFORE a composition root constructs this coordinator
+
+**Nothing in production constructs `MeetingTranscriptionCoordinator` today.** `MeetingEngine`
+still defaults to `NullMeetingTranscriptionCoordinator`, and that is correct for now: the seam and
+its adapters have never run against a real model or real audio on any machine, because neither
+exists in the environment they were built in.
+
+This section exists so that state cannot be left by accident. **Do not wire this seam until every
+item below is resolved.** Each is a link to the full entry; none is a nice-to-have.
+
+| # | Prerequisite | Status | Why it blocks wiring |
+|---|---|---|---|
+| 1 | Real-audio / real-model smoke testing of all three adapters | **OPEN** | No adapter has ever executed a real model load or a real inference. Compilation and fake-driven tests are the only evidence that exists. |
+| 2 | B2 residual: the admission-to-inference window (below) | **OPEN** | A dictation Mark starts in that window still queues behind a meeting chunk. Closing it needs shared admission with the dictation path, which is an upstream change nobody has authorised. |
+| 3 | A dictation-priority closure that is actually correct | **OPEN** | `MeetingAsrRuntimeAccess.isDictationActiveOrPending` has no default by design. Admission is only as good as what the composition root passes; passing `{ false }` silently disables item 2's mitigation entirely. |
+| 4 | transcribe.cpp concurrent-session safety | **OPEN** | Unlike FluidAudio, that path runs meeting and dictation inference concurrently rather than serialised, and whether that is safe or affordable on a 16GB M2 Pro is unmeasured. |
+| 5 | A diarizer `loadOperationTimeout` chosen from data | **OPEN** | The 30s default was picked without a single real-hardware measurement of how long `DiarizerModels.load` actually takes. |
+
+Items 2, 3 and 4 all reduce to the same exposure and the same person's daily flow: **Mark dictates
+with local Parakeet every day, and none of the mitigations above have been measured against real
+inference times.** A meeting chunk that degrades costs one chunk's segment timings. A dictation
+that stalls costs him the thing he was in the middle of saying. That asymmetry is why this gate is
+a gate and not a checklist.
+
+## GATE ITEM 1 -- Real-audio / real-model smoke testing
 
 `FluidAudioMeetingSegmentTranscriber`, `TranscribeCppMeetingSegmentTranscriber`, and
 `FluidAudioMeetingDiarizer` (`Features/Meetings/Transcription/`) compile against the real
@@ -298,6 +322,45 @@ the actual models downloaded:
 
 None of this can be substituted with more unit tests against injected fakes — the whole point is
 verifying the REAL backend/model behavior the fakes stand in for.
+
+## GATE ITEM 2 -- B2 residual: one `await` still separates admission from inference
+
+Source: `VoiceInk/Features/Meetings/Transcription/FluidAudioMeetingSegmentTranscriber.swift`
+(`transcribe(chunkAt:)`, `reconfirmDictationIsIdle()`).
+
+**The exact remaining suspension.** After round 5's reordering, `transcribe(chunkAt:)` runs:
+
+1. `await admitAndBorrow()` — hop to `@MainActor`: early priority check + borrow, no `await`
+   between those two statements.
+2. `await manager.decoderLayerCount` — hop into the `AsrManager` actor and back. **Hoisted above
+   the final check in round 5**; round 4 had it below, which is the window review found.
+3. `await reconfirmDictationIsIdle()` — hop to `@MainActor`: the final admission decision.
+4. `await manager.transcribe(url, decoderState:&decoderState)` — **the residual.** One hop, from
+   `@MainActor` into the `AsrManager` actor.
+
+Nothing else suspends between (3) and (4): `TdtDecoderState.make(decoderLayers:)` is a synchronous
+static function on a `Sendable` struct.
+
+**The interleaving that loses.** Our task resumes on `@MainActor` at (3) having decided dictation
+is idle, then calls `transcribe`, which enqueues work on the `AsrManager` actor. If a dictation
+enqueues on that same actor after our check returned but before our call lands, the dictation is
+behind us in the actor's queue and runs second.
+
+**The user-visible consequence.** Mark starts a dictation in that window and it does not begin
+transcribing until the meeting chunk's inference finishes. Latency, not corruption: no data is
+lost and no model is evicted. The magnitude is one chunk's inference time, **which has never been
+measured** (gate item 1).
+
+**Why it cannot be closed from this side.** The check runs on `@MainActor`; the inference runs on
+the `AsrManager` actor. Any sequence that decides in one isolation domain and acts in another has
+a gap between them, and no reordering within this file removes it — round 5 already hoisted
+everything hoistable, which is why exactly one `await` remains rather than three. Closing it means
+making the admission decision *inside* the actor that serialises both flows, i.e. **shared
+admission with the dictation path**. That is a change to code this fork merges from a
+daily-pushed upstream forever, so it is deliberately **not attempted here**: it is Mark's call.
+
+**HARD PREREQUISITE.** Do not wire this coordinator until this is either closed by shared
+admission or explicitly accepted by Mark with a measured inference time in hand.
 
 ## The meeting transcription seam cannot load a Parakeet model, only borrow one
 
@@ -409,27 +472,6 @@ file does not reach around the capability to fetch the service itself.
 **Would need revisiting** if the meeting seam ever grows a second component that needs the
 service, at which point the right move is probably to ask for a third upstream touchpoint and
 make `cleanup()` `private` with an explicit lifecycle owner, rather than widen the capability.
-
-## The dictation-priority check cannot preempt an in-flight meeting chunk
-
-Source: `VoiceInk/Features/Meetings/Transcription/FluidAudioMeetingSegmentTranscriber.swift`
-(`admitAndBorrow`).
-
-B4.2's admission control guarantees a meeting chunk never STARTS inference while dictation is
-active or pending: the priority read and the borrow are two synchronous statements in one
-`@MainActor` step, and `VoiceInkEngine` starts a dictation on `@MainActor`, so there is no window
-between them rather than a narrow one.
-
-It cannot PREEMPT. If dictation starts after `manager.transcribe` is already running for a chunk,
-that dictation queues behind it, because `AsrManager` is an actor and serializes them. The
-exposure is one chunk's inference time, and **that duration has never been measured** on real
-hardware with real models -- it is listed with the other real-audio smoke-test prerequisites
-above. Preempting would need cancellation support inside FluidAudio's own inference, which this
-fork does not have and cannot add from outside.
-
-Also worth stating: the check is only as good as the closure a composition root supplies. There
-is deliberately no default (a negative control asserts that omitting it does not compile), so
-choosing what "dictation is busy" means is a decision someone has to make explicitly.
 
 ## B4.2's dictation-priority admission is FluidAudio-only, and transcribe.cpp's exposure is different and unverified
 

@@ -1,11 +1,11 @@
 // Fork-owned (no donor equivalent). Not a port.
 //
 // Direct FluidAudio integration for the meeting transcription seam (`DECISION-transcription-seam.md`,
-// Option (ii)). It does not load models and it does not hold the concrete transcription service.
-// It holds one capability, `MeetingAsrManagerBorrowing` (see `MeetingAsrSharing.swift`), plus a
-// dictation-priority check.
+// Option (ii)). It does not load models and it cannot name the concrete transcription service. It
+// holds one value, `MeetingAsrRuntimeAccess` (see `MeetingAsrSharing.swift`): two closures, and
+// nothing else.
 //
-// FOUR ROUNDS OF REVIEW GOT IT HERE, and the history is kept because each round's mistake is a
+// FIVE ROUNDS OF REVIEW GOT IT HERE, and the history is kept because each round's mistake is a
 // live hazard for whoever edits this next:
 //   * Round 1 loaded its own independent `AsrManager` + Parakeet models, permanently doubling
 //     model memory on Mark's 16GB M2 Pro.
@@ -16,25 +16,36 @@
 //     calls "serialized on the same executor"; it does not, because all of those methods suspend.
 //   * Round 3 removed the version argument and the suspension point, which held. Its third
 //     claimed reason ("it calls nothing ... those remain private") was FALSE: `cleanup()` is
-//     internal, so this file could have compiled `service.cleanup()`. Fixed in round 4 by holding
-//     a capability instead of the class.
-//   * Round 4 also closed what sharing the actor had opened: `AsrManager` is a `public actor`, so
-//     a meeting chunk already inside `transcribe` makes a dictation started a moment later QUEUE
-//     BEHIND it. Not memory this time, latency, against the same thing memory was protecting.
+//     internal, so this file could have compiled `service.cleanup()`.
+//   * Round 4 replaced the concrete service with `any MeetingAsrManagerBorrowing`. ALSO FALSE:
+//     an existential downcasts back, so `borrowing as? FluidAudioTranscriptionService` followed
+//     by `cleanup()` compiled with zero diagnostics. Round 5 replaced it with a struct of
+//     closures, which has no concrete type to recover and no members to call.
+//   * Round 4 also opened, and round 5 tightened, the latency exposure below.
 //
 // DICTATION-PRIORITY ADMISSION -- what it guarantees, and what it does NOT:
-//   * GUARANTEED: a meeting chunk never STARTS inference while dictation is active or pending.
-//     `admitAndBorrow()` reads the priority check and takes the manager in ONE synchronous
-//     `@MainActor` step, with no `await` between them. `VoiceInkEngine` starts a dictation on
-//     `@MainActor`, so dictation cannot flip from idle to active inside that step. This is not a
-//     narrowed race; there is no window.
-//   * NOT GUARANTEED, and this is the honest limit: it cannot PREEMPT. If dictation starts after
-//     a chunk's `manager.transcribe` is already running, that dictation still queues behind it.
-//     The exposure is one chunk's inference, and its real duration has never been measured on
-//     real hardware with real models -- FOLLOWUPS.md carries that as a smoke-test prerequisite,
-//     not as a number I am guessing at here.
-//   * NOT GUARANTEED: the check is only as good as the closure a composition root supplies. There
-//     is no default, so that is a decision someone has to make, not one this file makes quietly.
+//   * WHY IT EXISTS: `AsrManager` is a `public actor`, so meeting and dictation inference are
+//     mutually serialized. A meeting chunk already inside `transcribe` makes a dictation started
+//     a moment later QUEUE BEHIND it. Not memory this time, latency, against the same daily flow
+//     memory was protecting.
+//   * GUARANTEED: the priority check is the LAST thing this file does before entering inference.
+//     Round 4 checked, then read `await manager.decoderLayerCount` -- a hop into the `AsrManager`
+//     actor and back -- and only then called `transcribe`, so a dictation starting inside that
+//     round trip still lost. Round 5 hoists that read to BEFORE the final check
+//     (`reconfirmDictationIsIdle()`), so exactly one `await` remains between deciding and
+//     starting: the hop into `transcribe` itself.
+//   * NOT GUARANTEED, stated plainly rather than argued away: that remaining hop is a real
+//     window. A dictation that enqueues on the `AsrManager` actor between our check returning
+//     and our `transcribe` call landing still queues behind this chunk. It CANNOT be closed from
+//     this side: closing it means deciding admission inside the actor that serializes both
+//     flows, which is shared admission with the dictation path -- a change to upstream code this
+//     fork merges from daily, and Mark's call, not this file's. FOLLOWUPS.md carries it as a
+//     HARD PREREQUISITE to wiring, not a nice-to-have.
+//   * NOT GUARANTEED: it cannot PREEMPT. A dictation starting after `transcribe` is already
+//     running waits for that chunk. The exposure is one chunk's inference, whose real duration
+//     has never been measured on real hardware with real models.
+//   * NOT GUARANTEED: the check is only as good as the closure a composition root supplies.
+//     There is no default, so that is a decision someone has to make, not one this file makes.
 //
 // Refusal is cheap on purpose. Both refusal cases raise a `MeetingSegmentTranscriberError` that
 // `MeetingTranscriptionCoordinator` routes to its flat-fallback path, so the cost is losing
@@ -66,30 +77,27 @@ enum MeetingSegmentTranscriberError: Error, Equatable {
 }
 
 actor FluidAudioMeetingSegmentTranscriber: MeetingSegmentTranscribing {
-    private nonisolated let borrow: MeetingAsrManagerBorrow
-    private nonisolated let isDictationActiveOrPending: MeetingDictationPriorityCheck
+    private nonisolated let access: MeetingAsrRuntimeAccess
 
-    /// `@MainActor` because both stored capabilities are `@MainActor` closures and this is where
-    /// the borrow one is formed -- and because the composition root that builds this lives on
-    /// `@MainActor` anyway (`TranscriptionServiceRegistry` is `@MainActor`).
+    /// `@MainActor` because both of the capability's closures are `@MainActor`, and because the
+    /// composition root that will build this lives there anyway (`TranscriptionServiceRegistry`
+    /// is `@MainActor`).
     ///
-    /// The parameter is `any MeetingAsrManagerBorrowing`, so inside this initializer the only
-    /// member of the transcription service that can be NAMED is `borrowedAsrManager()`. That is
-    /// where B4.1 is enforced: `cleanup()` is not a member of this type.
-    ///
-    /// No default for `isDictationActiveOrPending`, deliberately: a composition root must decide
-    /// what "dictation is busy" means rather than inherit a permissive default that silently
-    /// disables B4.2's admission control.
+    /// The parameter is a `MeetingAsrRuntimeAccess` VALUE, not a protocol existential over the
+    /// transcription service. That is where B1 is enforced in round 5: no concrete type is
+    /// carried in, so there is nothing here for `as?` to recover. Stated exactly, because the
+    /// looser version of this sentence is what round 4 shipped and review defeated:
+    /// `as? FluidAudioTranscriptionService` against this value still COMPILES, as a cast the
+    /// compiler proves "always fails"; it returns nil rather than a service. `cleanup()` is not
+    /// nameable in this file by any route the attack suite has found, and the suite now contains
+    /// the downcast it was missing.
     @MainActor
-    init(
-        borrowing: any MeetingAsrManagerBorrowing,
-        isDictationActiveOrPending: @escaping MeetingDictationPriorityCheck
-    ) {
-        self.borrow = { borrowing.borrowedAsrManager() }
-        self.isDictationActiveOrPending = isDictationActiveOrPending
+    init(access: MeetingAsrRuntimeAccess) {
+        self.access = access
     }
 
     func transcribe(chunkAt url: URL) async throws -> SpeechTranscriptionResult {
+        // (1) Cheap early refusal: if dictation is already busy, do not touch the actor at all.
         let manager: AsrManager
         switch await admitAndBorrow() {
         case .dictationHasPriority:
@@ -100,10 +108,30 @@ actor FluidAudioMeetingSegmentTranscriber: MeetingSegmentTranscribing {
             manager = borrowed
         }
 
-        var decoderState = TdtDecoderState.make(decoderLayers: await manager.decoderLayerCount)
-        // `AsrManager.transcribe(_:decoderState:language:)` reads and (for large files)
-        // disk-backs the URL itself -- never routes through `AudioFileProcessor`, which would
-        // load the whole chunk into a `[Float]` up front.
+        // (2) Every suspension this method needs BEFORE its final admission decision. Reading
+        //     `decoderLayerCount` is a hop into the `AsrManager` actor and back; round 4 did it
+        //     AFTER the check, which is exactly the window the reviewer found. Nothing below
+        //     this line and above `transcribe` suspends: `TdtDecoderState.make` is a synchronous
+        //     static function on a `Sendable` struct.
+        let decoderLayers = await manager.decoderLayerCount
+
+        // (3) The decision, as late as it can possibly be made from outside the actor.
+        guard await reconfirmDictationIsIdle() else {
+            throw MeetingSegmentTranscriberError.dictationHasPriority
+        }
+
+        // Synchronous: `TdtDecoderState.make` is a static function on a `Sendable` struct, so
+        // this adds no suspension between the decision above and the call below.
+        var decoderState = TdtDecoderState.make(decoderLayers: decoderLayers)
+
+        // (4) The ONE remaining `await` between deciding and starting inference -- this line.
+        //     It is a real window, not a closed one: a dictation that enqueues on the
+        //     `AsrManager` actor after step (3) returned but before this call lands runs second.
+        //     Disclosed, not argued away; see this file's header and FOLLOWUPS.md gate item 2.
+        //
+        //     `AsrManager.transcribe(_:decoderState:language:)` reads and (for large files)
+        //     disk-backs the URL itself -- never routes through `AudioFileProcessor`, which
+        //     would load the whole chunk into a `[Float]` up front.
         let result = try await manager.transcribe(url, decoderState: &decoderState)
         return SpeechTranscriptionResult(
             text: result.text,
@@ -146,16 +174,26 @@ actor FluidAudioMeetingSegmentTranscriber: MeetingSegmentTranscribing {
         case noModelLoaded
     }
 
-    /// The whole of this file's contact with dictation's runtime, and the reason the admission
-    /// decision has no race: the priority read and the borrow are two synchronous statements in
-    /// one `@MainActor` step, with no `await` between them, so no dictation can begin in between.
-    /// `borrowedAsrManager()` is itself non-`async` and argument-less, so this step cannot load,
-    /// evict, or switch anything -- and `borrow` is a closed-over capability, not the concrete
-    /// service, so `cleanup()` and friends are not nameable here at all. A closure has no members.
+    /// This file's only contact with dictation's runtime, and the reason the EARLY decision has
+    /// no race: the priority read and the borrow are two synchronous statements in one
+    /// `@MainActor` step with no `await` between them, so no dictation can begin in between.
+    /// `borrowLoadedManager` cannot load, evict or switch anything -- it is argument-less and
+    /// non-suspending -- and it is a closure, so there is no concrete service to recover from it.
     @MainActor
     private func admitAndBorrow() -> Admission {
-        if isDictationActiveOrPending() { return .dictationHasPriority }
-        guard let borrowed = borrow() else { return .noModelLoaded }
+        if access.isDictationActiveOrPending() { return .dictationHasPriority }
+        guard let borrowed = access.borrowLoadedManager() else { return .noModelLoaded }
         return .granted(borrowed.manager)
+    }
+
+    /// The final admission decision, taken after every other suspension this method needs, so
+    /// that only the hop into `transcribe` separates it from inference starting.
+    ///
+    /// It re-reads rather than trusting the earlier one because a dictation may have started
+    /// during step (2)'s round trip into the `AsrManager` actor -- which is precisely the
+    /// interleaving round 4 lost. It does NOT make the sequence atomic; see the header.
+    @MainActor
+    private func reconfirmDictationIsIdle() -> Bool {
+        !access.isDictationActiveOrPending()
     }
 }

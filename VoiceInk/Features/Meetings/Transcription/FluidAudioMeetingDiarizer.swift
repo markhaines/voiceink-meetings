@@ -57,7 +57,7 @@
 //   * The production initializer supplies real `DiarizerModels`.
 //   * The injectable initializer takes `() async throws -> Void` and always yields `nil` models.
 //     Its parameter type cannot express "here is a manager", so a caller cannot supply one,
-//     whatever their intent. `FluidAudioSharedModelAttacks.swift` asserts the old
+//     whatever their intent. `MeetingDiarizerSeamManagerInjectionAttack.swift` asserts the old
 //     manager-returning initializer no longer compiles.
 //   * The actor constructs every `DiarizerManager` itself, inside `finishLoad`, on the actor,
 //     from models. `DiarizerModels` is FluidAudio's own `public struct ... Sendable` whose

@@ -3209,6 +3209,14 @@ it, and they fired first time (full verifier output quoted under GATES):
     ok  line 75: cannot convert value of type 'any MeetingAsrManagerBorrowing' to specified type 'FluidAudioTranscriptionService'
 ```
 
+> **RETRACTED by fix round 5 — these diagnostics are real, and the guarantee they were offered as
+> evidence for was FALSE.** All three attacks pass, and the boundary was still defeated, because
+> the list did not contain a downcast. Line 75 is the tell: it tests COERCION
+> (`let _: FluidAudioTranscriptionService = borrowing`), which errors, while the sibling form
+> `borrowing as? FluidAudioTranscriptionService` compiled with zero diagnostics and reached
+> `cleanup()`. Round 4 read a green suite as a proven boundary when it was only a proven list.
+> See "Fix round 5" below for the replacement design and the split, one-mechanism-per-file suite.
+
 **Why the bad state is impossible rather than unlikely:** eviction is not a call the seam is
 allowed to fail to make; it is a call that does not type-check where the seam lives. The
 protocol and the closure are the entire surface, and both are checked by the compiler on every CI
@@ -3344,6 +3352,145 @@ inferred from a quiet build: the shape was type-checked standalone under
 `swiftc -swift-version 5 -strict-concurrency=complete`, which reports the existential version and
 accepts the closure version with no diagnostics. The closure is also strictly narrower than the
 protocol, since a closure has no members at all.
+
+### Fix round 5 (cross-vendor review of fix round 4: B1, B2)
+
+Round 4 was accepted on the diarizer ceiling (with its cancellation-blind fixture and the round-2
+control), on `MeetingEngine.stop()` no longer being able to hang, on removing the module-wide
+`extension DiarizerManager: @unchecked Sendable`, on `borrowModel`'s release discipline, on the
+naive-killer test and on fallback timestamp safety. None of that is touched here.
+
+Two findings remained. Both were verified against the real code before anything was changed,
+because a claim from a reviewer is a hypothesis, not a fact — and on this branch the last four
+rounds have each shipped at least one comment whose text outran what the code did.
+
+#### B1 — the capability boundary was defeated by a downcast. CONFIRMED, then fixed.
+
+**Verification first.** The claim was built, not read. A probe file was staged into the app target
+and compiled with a full `xcodebuild`:
+
+```swift
+@MainActor
+func probeDowncast(borrowing: any MeetingAsrManagerBorrowing) async {
+    if let concrete = borrowing as? FluidAudioTranscriptionService {
+        await concrete.cleanup()
+    }
+}
+```
+
+```
+=== BUILD EXIT: 0 (0 = THE ATTACK COMPILED) ===
+=== diagnostics against __Probe.swift ===
+=== other errors ===
+```
+
+Zero diagnostics. The finding reproduces exactly: an existential carries its concrete type and
+hands it back to anyone who writes `as?`, so round 4's "`cleanup()` is not a member of this type"
+was true of the protocol and false of what a holder of the protocol could do. Round 4's own
+attack suite tested *coercion* (`let _: FluidAudioTranscriptionService = borrowing`), which
+errors, and never tested the downcast beside it.
+
+**The fix: a value, not an existential.** `MeetingAsrRuntimeAccess` is a `struct` whose only
+stored properties are two `@MainActor @Sendable` closures. `FluidAudioMeetingSegmentTranscriber`
+takes and stores that value. There is no protocol existential to downcast, no class reference to
+recover, and no member to call but the capability itself. The protocol
+`MeetingAsrManagerBorrowing` and its retroactive conformance are DELETED, so the type that
+carried the concrete service no longer exists anywhere in the seam.
+
+**Why the unsafe call cannot be expressed**, mechanism by mechanism, each verified by compiling
+it (full list and verbatim diagnostics under GATES below):
+
+- `access as? FluidAudioTranscriptionService` and `access as!` — a struct and a class are
+  unrelated types, so the compiler does not merely fail to find a conversion, it **proves the cast
+  can never succeed**: `cast from 'MeetingAsrRuntimeAccess' to unrelated type
+  'FluidAudioTranscriptionService' always fails`.
+- `access.cleanup()` / `access.loadModel(for:)` — `value of type 'MeetingAsrRuntimeAccess' has no
+  member 'cleanup'` / `... has no member 'loadModel'`.
+- `let _: FluidAudioTranscriptionService = access` — `cannot convert value of type ... to
+  specified type ...`.
+- Downcasting the closure itself, which is the field that actually captures the service —
+  `cast from 'MeetingAsrManagerBorrow' (aka '@MainActor @Sendable () -> ...') to unrelated type
+  'FluidAudioTranscriptionService' always fails`.
+
+**What COMPILES, disclosed rather than argued away.** Three attack classes are legal Swift against
+any value and are not prevented:
+
+1. **`as?` / `as!` themselves compile** — they produce a warning, not an error, so the build
+   succeeds. They cannot *succeed*: the compiler statically proves they always fail, `as?` yields
+   nil and `as!` traps. The controls for these run in a new `must-warn` verifier mode that asserts
+   the "always fails" diagnostic is PRESENT, precisely because its disappearance is what a
+   regression to an existential would look like.
+2. **`Mirror`, extensions and type-erased generic casts compile.** Their safety is a runtime
+   property, so it is asserted at runtime in
+   `Tests/.../MeetingCapabilityReflectionAttackTests.swift` rather than left as an argument.
+   Measured result: `Mirror` yields the two closures as **empty tuples** — the Swift runtime
+   cannot even demangle a `@MainActor @Sendable` closure type — so neither a one-level walk nor a
+   recursive one to depth 8 ever reaches the captured service.
+3. **`unsafeBitCast` and raw memory are NOT defended against**, and no test pretends otherwise.
+   The closures genuinely do capture the service in their context, so reconstructing an
+   undocumented closure-context layout would reach it. That is a cost, not a defence. It is
+   recorded the same way FOLLOWUPS.md already records it for `MeetingStore`.
+
+**And what stays CONVENTIONAL, said as such.** `MeetingAsrSharing.swift` itself names
+`FluidAudioTranscriptionService`, in one function,
+`MeetingAsrRuntimeAccess.sharingDictationRuntime(of:isDictationActiveOrPending:)`. Minting a
+capability from a service is what an adapter is for, and authority is delegated at exactly one
+place rather than nowhere. `cleanup()` remains `internal`, so code that already holds the concrete
+service can still call it — that is dictation's own lifecycle API and making it `private` would be
+a change to upstream code beyond this PR's authorised touchpoints. What round 5 changed is that
+the meeting seam is no longer such code, and can no longer *become* such code by writing `as?`.
+
+#### B2 — scoped down per Mark's ruling: hoist what can be hoisted, disclose the rest.
+
+**Verification first.** `decoderLayerCount` is a `public var` on `public actor AsrManager`
+(FluidAudio `AsrManager.swift:24`), so reading it from outside genuinely requires `await` and is a
+suspension. The finding reproduces.
+
+**(a) What was closed, at zero cost.** Round 4 ran: check → `await manager.decoderLayerCount` →
+`await manager.transcribe(...)`. The `decoderLayerCount` read is a full round trip into the
+`AsrManager` actor and back, sitting *between* the decision and the inference. Round 5 hoists it
+ABOVE the final check and adds `reconfirmDictationIsIdle()` immediately before `transcribe`, so
+the ordering is now: early check + borrow → `decoderLayerCount` → **final check** → `transcribe`.
+
+**Every remaining `await` between the final check and inference: exactly one.** It is
+`await manager.transcribe(url, decoderState: &decoderState)` — the hop from `@MainActor` into the
+`AsrManager` actor. Nothing else suspends in between:
+`TdtDecoderState.make(decoderLayers:)` is a synchronous static function on a `Sendable` struct
+(FluidAudio `TdtDecoderState.swift:52`), and the local `var decoderState` is a plain assignment.
+
+**(b) What was NOT attempted.** Shared admission with the dictation path. Per Mark's explicit
+scope ruling, that is a materially larger change into code this fork merges from a daily-pushed
+upstream, and is his call.
+
+**(c) The residual, recorded as a HARD PREREQUISITE.** FOLLOWUPS.md's new `⛔ WIRING GATE` carries
+it as gate item 2, with the exact suspension, the losing interleaving (a dictation enqueues on the
+`AsrManager` actor after our check returned but before our `transcribe` lands, so it queues
+behind the chunk), the user-visible consequence (latency on a dictation Mark starts mid-chunk;
+no data loss, no eviction), and the statement that closing it requires shared admission.
+
+#### The not-wired status, made hard to lose
+
+Nothing in production constructs this coordinator; `MeetingEngine` still defaults to
+`NullMeetingTranscriptionCoordinator`. FOLLOWUPS.md now opens that region with a single
+`⛔ WIRING GATE` heading and a five-row table: real-model smoke testing, the B2 residual, a
+dictation-priority closure that is actually correct (passing `{ false }` silently disables
+admission entirely), transcribe.cpp concurrent-session safety, and a diarizer timeout chosen from
+data rather than picked. A future session cannot wire this without reading it.
+
+#### Verifier changes, and the check that it still fails correctly
+
+The single `FluidAudioSharedModelAttacks.swift` is gone, replaced by **one mechanism per file** —
+eight files, each compiled in its own build, so no attack can borrow another's diagnostics or
+another's conformances. Three verifier changes:
+
+- A `must-warn` mode, for controls whose diagnostic is a warning rather than an error.
+- A guard rejecting markers of the wrong kind for the mode, so an `expect-error` in a `must-warn`
+  file cannot sit there unchecked and read as coverage.
+- A same-line-collision check: two markers expecting diagnostics on the SAME line are rejected,
+  because one diagnostic would satisfy both. Duplicate marker TEXT on DIFFERENT lines is reported
+  as a note and allowed, because matching is line-anchored —
+  `MeetingStoreIsolationAttacks.swift` relies on that deliberately (A3 and A14 produce identical
+  text) and its header already records why.
 
 ### GATES
 

@@ -15,7 +15,7 @@
 // about the real path.
 //
 // The structural half that IS proven elsewhere, and is much stronger than this scan:
-// `scripts/negative-controls/FluidAudioSharedModelAttacks.swift` is compiled into the app target
+// the `scripts/negative-controls/` attack files are compiled into the app target
 // on every CI run and MUST NOT COMPILE. That is a compiler-enforced statement that the
 // eviction-capable methods on `FluidAudioTranscriptionService` are unreachable, which no amount
 // of text scanning could establish. This file covers the complementary, weaker question of
@@ -52,7 +52,7 @@ struct SharedModelDuplicationTests {
         // no version to pass, so the meeting seam cannot request a switch. Asserting the exact
         // no-argument call shape means reintroducing a parameterised accessor would fail here as
         // well as failing the negative control.
-        #expect(contents.contains("borrowing.borrowedAsrManager()"))
+        #expect(contents.contains("access.borrowLoadedManager()"))
     }
 
     @Test("TranscribeCppMeetingSegmentTranscriber.swift no longer constructs its own native Model or initializes backends itself")
@@ -91,12 +91,14 @@ struct SharedModelDuplicationTests {
         // B4.1. Round 3's third guarantee ("it calls nothing ... those remain private") was false
         // while this file stored `FluidAudioTranscriptionService`, because `cleanup()` is
         // internal. The enforced version of that guarantee is that the adapter is handed
-        // `any MeetingAsrManagerBorrowing` instead, whose surface is one getter -- see
-        // `scripts/negative-controls/FluidAudioSharedModelAttacks.swift`, which is the actual
-        // enforcement. This scan is the cheap tripwire for the storage type going back.
+        // a `MeetingAsrRuntimeAccess` VALUE instead -- see
+        // the `scripts/negative-controls/MeetingCapability*Attack.swift` files, which are the
+        // actual enforcement (round 5 split them one mechanism per file after a downcast attack
+        // that was simply absent from the old bundled suite defeated the round-4 boundary).
+        // This scan is only the cheap tripwire for the storage type going back.
         let contents = try Self.readFile("FluidAudioMeetingSegmentTranscriber.swift")
-        #expect(contents.contains("borrowing: any MeetingAsrManagerBorrowing"))
-        #expect(contents.contains("private nonisolated let borrow: MeetingAsrManagerBorrow"))
+        #expect(contents.contains("init(access: MeetingAsrRuntimeAccess)"))
+        #expect(contents.contains("private nonisolated let access: MeetingAsrRuntimeAccess"))
 
         let offenders = try Self.scanFile("FluidAudioMeetingSegmentTranscriber.swift", forSubstrings: [
             ": FluidAudioTranscriptionService",
@@ -121,7 +123,7 @@ struct SharedModelDuplicationTests {
         // glossing: the natural compile-time control ("assert `DiarizerManager` is not
         // `Sendable`") does not work in this target, which builds in the Swift 5 language mode
         // where a missing `Sendable` conformance is a warning, not an error. It was tried in
-        // `scripts/negative-controls/FluidAudioSharedModelAttacks.swift` and produced no
+        // `scripts/negative-controls/` as a sixth attack and produced no
         // diagnostic at all. So this catches the exact regression by name; it does not prove the
         // absence of every possible retroactive conformance.
         // The needle is anchored to a line start, for the same reason the transcribe-cpp scan

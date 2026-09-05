@@ -147,11 +147,21 @@ class FluidAudioTranscriptionService: TranscriptionService {
     //     version other than the one already loaded, so "the meeting requested a version
     //     switch" is not an expressible call.
     //   * It calls nothing. Not `ensureModelsLoaded`, not `getOrLoadModels`, not
-    //     `cleanupLoadedManagers`, not `cleanup()`. Those remain `private` to this file
-    //     (`cleanup()` is internal, but is dictation's own lifecycle API and is called from no
-    //     meeting file). `scripts/negative-controls/FluidAudioSharedModelAttacks.swift` is
-    //     compiled into the app target on every CI run and MUST NOT COMPILE, which is what
-    //     keeps that true rather than conventional.
+    //     `cleanupLoadedManagers`. Those are `private` to this file, and
+    //     `scripts/negative-controls/FluidAudioServicePrivateEvictionAttack.swift` is compiled
+    //     into the app target on every CI run and MUST NOT COMPILE, which is what keeps that
+    //     true rather than conventional.
+    //
+    // WHAT THIS ACCESSOR DOES NOT DO, corrected in fix round 5 because the previous wording of
+    // this very comment was the mistake: it does NOT stop a holder of THIS CLASS from calling
+    // `cleanup()`. That method is `internal`, not `private`, and rounds 3 and 4 both wrote a
+    // parenthetical here -- "is called from no meeting file" -- which is a convention sitting
+    // inside a paragraph claiming enforcement. Review defeated that twice. The actual defence
+    // lives on the other side of the seam and is not a property of this accessor at all: the
+    // meeting adapter is handed a `MeetingAsrRuntimeAccess` value (two closures, see
+    // `MeetingAsrSharing.swift`) and never the concrete service, so it cannot name `cleanup()`
+    // and cannot recover a reference that could -- not by member lookup, not by coercion, and
+    // not by `as?`, which is what defeated round 4's protocol-existential version.
     //
     // Consequence, deliberately accepted: the meeting seam is PINNED to whatever version
     // dictation already has loaded, and returns nil when nothing is loaded (the caller then

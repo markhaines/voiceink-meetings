@@ -338,3 +338,325 @@ whatever queue/thread actually detects a route change (e.g. a CoreAudio device-c
 since that is very unlikely to be the same queue. Not built here — this file only defines the
 protocol seam and reads through it; the synchronization is the integration owner's to add when
 wiring the real classifier in.
+
+# ⛔ WIRING GATE: what must be true BEFORE a composition root constructs this coordinator
+
+**Nothing in production constructs `MeetingTranscriptionCoordinator` today.** `MeetingEngine`
+still defaults to `NullMeetingTranscriptionCoordinator`, and that is correct for now: the seam and
+its adapters have never run against a real model or real audio on any machine, because neither
+exists in the environment they were built in.
+
+This section exists so that state cannot be left by accident. **Do not wire this seam until every
+item below is resolved.** None is a nice-to-have. Items 1 and 2 have their own `GATE ITEM`
+sections immediately below; item 4 has its own entry further down ("B4.2's dictation-priority
+admission is FluidAudio-only"); items 3 and 5 are covered in the per-file entries they name.
+
+| # | Prerequisite | Status | Why it blocks wiring |
+|---|---|---|---|
+| 1 | Real-audio / real-model smoke testing of all three adapters | **OPEN** | No adapter has ever executed a real model load or a real inference. Compilation and fake-driven tests are the only evidence that exists. |
+| 2 | B2 residual: the admission-to-inference window (below) | **OPEN** | A dictation Mark starts in that window still queues behind a meeting chunk. Closing it needs shared admission with the dictation path, which is an upstream change nobody has authorised. |
+| 3 | A dictation-priority closure that is actually correct | **OPEN** | `MeetingAsrRuntimeAccess.isDictationActiveOrPending` has no default by design. Admission is only as good as what the composition root passes; passing `{ false }` silently disables item 2's mitigation entirely. |
+| 4 | transcribe.cpp concurrent-session safety | **OPEN** | Unlike FluidAudio, that path runs meeting and dictation inference concurrently rather than serialised, and whether that is safe or affordable on a 16GB M2 Pro is unmeasured. |
+| 5 | A diarizer `loadOperationTimeout` chosen from data | **OPEN** | The 30s default was picked without a single real-hardware measurement of how long `DiarizerModels.load` actually takes. |
+| 6 | The capability must not expose an eviction-capable `AsrManager` | **CLOSED** by `MeetingAsrSharing.swift` in round 6 | Kept as a row rather than deleted, because the history is the point. Round 5's capability returned the live shared `AsrManager`, and `AsrManager.cleanup()` is ordinary public FluidAudio API that nils every loaded model: `access.borrowLoadedManager()?.manager.cleanup()` compiled from any meeting-side file with zero diagnostics. Closed by inversion — the capability now performs the transcription on the owning side and returns a fork-owned value receipt, so the meeting side never holds a manager. Enforced by `MeetingCapabilityReturnValueEvictionAttack.swift`, `MeetingReceiptMutatingApiAttack.swift` and `MeetingSeamCannotNameAsrManagerAttack.swift`. |
+| 7 | A computed manager-returning member on the seam's types would FAIL OPEN | **OPEN** | The guards enforce the STORED surface only: a new stored property or outcome case stops the build, but `extension MeetingAsrRuntimeAccess { var liveManager: AsrManager { ... } }` compiles and nothing catches it. `Mirror` does not see computed properties, the memberwise initializer gains no parameter, and Swift has no exhaustiveness rule over a method list. An AST/source-signature guard would close it and was deliberately NOT built (see below). **Re-read the seam's types for computed members before wiring.** |
+
+## The seam's error channel is not type-constrained (safe today by inspection)
+
+Source: `VoiceInk/Features/Meetings/Transcription/MeetingAsrSharing.swift`
+(`MeetingChunkTranscriptionOperation`).
+
+The capability's SUCCESS channel is constrained to fork-owned value types: the operation returns
+`MeetingChunkTranscriptionOutcome`, and negative controls destructure every payload to prove none
+of it is or contains an `AsrManager`. The ERROR channel has no equivalent constraint. The
+operation is `throws`, so it can throw `any Error`, and nothing in the type system stops a future
+error type from carrying a manager or the service across the seam.
+
+**Safe today, by inspection rather than by type.** Everything on the factory's path that can throw
+is `AsrManager.transcribe`, which throws FluidAudio's own `ASRError` and decoding errors; none of
+them embed the manager. Raised by cross-vendor review in round 7, which also found no current
+leaking path.
+
+**Deliberately not fixed.** Constraining it means a typed-throws boundary plus error mapping
+across the seam, which is a larger change than the residual justifies for a channel that is empty
+today. Recorded here so it is a decision rather than an oversight.
+
+**Would need revisiting** if the operation ever grows a second throwing call, or if a fork-owned
+error type is introduced on this path: at that point map errors to a fork-owned enum rather than
+letting `any Error` through.
+
+Item 7 is the honest residual of rounds 7 and 8. Round 7's production comment claimed "a new
+member" fails closed; that was true of STORED properties and false of computed ones, and the guard
+suite admitted as much in its own text while the comment did not. Both now say the same thing. The
+AST guard that would close it was ruled out for this PR as bespoke test infrastructure whose own
+correctness would need verifying, which rots when the source layout changes, on a coordinator
+nothing constructs yet: a precise narrow claim beats a broad one a future reader would trust
+further than it deserves. That trade is only acceptable *because* nothing is wired, which is
+exactly why it sits on this gate rather than in a comment.
+
+Item 6 is recorded as CLOSED rather than removed because four successive designs of that boundary
+were each defeated in one line, and the last one was defeated by an attack nobody had listed: the
+suite tested routes to the *service* while the capability handed out the *manager* through its own
+front door. A future editor who re-exposes any FluidAudio runtime object across this seam should
+see that history before deciding it is safe.
+
+Items 2, 3 and 4 all reduce to the same exposure and the same person's daily flow: **Mark dictates
+with local Parakeet every day, and none of the mitigations above have been measured against real
+inference times.** A meeting chunk that degrades costs one chunk's segment timings. A dictation
+that stalls costs him the thing he was in the middle of saying. That asymmetry is why this gate is
+a gate and not a checklist.
+
+## GATE ITEM 1 -- Real-audio / real-model smoke testing
+
+`FluidAudioMeetingSegmentTranscriber`, `TranscribeCppMeetingSegmentTranscriber`, and
+`FluidAudioMeetingDiarizer` (`Features/Meetings/Transcription/`) compile against the real
+FluidAudio/TranscribeCpp package APIs and pass `xcodebuild build-for-testing`, but NONE of their
+real model-loading/inference paths have ever run against real audio or real downloaded models —
+no Parakeet, transcribe-cpp, or diarizer models are present in the environment these were built
+in. Before any composition root constructs a real `MeetingTranscriptionCoordinator` and wires it
+into `MeetingEngine` (currently nothing does — see `FORK-PATCHES.md`'s
+`meeting-transcription-coordinator` section), the following must be run for real, on a Mac with
+the actual models downloaded:
+
+- **`.segment` timestamp support, per transcribe-cpp catalog model.** `segment-timing-design.md`
+  §B and `FORK-PATCHES.md` both flag this as unresolved: whether `cohereTranscribe` or
+  `senseVoiceSmall` (or both, or neither) actually populates `Transcript.segments` when asked for
+  `timestamps: .segment`, versus silently resolving to a coarser kind. Requesting `.segment` and
+  getting back an empty `segments` array is NOT a crash — it silently degrades to
+  `TranscribeCppMeetingSegmentTranscriber`'s own empty-segments fallback (one flat, zero-duration
+  segment) — so this needs an explicit real-audio check, not just "it didn't throw."
+- **Actual resource measurement**, now that B1's fix round shares the loaded model with
+  dictation instead of duplicating it: confirm on real hardware (ideally Mark's own 16GB M2 Pro)
+  that memory stays within an acceptable envelope for the actual model(s) wired in. (The
+  version-switch eviction race this bullet used to also ask about is CLOSED as of fix round 3 --
+  the meeting seam has no API that can request a version, so it cannot evict. See the
+  `borrowedAsrManager()` entries below and in `FORK-PATCHES.md` touchpoint 4.)
+- **`FluidAudioMeetingDiarizer`'s real `DiarizerModels.load`/`performCompleteDiarization` path**,
+  including a real timing measurement against the `loadOperationTimeout` default (30s) chosen
+  without any real-hardware data point for how long a genuine model load takes on Mark's
+  machine — the ceiling exists and is proven to bite (`FluidAudioMeetingDiarizerTests`), but
+  whether 30s is the RIGHT number, as opposed to just A number, is unverified.
+
+None of this can be substituted with more unit tests against injected fakes — the whole point is
+verifying the REAL backend/model behavior the fakes stand in for.
+
+## GATE ITEM 2 -- B2 residual: one `await` still separates admission from inference
+
+Source: `VoiceInk/Features/Meetings/Transcription/FluidAudioMeetingSegmentTranscriber.swift`
+(`transcribe(chunkAt:)`, `reconfirmDictationIsIdle()`).
+
+**Where this now lives (round 6).** The sequence moved from
+`FluidAudioMeetingSegmentTranscriber.transcribe(chunkAt:)` into the capability's operation in
+`MeetingAsrSharing.swift`, because the meeting side no longer holds an `AsrManager` to run it
+with. The property is PRESERVED and slightly improved: the whole sequence now runs on
+`@MainActor`, so the final check is a synchronous statement rather than needing its own hop, and
+round 5's `await reconfirmDictationIsIdle()` suspension is gone. Exactly one `await` still
+separates the final check from inference.
+
+**The exact remaining suspension.** The operation runs:
+
+1. Early priority check + borrow — both synchronous, on `@MainActor`, no `await` between them.
+2. `await manager.decoderLayerCount` — hop into the `AsrManager` actor and back. **Above the
+   final check**; round 4 had it below, which is the window review found then.
+3. The final admission decision — **synchronous** on `@MainActor` (round 5 needed an `await` here
+   to hop back; round 6 does not, because it never left).
+4. `await manager.transcribe(url, decoderState:&decoderState)` — **the residual.** One hop, from
+   `@MainActor` into the `AsrManager` actor.
+
+Nothing else suspends between (3) and (4): `TdtDecoderState.make(decoderLayers:)` is a synchronous
+static function on a `Sendable` struct.
+
+**The interleaving that loses.** Our task resumes on `@MainActor` at (3) having decided dictation
+is idle, then calls `transcribe`, which enqueues work on the `AsrManager` actor. If a dictation
+enqueues on that same actor after our check returned but before our call lands, the dictation is
+behind us in the actor's queue and runs second.
+
+**The user-visible consequence.** Mark starts a dictation in that window and it does not begin
+transcribing until the meeting chunk's inference finishes. Latency, not corruption: no data is
+lost and no model is evicted. The magnitude is one chunk's inference time, **which has never been
+measured** (gate item 1).
+
+**Why it cannot be closed from this side.** The check runs on `@MainActor`; the inference runs on
+the `AsrManager` actor. Any sequence that decides in one isolation domain and acts in another has
+a gap between them, and no reordering within this file removes it — round 5 already hoisted
+everything hoistable, which is why exactly one `await` remains rather than three. Closing it means
+making the admission decision *inside* the actor that serialises both flows, i.e. **shared
+admission with the dictation path**. That is a change to code this fork merges from a
+daily-pushed upstream forever, so it is deliberately **not attempted here**: it is Mark's call.
+
+**HARD PREREQUISITE.** Do not wire this coordinator until this is either closed by shared
+admission or explicitly accepted by Mark with a measured inference time in hand.
+
+## The meeting transcription seam cannot load a Parakeet model, only borrow one
+
+Source: `VoiceInk/Infrastructure/Providers/Transcription/FluidAudio/FluidAudioTranscriptionService.swift`
+(`borrowedAsrManager()`), `VoiceInk/Features/Meetings/Transcription/FluidAudioMeetingSegmentTranscriber.swift`.
+
+Fix round 3 for review finding B1 removed the meeting seam's ability to trigger a model load,
+because being able to load was exactly what let a meeting run `cleanupLoadedManagers()` --
+including `asrManager.cleanup()` -- underneath a live dictation. The accessor is now synchronous,
+argument-less and calls nothing, so the bad interleaving is not expressible rather than merely
+unlikely.
+
+**The cost, which is real and is a composition-root requirement, not a bug:** if dictation has no
+model loaded when a meeting chunk is transcribed, `FluidAudioMeetingSegmentTranscriber` throws
+`MeetingSegmentTranscriberError.sharedModelNotLoaded` and `MeetingTranscriptionCoordinator`
+degrades that chunk to its flat-fallback path (a single zero-duration segment, which
+`MicTurnNormalizer` sentence-splits). It never loads a model to rescue itself.
+
+**What the composition root must therefore do** when one is finally built (nothing constructs a
+non-Null coordinator today): ensure the user's selected FluidAudio model is loaded through the
+EXISTING dictation API, `FluidAudioTranscriptionService.loadModel(for:)`, at meeting start --
+exactly as `VoiceInkEngine` already does at recording start (`VoiceInkEngine.swift`, the
+`@MainActor` preload block after `scheduleVoiceInkRefinePreparation`). That call belongs on the
+dictation side of the seam, where a version switch is the user's own intent, not on the meeting
+side, where it is an eviction of somebody else's model.
+
+## Dictation can still evict a model a meeting is using (the deliberate asymmetry)
+
+Source: same files. B1's fix is one-directional on purpose. A meeting can no longer evict
+dictation's manager. Dictation switching models still runs `cleanupLoadedManagers()` and can nil
+the CoreML models out of an `AsrManager` a meeting chunk is mid-way through using.
+
+Not fixed, and not an oversight: protecting Mark's daily dictation outranks a meeting chunk, and
+the two outcomes are not comparable. A meeting chunk that fails degrades to the flat-fallback
+transcript and the recording is already persisted; a dictation that fails is the thing Mark was
+in the middle of saying. Closing the reverse direction properly would need a lease/refcount on
+`FluidAudioTranscriptionService`'s manager lifecycle (the shape `OfflineTranscribeCppService`
+already has via `activeTranscriptionCount`), which means changing existing upstream logic rather
+than adding to it -- past the authorised touchpoint budget, and a change that could make
+dictation's own model switch block on a meeting.
+
+**Would need revisiting** if meetings ever become a foreground feature people run for hours
+alongside heavy dictation use, at which point the lease is worth its upstream cost.
+
+## An expired diarizer load keeps running alongside its replacement -- CAPPED in round 4
+
+Source: `VoiceInk/Features/Meetings/Transcription/FluidAudioMeetingDiarizer.swift`
+(`expireLoad`, `finishLoad`, `maxOutstandingAbandonedLoads`).
+
+**This entry previously said "two model loads can be in flight at once" and that was an
+understatement, which review caught (B4.3).** A PERMANENTLY stuck load is abandoned and never
+returns, so under round 3 every later `MeetingEngine.stop()` could start yet another
+cancellation-blind CoreML load: unbounded accumulation of memory and CPU across a working day of
+meetings. The UUID quarantine prevented stale STATE from being installed; it did nothing about
+stale RESOURCES.
+
+**Fixed by a circuit breaker.** `expireLoad` increments `outstandingAbandonedLoads`; a load only
+decrements it by actually reporting back (`finishLoad` with a stale id, whether it succeeded or
+threw). While the count is at `maxOutstandingAbandonedLoads` (1), `startLoadIfNeeded` throws
+`.loadAbandonedAndStillOutstanding` BEFORE creating any task, so a refused attempt costs nothing
+and does not wait out another deadline. At most two loads can ever be in flight: one live, one
+abandoned, no matter how many meetings end.
+
+If the abandoned load never returns, the breaker stays open and diarization fails fast for the
+rest of the session. That is the intended outcome, not a regression: the alternative is the
+unbounded accumulation this fixes, and a failed diarization is recoverable (audio and segments
+are already persisted by the time `stop()` reaches this call).
+
+**Would need revisiting** if real-hardware measurement (see the smoke-test prerequisite above)
+shows genuine `DiarizerModels.load` hangs are common rather than pathological, at which point the
+right answer is probably a user-visible signal that diarization is disabled for the session,
+rather than a different cap.
+
+## A diarizer waiter cancelled before it registers waits for the ceiling, not for its cancel
+
+Source: `VoiceInk/Features/Meetings/Transcription/FluidAudioMeetingDiarizer.swift` (`join`).
+
+`withTaskCancellationHandler`'s `onCancel` can fire before the enclosing
+`withCheckedThrowingContinuation` has stored the waiter, in which case `cancelWaiter` finds no
+entry and the call waits for the load generation to end normally instead of returning at once
+with `CancellationError`. Only reachable for a caller whose Task is already cancelled on entry.
+
+Cost is latency, not a hang, and specifically because of B2's fix: the generation is bounded by
+`expireLoad` no matter what the loader does, so the worst case is one `loadOperationTimeout`
+(default 30s). Left as is -- a pre-registration cancellation check has its own race and is no
+simpler. Disclosed here so it is a decision rather than an oversight.
+
+## `cleanup()` remains internal on `FluidAudioTranscriptionService`
+
+Source: `VoiceInk/Infrastructure/Providers/Transcription/FluidAudio/FluidAudioTranscriptionService.swift`,
+`VoiceInk/Features/Meetings/Transcription/MeetingAsrSharing.swift`.
+
+Round 3 claimed the meeting seam could not evict dictation's model partly because the
+eviction-capable methods were `private`. Review found that false (B4.1): `cleanup()` is
+`internal`, so any file in the app target could compile `await service.cleanup()`.
+
+Round 4 fixed the seam by capability narrowing rather than by changing upstream: the meeting
+transcriber is handed `any MeetingAsrManagerBorrowing` (one getter) and stores a closed-over
+`@MainActor @Sendable` capability, so `cleanup()`, `loadModel(for:)` and the concrete type are
+not nameable there at all. Five negative-control attacks enforce it.
+
+**What is still CONVENTIONAL, stated as such:** `cleanup()` is unchanged and still `internal`, so
+app-target code that obtains the CONCRETE service (from `TranscriptionServiceRegistry`, say) can
+still call it. Making it `private` would mean changing its existing upstream callers, which is
+larger than the accessor-sized touchpoint that was authorised. What is enforced is that the
+meeting seam is never given that concrete type; what is conventional is that a future meeting
+file does not reach around the capability to fetch the service itself.
+
+**Would need revisiting** if the meeting seam ever grows a second component that needs the
+service, at which point the right move is probably to ask for a third upstream touchpoint and
+make `cleanup()` `private` with an explicit lifecycle owner, rather than widen the capability.
+
+## B4.2's dictation-priority admission is FluidAudio-only, and transcribe.cpp's exposure is different and unverified
+
+Source: `VoiceInk/Features/Meetings/Transcription/FluidAudioMeetingSegmentTranscriber.swift`
+(admission control) versus `TranscribeCppMeetingSegmentTranscriber.swift` (no admission control).
+Noticed while fixing B4.2; not raised by review, and deliberately NOT "fixed" here, because the
+transcribe-cpp borrow path was reviewed and accepted and changing it would be scope I was not
+given.
+
+The two seams share a model in genuinely different ways, so B4.2's hazard does not transfer:
+
+- **FluidAudio:** `AsrManager` is a `public actor`, so meeting and dictation inference are
+  mutually serialized and a dictation started after a meeting chunk QUEUES behind it. That is the
+  latency defect B4.2 fixes with admission control.
+- **transcribe.cpp:** `OfflineTranscribeCppService.transcribe` holds no lock across inference. It
+  calls `nativeModel.session()` per chunk and runs that session; `Model.session()`
+  (`Transcribe-cpp-swift/Sources/TranscribeCpp/Model.swift:43`) creates a FRESH native session
+  from the shared model pointer on each call. So a meeting and a dictation do not queue behind
+  each other there; they run concurrently.
+
+**What is therefore unverified, and belongs with the real-model smoke tests above:** whether
+running two concurrent sessions against one shared `Model` is thread-safe in this build of
+transcribe.cpp, and what the CPU and memory cost of doing so is on a 16GB M2 Pro. The one-model
+many-sessions API shape is consistent with concurrent use being intended, and the meeting seam
+uses exactly the same `session()`-per-chunk pattern dictation already uses, so this introduces no
+new pattern -- but "the API looks designed for it" is not evidence, and nothing in this
+environment can produce evidence without the real GGUF model present.
+
+**Decide when that smoke test runs:** if concurrent sessions turn out to be unsafe or expensive,
+the fix is the same admission-control shape B4.2 already establishes, applied to
+`TranscribeCppMeetingSegmentTranscriber`. If they are fine, transcribe.cpp is simply the better
+sharing model of the two and no change is needed.
+
+## `StreamingVadControllerTests.serializesChunkProcessing` flaked once on CI (2026-09-05) — FIXED
+
+`Tests/VoiceInkTests/Features/Meetings/Transcription/StreamingVadControllerTests.swift`. Failed on
+CI run **33965544410** (attempt 1) during PR #16 round 8, in a change that touched only comments,
+two test files, a negative control, the verifier script and this file. Evidence it was a flake and
+not a regression:
+
+- **The same commit (`01e85ce7`) passed on attempt 2**, with no code change between attempts.
+- The change in flight touches nothing this test exercises: `StreamingVadController` and its tests
+  were not modified, and the round-8 diff under `VoiceInk/` is comment-only.
+- It passed locally in the same round at **0.568s**.
+- The CI failure took **2.324s** against a **2-second** deadline, i.e. it exhausted the wait and
+  then failed the count assertion. That is the signature of the deadline expiring, not of a
+  behavioural fault.
+
+**Root cause.** The test enqueues 10 chunks processed serially at 25ms each (~250ms of work) and
+polls for completion under a 2s ceiling. The ceiling is a hang guard, not a latency assertion, but
+it was only ~8x the expected work, and a loaded GitHub runner stretched the real duration past it.
+
+**Fix.** Raised that ceiling and its sibling in `buffersChunksBeforeStateReady` to 10s, with the
+reasoning recorded at both sites. This cannot mask a real defect: the assertions
+(`processedCount == 10`, `maxConcurrentCount == 1`) are unchanged, a genuine serialization
+regression still fails on `maxConcurrentCount` immediately, and a genuine hang still fails after
+10s. It is the same idiom this file already prescribes in the `RouteAwareMeetingMicRecorderTests`
+audit above: extend the wait to cover the state actually being asserted, never a fixed sleep.
+
+**Not fixed here:** the remaining 1s/2s deadlines in that file (lines ~211-258) gate on a single
+in-flight operation rather than N serialized ones, so their margins are far wider. If either ever
+flakes, apply the same reasoning rather than assuming a behavioural cause.
+

@@ -90,7 +90,17 @@ struct StreamingVadControllerTests {
             controller.processAudio([Float](repeating: 0, count: VadManager.chunkSize))
         }
 
-        let deadline = ContinuousClock.now + .seconds(2)
+        // 10s, not 2s. This deadline is a HANG GUARD, not a latency assertion: the two `#expect`s
+        // below are what this test proves, and neither depends on how long the wait was allowed
+        // to run. The work here is 10 chunks serialized at 25ms each, so ~250ms locally -- but
+        // the loop is doing exactly what this repo's own rule in FOLLOWUPS.md prescribes
+        // (wait on the state being asserted, never a fixed sleep), and a loaded CI runner can
+        // stretch 250ms of serialized async work past 2s. It did: CI run 33965544410 failed here
+        // at 2.324s, having exhausted the old deadline, and the SAME COMMIT passed on re-run with
+        // no code change. Raising the ceiling removes the false failure without weakening either
+        // assertion -- a genuine serialization regression still fails on `maxConcurrentCount`,
+        // and a genuine hang still fails on `processedCount` after 10s.
+        let deadline = ContinuousClock.now + .seconds(10)
         while await probe.processedCount < 10, ContinuousClock.now < deadline {
             try? await Task.sleep(for: .milliseconds(20))
         }
@@ -123,7 +133,8 @@ struct StreamingVadControllerTests {
             controller.processAudio([Float](repeating: 0, count: VadManager.chunkSize))
         }
 
-        let deadline = ContinuousClock.now + .seconds(2)
+        // Same reasoning as `serializesChunkProcessing` above: hang guard, not a latency claim.
+        let deadline = ContinuousClock.now + .seconds(10)
         while await probe.processedCount < 3, ContinuousClock.now < deadline {
             try? await Task.sleep(for: .milliseconds(20))
         }

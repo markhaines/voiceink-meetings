@@ -343,7 +343,7 @@ jobs:
       # claim is re-attacked on every run rather than trusted. Runs AFTER the test step and
       # reuses .ci-test-build on purpose, so each attack is an incremental one-file compile
       # rather than a cold build. It is the last step that builds anything.
-      - name: Verify MeetingStore isolation negative controls
+      - name: Verify structural negative controls (MeetingStore isolation, shared-model eviction)
         run: scripts/verify-meeting-store-isolation.sh --derived-data .ci-test-build
 
       # The trust check above runs before the build, against the COMMITTED Package.resolved.

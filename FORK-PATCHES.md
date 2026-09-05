@@ -3296,3 +3296,994 @@ Views/MeetingRecordingController.swift`, `VoiceInk/Features/Meetings/Views/Meeti
 `Makefile`, `Tests/VoiceInkTests/Features/Meetings/Models/MeetingStoreTests.swift`,
 `Tests/VoiceInkTests/Features/Meetings/Views/MeetingRecordingControllerTests.swift`, this file.
 No SPM dependency added. No deletion in any upstream file.
+
+## meeting-transcription-coordinator (Stage 2c: the real MeetingTranscriptionCoordinator)
+
+**NOT WIRED INTO PRODUCTION.** This stage builds `MeetingTranscriptionCoordinator` -- an actor
+conforming to `MeetingTranscriptionCoordinating`, ready to REPLACE
+`NullMeetingTranscriptionCoordinator` -- but nothing in this repo constructs a non-Null
+coordinator anywhere yet. Every meeting today still runs on the empty-transcript Null stub,
+unchanged by this PR. See "Which backends land on which path TODAY" below and `FOLLOWUPS.md` for
+what still has to happen before that changes.
+
+Implements `DECISION-transcription-seam.md`'s Option (ii): the coordinator sits BESIDE
+`TranscriptionServiceRegistry`, calling FluidAudio and transcribe-cpp directly for real
+per-segment timing, flat-string sentence-split fallback for everything else.
+
+### Premise verification (STEP 1 of the brief), before anything was built
+
+(a) Confirmed: `MeetingTranscriptionCoordinating.swift` defines the protocol and only
+`NullMeetingTranscriptionCoordinator` implemented it anywhere in the repo (`grep -rl
+"MeetingTranscriptionCoordinating"` — three hits besides the protocol file itself: the protocol
+file, `MeetingEngine.swift`, `MeetingPersisting.swift`, `MeetingEngineTests.swift`; none besides
+the Null stub and this stage's own new type conform).
+
+(b) Confirmed: `MicTurnNormalizer.swift`/`SystemTurnNormalizer.swift` are present in
+`Features/Meetings/Transcription/` and are the code that actually manufactures turn timing —
+`MicTurnNormalizer` runs a three-tier decision (real segment timing if present and not
+"fragmented" -> merge adjacent -> NLTokenizer sentence-split + proportional interpolation);
+`SystemTurnNormalizer` always does the sentence-split tier, never inspects `result.segments`.
+Both ported verbatim in an earlier stage; neither touched here.
+
+(c) Confirmed: `SpeechTranscriptionResult.swift` (`{ text: String, segments: [SpeechSegment] }`)
+is present and is exactly what both normalizers consume.
+
+(d) Confirmed, exact line numbers, quoted:
+`LibWhisper.swift:104-108`:
+```swift
+func getTranscription() -> String {
+    guard let context = context else { return "" }
+    var transcription = ""
+    for i in 0..<whisper_full_n_segments(context) {
+        transcription += String(cString: whisper_full_get_segment_text(context, i))
+```
+`t0`/`t1` are never called anywhere in this function — only segment text is read.
+`FluidAudioTranscriptionService.swift:196`:
+```swift
+return TextNormalizer.shared.normalizeSentence(result.text)
+```
+`result` is FluidAudio's `ASRResult` (from `asrManager.transcribe(...)`); everything on it
+except `.text` — including `tokenTimings` — is discarded at this return.
+
+(e) Confirmed: `MeetingEngine` depends only on the four `MeetingTranscriptionCoordinating`
+methods (`getVadManager()` once at `start()`; `transcribeMeetingChunk(at:)` three call sites,
+final-mic-chunk/final-system-chunk/mid-meeting rotation; `diarizeSystemAudio(at:)` once at
+`stop()`; `transcribeMeeting(at:)` not called anywhere in `MeetingEngine` today, matching the
+protocol file's own note). `MeetingEngine`'s initializer defaults `transcriptionCoordinator` to
+`NullMeetingTranscriptionCoordinator()`, so yes, it already constructs and runs fine without this
+piece — that default is unchanged by this stage.
+
+### What was built
+
+Five new files, all under `Features/Meetings/Transcription/`, no existing file touched:
+
+- `MeetingSegmentTranscribing.swift` — the two small protocols this stage adds
+  (`MeetingSegmentTranscribing`, `MeetingSystemAudioDiarizing`) plus `MeetingTranscriptionBackend`
+  (`.fluidAudio` / `.transcribeCpp` / `.other`).
+- `MeetingTranscriptionCoordinator.swift` — the actor. Constructor-injected: `backend`, an
+  optional transcriber per segment-bearing backend, an optional diarizer, a
+  `fallbackTranscribe: @Sendable (URL) async throws -> String` closure, and a `vadManagerFactory`
+  defaulting to `{ try await VadManager() }`. Routes `transcribeMeetingChunk`/`transcribeMeeting`
+  by `backend`: if the matching transcriber is configured, calls it verbatim; otherwise (or for
+  `.other`) wraps `fallbackTranscribe`'s string in a single zero-duration `SpeechSegment` — the
+  exact shape `MicTurnNormalizer`/`SystemTurnNormalizer` already treat as "no meaningful timing."
+  `getVadManager()` lazily constructs and caches a `VadManager` (and caches a construction
+  *failure* too, so it does not retry every chunk). `diarizeSystemAudio` delegates to the
+  injected diarizer, nil if none configured.
+- `FluidAudioMeetingSegmentTranscriber.swift` — owns its own `AsrManager` and its own Parakeet
+  model load (`AsrModels.load`/`.v3`/`.int8`, same call shape `FluidAudioTranscriptionService`
+  uses), independent of that file (which the brief forbids touching — its `asrManager` is
+  `private`, no seam to reach without an edit). Maps `ASRResult.tokenTimings` to one
+  `SpeechSegment` per token (matching the donor's own `transcribeWithFluidAudio` exactly, per
+  `segment-timing-design.md` §A/§C), falling back to one full-span segment (real `duration`, not
+  zero) only when the backend returns no token timings.
+- `TranscribeCppMeetingSegmentTranscriber.swift` — owns its own `Model`/`Session`, independent of
+  `OfflineTranscribeCppService.swift` for the same reason (that file explicitly opts OUT of
+  timing with `timestamps: .none`, and changing that is an upstream-file edit the brief said to
+  stop and ask about, not make unilaterally). Reads (does not edit)
+  `TranscribeCppModelCatalog.artifact(for:)` to resolve an on-disk model file. Requests
+  `timestamps: .segment` and maps `Transcript.segments` to `[SpeechSegment]` (ms -> seconds).
+  Deliberately does NOT reproduce that file's energy-aware long-file chunking — meeting chunks
+  are already short, VAD-rotated windows, not whole dictation files, so one `session.run` per
+  chunk is the correct scope.
+- `FluidAudioMeetingDiarizer.swift` — `diarizeSystemAudio`'s real implementation: resolves
+  `DiarizerRuntimePolicy.resolve(for: .current())` once and applies `.modelConfiguration`
+  whenever `DiarizerModels` load, per `ADAPTER-HANDOVER.md` §5's explicit requirement. Its load
+  `Task` is typed `Void`, not `DiarizerManager` — `DiarizerManager` is a plain (non-`Sendable`,
+  non-actor) class, and typing the Task's success value as it would fail to compile under this
+  project's concurrency checking; the fix is to assign `self.loadedManager` from inside the
+  actor-isolated Task body instead of returning the manager across a generic boundary that would
+  require it to be `Sendable`.
+
+None of the four new files route audio through `AudioFileProcessor.processAudioToSamples()` (the
+whole-file-into-`[Float]` loader the brief named as forbidden for meeting audio): FluidAudio's
+`AsrManager.transcribe(url:...)` reads/streams the URL itself; the transcribe-cpp and diarizer
+paths use FluidAudio's own `AudioConverter.resampleAudioFile` (the same helper
+`OfflineTranscribeCppService.swift`/`FluidAudioTranscriptionService.swift` already use), a
+distinct type from this fork's `AudioFileProcessor`.
+
+### Which backends land on which path TODAY
+
+Nothing in this repo constructs a non-Null `MeetingTranscriptionCoordinator` yet — no
+composition root exists (that is a UI/settings decision the protocol file's own header says this
+stage does not make: "backend selection ... is a product decision"). So today, in production,
+every meeting still runs on `NullMeetingTranscriptionCoordinator` (empty transcript), unchanged
+by this PR. What this stage adds is the coordinator and its two real segment-bearing adapters,
+ready to be wired in: given `backend: .fluidAudio` with a `FluidAudioMeetingSegmentTranscriber`
+configured, chunks route to real per-token timing; given `.transcribeCpp` with a
+`TranscribeCppMeetingSegmentTranscriber` and an installed catalog model, chunks route to real
+per-segment timing; every other configuration (`.other`, or `.fluidAudio`/`.transcribeCpp` with
+no transcriber wired) routes to the flat-string fallback.
+
+### Tests
+
+`MeetingTranscriptionCoordinatorTests.swift` (12 cases) and
+`FluidAudioMeetingSegmentTranscriberTests.swift` (6 cases), all against real types (fakes only at
+the `MeetingSegmentTranscribing`/`MeetingSystemAudioDiarizing` protocol boundary, never inside
+`SpeechSegment`/`SpeechTranscriptionResult`/`ASRResult`/`TokenTiming`, all of which have public
+initializers and are constructed for real).
+
+The naive-implementation-killing case, `killsNaiveAlwaysSentenceSplit`: a fake FluidAudio
+transcriber returns two real timed segments (`0.2-0.6`, `2.5-3.8`, chunk-relative) for the single
+grammatical sentence "Hi there friend." — chosen so NLTokenizer's `.sentence` unit sees no
+boundary in it, meaning a sentence-split fallback for the *identical text* collapses to exactly
+ONE turn (see the paired control test, `fallbackCollapsesToOneTurn`). Values were derived by hand
+against `MicTurnNormalizer`'s documented tiering before running anything: two segments never trip
+`isFragmented` (`guard segments.count > 3`), and the 1.9s gap between them exceeds both the 0.35s
+merge gap and the 1.5s short-segment gap cap, so they survive as two independent turns at
+`100.2-100.6` and `102.5-103.8` (chunk start 100.0 + each segment's own offset). Run against the
+real `MeetingTranscriptionCoordinator` + the real, unmodified `MicTurnNormalizer`: passes,
+producing exactly those two turns. A coordinator that always flattened to sentence-split
+(ignoring a configured segment-bearing transcriber) would produce ONE turn spanning
+`100.0-104.0` instead — this test fails against that implementation and passes against the real
+one.
+
+`FluidAudioMeetingSegmentTranscriberTests` covers the pure `speechSegments(fromTokenTimings:...)`
+mapping directly against real `TokenTiming`/`ASRResult` values (both have public memberwise
+initializers in the FluidAudio package) — the one segment-bearing adapter this can be done for.
+transcribe-cpp's equivalent mapping (`Transcript.segments -> [SpeechSegment]`) has NO test:
+`Transcript`/`Segment` have no public initializer outside the `TranscribeCpp` package and are not
+`Codable`, so no real value can be constructed from this module. That mapping is exercised only
+by type-checking + the compiled, running build; stated here rather than silently left uncovered.
+
+### What could not be proven / known gaps, stated plainly
+
+- **transcribe-cpp segment mapping has no unit test** (see above) — untestable from this module
+  with the types as they stand.
+- **`FluidAudioMeetingSegmentTranscriber`/`TranscribeCppMeetingSegmentTranscriber`/
+  `FluidAudioMeetingDiarizer`'s real model-loading paths were never run against real audio or
+  real downloaded models** — no Parakeet/transcribe-cpp/diarizer models are present in this
+  environment, and the brief's gates are the local test suite and CI, neither of which downloads
+  multi-hundred-MB models. Verified only: they compile against the real FluidAudio/TranscribeCpp
+  package APIs and pass `xcodebuild build-for-testing`. This is genuinely unverified beyond that.
+- ~~`FluidAudioMeetingDiarizer` does NOT implement the donor's full three-property diarizer
+  preload semantics~~ **FIXED in the fix round below** (touchpoint 4 section) — shared load,
+  a bounded operation deadline, and prompt per-waiter cancellation are all now implemented and
+  tested.
+- **Which transcribe-cpp catalog model (`cohereTranscribe` vs. `senseVoiceSmall`) backs
+  meetings, and whether either's installed model artifact actually populates `Transcript
+  .segments` at `.segment` timestamp granularity, is unresolved** — both are real, declared
+  models with unknown per-model timestamp-kind support (`segment-timing-design.md` §B says the
+  same for the donor's own catalog: "I did not cross-check which catalog entries claim which
+  `maxTimestampKind`"). The model NAME is constructor-injected, not decided here; still open.
+- **No composition root wires a real coordinator into `MeetingEngine` in production** — see
+  "Which backends land on which path TODAY" above. This stage builds the coordinator and its
+  adapters; wiring them into the app's actual meeting-start flow (and deciding, e.g. via a
+  settings UI, which backend a given meeting uses) is a follow-on, not attempted here.
+
+Original round: no upstream file touched, no SPM dependency added. Files changed:
+`MeetingSegmentTranscribing.swift`, `MeetingTranscriptionCoordinator.swift`,
+`FluidAudioMeetingSegmentTranscriber.swift`, `TranscribeCppMeetingSegmentTranscriber.swift`,
+`FluidAudioMeetingDiarizer.swift`, `MeetingTranscriptionCoordinatorTests.swift`,
+`FluidAudioMeetingSegmentTranscriberTests.swift`, `FORK-PATCHES.md` (this entry). See the fix
+round immediately below for touchpoint 4 (the one upstream change this PR now contains) and
+everything else the cross-vendor review required.
+
+### Fix round (cross-vendor review, B1/B2/B3, Gap (i))
+
+Cross-vendor review on PR #16 returned CHANGES-REQUIRED with three blocking findings. All three
+are addressed below. Confirmed still valid from the review and NOT regressed: the naive-killer
+test (`killsNaiveAlwaysSentenceSplit`) kills a naive implementation for the right reason; the
+fallback path emits no negative/NaN/non-monotonic/out-of-chunk timestamps; the original
+dead-code disclosures were accurate.
+
+#### 4. `FluidAudioTranscriptionService.swift` / `OfflineTranscribeCppService.swift`: narrow accessors (B1, B2)
+
+**UPSTREAM TOUCHPOINT, explicitly authorised by Mark specifically to avoid loading a second
+Parakeet model / a second transcribe-cpp native model beside dictation's on a 16GB M2 Pro Mark
+dictates on every day.**
+
+**The defect (B1):** the original `FluidAudioMeetingSegmentTranscriber`/
+`TranscribeCppMeetingSegmentTranscriber` each owned an independent, permanently-retained model
+load, entirely separate from `FluidAudioTranscriptionService`'s/`OfflineTranscribeCppService`'s
+own already-loaded instance. Once wired into a meeting, this would double memory for the active
+backend's model for the meeting's whole lifetime, with no eviction.
+
+**The defect (B2):** the transcribe-cpp adapter additionally constructed its native `Model`
+directly (`Model(path:options:)`, `Transcribe.initBackends()`), bypassing
+`OfflineTranscribeCppService`'s own `backendInitializationLock`/`modelInitializationLock` — a
+second, uncoordinated lock over the same non-cancellable native construction path, which could
+race or serialize behind dictation's own load in undefined order.
+
+**The fix, minimal and additive as authorised — no existing method's logic changed, only two new
+methods added:**
+
+- `FluidAudioTranscriptionService.swift`: `sharedAsrManager(for version: AsrModelVersion) async
+  throws -> AsrManager` — calls the SAME existing `ensureModelsLoaded(for:)` that
+  `transcribe(audioURL:model:context:)` already calls, then returns `self.asrManager`. The fast
+  path (`asrManager != nil, activeVersion == version`) is a complete no-op relative to whatever
+  dictation already has loaded — zero new work, zero new state.
+- `OfflineTranscribeCppService.swift`: `borrowModel(for: TranscribeCppModel) async throws ->
+  (model: Model, artifact: TranscribeCppModelArtifact, release: @Sendable () -> Void)` — calls the
+  SAME existing `resolveArtifact` → `getOrLoadModel` → `retainModel` path
+  `transcribe(audioURL:model:context:)` already uses, hence the SAME locks; no second lock
+  introduced. Caller releases via the returned closure, mirroring that method's own
+  `defer { releaseModel(...) }`.
+
+Both are pure additions: zero lines of existing logic in either file were changed, reordered, or
+removed. `git diff` on both files shows only new method bodies inserted; every pre-existing
+method is byte-for-byte unchanged. Exactly the two files the review anticipated
+(`segment-timing-design.md`'s own Option (ii) discussion named these same two files as the
+natural home for this) — no third or fourth upstream file was needed, so no STOP-and-report was
+triggered.
+
+**Why not more (the "change bigger than an accessor" line I was told not to cross):** marking
+`FluidAudioTranscriptionService` itself `@MainActor` would have been the fully compiler-enforced
+fix for B1's isolation concern, but `grep -rn "FluidAudioTranscriptionService"` shows it is also
+held by `StreamingTranscriptionService.swift` (already `@MainActor`, fine) AND
+`FluidAudioStreamingProvider.swift` (NOT `@MainActor`) — annotating the class would very likely
+have forced isolation changes in that third file too, a bigger and less certain change than an
+accessor. I did not attempt it, and did not need to: see "SAFETY" below for what was done
+instead within the one-file budget.
+
+**Dictation behaviour, how "provably unchanged" was established:**
+1. `git diff` on both files: every pre-existing method's body is untouched, character for
+   character. `sharedAsrManager`/`borrowModel` are pure additions after the existing methods.
+2. For the common case — a meeting requests the SAME FluidAudio version dictation already has
+   loaded — `sharedAsrManager`'s fast path means the new call is a no-op read of existing state;
+   dictation's own manager is untouched, not even re-validated.
+3. ~~Requesting a DIFFERENT version than dictation currently has loaded evicts dictation's
+   manager via `cleanupLoadedManagers()` — but that is the EXISTING code path
+   `ensureModelsLoaded` already takes whenever dictation itself switches models; a meeting is
+   simply a new second caller now ABLE to trigger it. This is disclosed, not hidden.~~
+   **WRONG, and fixed in round 3.** The eviction PATH is old; the cross-flow interleaving is
+   new, and that is the part that matters. `ensureModelsLoaded`, `cleanupLoadedManagers` and
+   `transcribe` all suspend, so `@MainActor` initiation gives no operation-level serialisation:
+   a meeting could run `asrManager.cleanup()` — which nils the CoreML models — underneath a
+   dictation suspended inside `AsrManager.transcribe`. Round 2's source comment claiming the
+   calls were "serialized on the same executor" and that this was "not new eviction behavior"
+   was materially misleading on both counts. Both the comment and the capability are gone.
+4. `OfflineTranscribeCppService.borrowModel` reuses `retainModel`/`releaseModel`'s EXISTING
+   reference-counted eviction guard (`activeTranscriptionCount`) untouched — a meeting's borrow
+   is indistinguishable, from the lock/refcount machinery's point of view, from a second
+   concurrent dictation transcription.
+5. Full local `VoiceInkTests` suite (including every pre-existing FluidAudio/transcribe-cpp/
+   dictation-adjacent test) passes unchanged after this touchpoint — see GATES below.
+
+**SAFETY (actor isolation), stated exactly, not oversold:**
+- `OfflineTranscribeCppService` is already `@unchecked Sendable` and internally lock-protected
+  (`stateLock`, `backendInitializationLock`, `modelInitializationLock`) — genuinely,
+  compiler-and-lock-enforced safe to call from any context. No further discipline needed at the
+  meeting call site.
+- `FluidAudioTranscriptionService` carries NO actor isolation of its own, today or after this
+  change — its existing safety comes entirely from every caller initiating from `@MainActor`
+  (informal, not compiler-enforced). `FluidAudioMeetingSegmentTranscriber.resolveSharedManager()`
+  is annotated `@MainActor` so the meeting seam's call is initiated from the SAME executor
+  dictation's own calls already use — putting meetings in the identical access shape dictation
+  already has, not a new, less-disciplined bypass of it. This does NOT prove no two overlapping
+  calls can ever race past an internal `await` inside `ensureModelsLoaded` — it proves the
+  meeting seam is exactly as disciplined as dictation already is, no more, no less. A fully
+  compiler-enforced fix would need `@MainActor` on the class itself, which I determined (above)
+  risks a third/fourth upstream touchpoint and did not attempt without asking first.
+
+**B1 PROOF, and what remains unproven — stated plainly, not asserted:** an object-IDENTITY test
+(`meetingManager === dictationManager`) is NOT possible in this environment: both accessors only
+produce a real manager by loading real Parakeet CoreML models / a real transcribe-cpp GGUF file,
+neither of which is present here, and `AsrManager`/`Model` have no lightweight test double (same
+class of gap `MeetingEngineTests.swift` already discloses for `VadManager`). I did not fake this.
+What IS proven, by a real passing test
+(`SharedModelDuplicationTests.swift`, 4 cases): neither adapter file constructs its own
+`AsrManager`/`AsrModels`/native `Model`/`Transcribe.initBackends()` anymore (a static scan over
+the actual file text, same pattern `MeetingVadStreamsTests.swift` already uses for an analogous
+property), and both adapter files' only path to a real model is through the new shared
+accessors. Combined with the code-level argument above (both call sites read the identical
+`self.asrManager` property / go through the identical `retainModel`/`releaseModel` bookkeeping on
+whatever single instance is injected), instance identity follows by construction once a real
+composition root passes the SAME `FluidAudioTranscriptionService`/`OfflineTranscribeCppService`
+instance to both dictation's registry and the meeting adapters — but that is not, and cannot be,
+tested here today.
+
+#### `FluidAudioMeetingDiarizer.swift`: bounded shared-load state machine (B3)
+
+Full rewrite of the load path. Previously: joined an in-flight load with no ceiling and no
+per-waiter cancellation — `diarizeSystemAudio` is awaited from `MeetingEngine.stop()`, so a hung
+CoreML load hung meeting completion indefinitely. Now implements all three properties
+`ADAPTER-HANDOVER.md` §5 describes:
+
+1. **Shared load** — `resolvedManager()`'s `startLoadIfNeeded()` starts at most one load `Task`;
+   concurrent callers join it via `join()`.
+2. **Operation deadline independent of any caller's wait** — `runWithDeadline` races the real
+   loader against a `Task.sleep(loadOperationTimeout)` (default 30s) inside a `withTaskGroup`,
+   taking whichever finishes first and cancelling the loser. The cancellation is honestly
+   best-effort (a genuinely hung, cancellation-blind native call may keep running in the
+   background regardless — the same shape the donor's own `timeoutDiarizerLoad` uses); what is
+   guaranteed unconditionally is that no caller of `resolvedManager()` ever waits past the
+   deadline, whether or not the loser actually stops.
+3. **Prompt per-waiter cancellation** — `join()` registers each caller as a waiter via
+   `withCheckedThrowingContinuation` inside `withTaskCancellationHandler`; a cancelled caller's
+   `onCancel` resumes ONLY its own continuation (`cancelWaiter`) and never touches `loadTask` or
+   any other waiter.
+
+A failed or timed-out load clears `loadTask`, so the next `diarizeSystemAudio` call retries
+rather than being permanently poisoned — matching "a failed diarization is recoverable" (audio
+and segments are already persisted by the time `stop()` reaches this call).
+
+`resolvedManager()` widened from `private` to `internal` (module-only) specifically so
+`FluidAudioMeetingDiarizerTests.swift` can drive the state machine directly via `@testable
+import`, without needing a real audio file on disk (`diarize(fileAt:)` itself still does real
+file I/O; `resolvedManager()` does not). No production code outside this actor calls it
+(grep-verified).
+
+**SUPERSEDED by fix round 3 (B3).** One new fork-owned, non-upstream declaration:
+`extension DiarizerManager: @unchecked Sendable {}`, needed because `withTaskGroup`'s race requires a Sendable result type and `DiarizerManager`
+(FluidAudio's own plain class) has none. Honest about what this asserts: single-owner exclusive
+access, true by construction because this actor is the only place in the fork that ever
+constructs or touches a `DiarizerManager` (grep-verified) — not a general claim that the type is
+safe to share. Review was right to reject this: whatever the comment said, the CONFORMANCE tells
+the compiler, target-wide and for every future FluidAudio version, that the type is safe to
+share, and a grep-based sole-owner convention is neither scoped nor enforceable. Removed in fix
+round 3.
+
+> **RETRACTED by fix round 3 — the proof below is real output that demonstrates the WRONG
+> PROPERTY, and the ceiling it claims to prove did not exist.** The injected loader was
+> `try await Task.sleep(...)`, which IS cancellation-aware: the instant `group.cancelAll()` ran
+> it threw `CancellationError` and the "60s" loader was finished. That is the only reason the
+> enclosing `withTaskGroup` — structured concurrency, which cannot return until every child has
+> completed — was able to return at all. Against a cancellation-BLIND load, which is the sole
+> failure mode a ceiling exists for, the caller waited exactly as long as it would have with no
+> ceiling. The numbers below are genuine; the conclusion drawn from them was not. Kept here
+> rather than deleted so the mistake is legible. See "Fix round 3" below for the replacement
+> design and a proof against a loader that cannot be cancelled.
+
+**B3 PROOF (SUPERSEDED — see the retraction above), quoted from a real run —
+`FluidAudioMeetingDiarizerTests.hungLoadSurfacesAsATimeoutRatherThanHangingForever` injects a
+loader that `Task.sleep`s for 60 real seconds and never checks cancellation, against a 0.2s
+deadline:**
+
+```
+Test case 'FluidAudioMeetingDiarizerTests/hungLoadSurfacesAsATimeoutRatherThanHangingForever()' passed on 'My Mac - VoiceInk Dev (47100)' (0.214 seconds)
+Test case 'FluidAudioMeetingDiarizerTests/hungLoadFailureIsSpecificallyTimedOut()' passed on 'My Mac - VoiceInk Dev (47100)' (0.102 seconds)
+```
+
+Both complete in essentially exactly their configured deadline (0.214s / 0.102s), not 60s — the
+hung loader Task itself is left running/leaked in the background (never actually interrupted,
+consistent with the honestly-stated best-effort cancellation above), but the CALLER is never
+blocked past the ceiling. Also covered and passing: `sharedLoadIsJoinedNotDuplicated` (the loader
+runs exactly once for two concurrent callers),
+`cancelledWaiterReturnsPromptlyWithoutAbortingTheSharedLoad` (a cancelled joiner returns with
+`CancellationError` while the other waiter still gets the real result once the load completes),
+`successfulLoadIsCachedAcrossCalls`, `failedLoadIsRetriedNotPoisoned`.
+
+#### `TranscribeCppMeetingSegmentTranscriber.swift`: pure, tested segment mapping (Gap (i))
+
+The reviewer's note that "untestable" (the original round's claim for this adapter's
+`Transcript` -> `SpeechSegment` mapping) was overstated is correct. `Transcript`/`Segment`
+themselves still have no public initializer outside the `TranscribeCpp` package and are not
+`Codable` — that half is genuinely still compile-only-verified — but the actual mapping
+arithmetic never needed those types, only their primitive fields. Split into
+`speechSegments(segments: [(t0Ms: Int64, t1Ms: Int64, text: String)], fallbackText: String) ->
+[SpeechSegment]`, a pure function `speechSegments(from: Transcript)` now just adapts into.
+
+`TranscribeCppMeetingSegmentTranscriberTests.swift` (8 cases) tests it directly against
+malformed inputs, since these values land in Mark's `**MM:SS**` export where nothing downstream
+catches a wrong one: empty segments (falls back to flat text), empty segments + blank text (zero
+segments), negative `t0Ms` (clamped to 0), negative `t1Ms` (clamped to the already-clamped
+start), reversed timestamps end-before-start (end clamped up to start, never negative duration),
+overflowed timestamps near `Int64.max` (converts without crashing, stays finite, non-negative),
+and multiple malformed segments in one transcript (each clamped independently, in original
+order).
+
+### Fix round 3 (cross-vendor review of the fix round: B1, B2, B3)
+
+The same reviewer defeated two successive designs on the same properties, and one of round 2's
+"proofs" turned out to demonstrate the wrong thing. This round's bias, stated up front because it
+drove every decision below: **make the bad state impossible rather than unlikely.** On this
+branch three separate guarantees that were merely documented or merely conventional were each
+defeated in one line; the ones that held (`MeetingStore`'s isolation boundary) held because the
+unsafe call did not exist in the API and a negative control proved it on every CI run. All three
+fixes below take that shape.
+
+Confirmed still valid and NOT regressed: the naive-killer test and its paired fallback control;
+the fallback path emitting no negative/NaN/non-monotonic/out-of-chunk timestamps; the dead-code
+disclosure (nothing here is wired into a composition root yet); `OfflineTranscribeCppService
+.borrowModel(for:)` and its release discipline, which is untouched.
+
+#### B1 — a meeting could evict the model out from under a live dictation
+
+**The finding, accepted in full.** `@MainActor` initiation does not give operation-level
+serialisation. `ensureModelsLoaded`, `cleanupLoadedManagers` and `transcribe` all suspend, so a
+meeting-requested version switch could run `asrManager.cleanup()` — which nils out the CoreML
+models — underneath a dictation suspended inside `AsrManager.transcribe`. Round 2's source
+comment ("serialized on the same executor", "not new eviction behavior") was materially
+misleading: the eviction PATH is old, but the cross-flow interleaving is new, and that is the
+part that matters. `AsrManager.cleanup()` is four `nil` assignments to the loaded CoreML models
+(FluidAudio `AsrManager.swift:215`), so what dictation gets afterwards is not slow, it is broken.
+
+**The design: borrow-only, version-pinned, no load.** The accessor is now
+
+```swift
+func borrowedAsrManager() -> (manager: AsrManager, version: AsrModelVersion)?
+```
+
+**Why the bad interleaving is now impossible, not unlikely** — three independent reasons, each
+sufficient on its own:
+
+1. **No parameter.** There is no argument by which a caller can name a version other than the one
+   already loaded. "The meeting requested a switch" is not an expressible call. This is the
+   reviewer's own suggested direction (ii), pinning the seam to whatever is loaded, enforced by
+   the signature rather than by a rule.
+2. **No suspension point.** The method is not `async` and not `throws`. Its whole body is two
+   stored-property reads and a tuple construction, so it runs to completion between two of the
+   caller's instructions. There is no `await` at which anything can interleave — which is exactly
+   the property round 2's `@MainActor` argument was wrongly claimed to provide.
+3. **No reachable eviction.** It calls nothing. `ensureModelsLoaded`,
+   `ensureUnifiedModelsLoaded`, `ensureNemotronModelsLoaded` and `cleanupLoadedManagers` are all
+   `private` to `FluidAudioTranscriptionService.swift`, and
+   `scripts/negative-controls/FluidAudioSharedModelAttacks.swift` — compiled INTO THE APP TARGET
+   on every CI run, which is the realistic attacker for `private` — must not compile. Five
+   attacks, five compiler diagnostics, verified line-anchored (output quoted below).
+
+`FluidAudioMeetingSegmentTranscriber` no longer holds a `version` at all: it cannot want one.
+
+**The corrected comment.** Round 2's misleading paragraph is gone. The accessor now carries, in
+full: that the class has no actor isolation of its own; that `@MainActor` initiation does NOT
+serialise the operations because all of them suspend; the exact defect round 2 shipped and why;
+the three structural reasons above; and — separately — the two costs, neither hidden. Its
+operative text:
+
+> This version removes the ability rather than documenting the hazard: it is NOT `async` and NOT
+> `throws` ... so it contains no suspension point at which anything can interleave. It takes NO
+> parameter ... so "the meeting requested a version switch" is not an expressible call. It calls
+> nothing ... `scripts/negative-controls/FluidAudioSharedModelAttacks.swift` is compiled into the
+> app target on every CI run and MUST NOT COMPILE, which is what keeps that true rather than
+> conventional.
+>
+> Consequence, deliberately accepted: the meeting seam is PINNED to whatever version dictation
+> already has loaded, and returns nil when nothing is loaded ... Getting a model loaded stays
+> entirely dictation's job.
+>
+> The reverse direction is NOT closed and is not claimed to be: dictation switching models still
+> evicts a manager a meeting is mid-way through using. That asymmetry is the point — protecting
+> the daily dictation flow outranks a meeting chunk.
+
+**What this costs, and where it is recorded.** Two things, both in FOLLOWUPS.md rather than
+buried here: (a) a meeting chunk transcribed while dictation has nothing loaded throws
+`MeetingSegmentTranscriberError.sharedModelNotLoaded`, which
+`MeetingTranscriptionCoordinator` degrades to its flat-fallback path — so a composition root must
+load the selected model through the EXISTING dictation API (`loadModel(for:)`, as `VoiceInkEngine`
+already does at recording start), not through the meeting seam; (b) the asymmetry above. The
+coordinator's catch is typed (`catch MeetingSegmentTranscriberError.sharedModelNotLoaded`), not
+blanket, and `MeetingTranscriptionCoordinatorTests` carries both halves — the new
+`sharedModelNotLoadedDegradesToFallback` and the pre-existing
+`segmentTranscriberFailurePropagates` control, which would fail if the catch were ever widened.
+
+Still additive upstream: `git diff origin/phase-1-integration` on both upstream files is
+`47 ++++` / `26 ++++`, **0 deletions**. No third upstream file was needed.
+
+#### B2 — the timeout ceiling was false, and its proof proved the wrong thing
+
+**The finding, accepted in full**, including the part about the evidence. `withTaskGroup` is
+structured concurrency: it cannot return until every child finishes, so `group.cancelAll()`
+followed by leaving the group still awaits the loader. Round 2's proof (a "60s" loader completing
+in 0.214s against a 0.2s deadline) was real output demonstrating the wrong property: the loader
+was `try await Task.sleep`, which IS cancellation-aware and threw the instant cancellation
+arrived. That test could not have failed even if the ceiling were entirely fictional, which it
+was. The retraction is recorded inline above, next to the original quote.
+
+**The design: an unstructured load and an independently expiring deadline, which are siblings,
+not parent and child.** `startLoadIfNeeded()` creates one `Task` for the load and a separate
+`Task` for the deadline, stamps both with a generation `UUID`, and returns. Nothing in the actor
+ever awaits `loadTask`. `expireLoad(id:)` resumes every waiter with `.loadTimedOut`, cancels the
+load task best-effort, sets `activeLoadID = nil`, and returns — it does not await the loader, so
+the caller's return time depends on the deadline task alone.
+
+**Why the caller's bound now holds regardless of the loader**, and why each review requirement is
+met:
+
+- *Timeout completion does not await the loader*: there is no structured construct anywhere in
+  the path. `withTaskGroup`, `async let` and `TaskGroup` are all gone; both tasks are
+  unstructured `Task`s that the actor stores and forgets.
+- *Quarantine by load ID*: `finishLoad(id:_:)` opens with `guard activeLoadID == id else
+  { return }`. A late result from an abandoned generation is dropped on the floor; it cannot
+  install a manager into a generation that already gave up on it.
+- *A subsequent attempt gets a FRESH load*: `expireLoad` clears `activeLoadID`, so the next call
+  starts a new generation with a new id rather than joining the abandoned one.
+- The cost of that — an abandoned blind load running alongside its replacement — is recorded in
+  FOLLOWUPS.md, not hidden. It costs memory and CPU, never correctness, because of the id guard.
+
+**B2 PROOF, against a genuinely cancellation-BLIND loader.** The fixture is
+`CancellationBlindLoader` in `FluidAudioMeetingDiarizerTests.swift`. It is not `Task.sleep`:
+nothing in its path checks `Task.isCancelled`, nothing in it can throw `CancellationError`, it
+parks on a plain `withCheckedContinuation` (which has no cancellation semantics at all), and the
+blocking wait is `DispatchSemaphore.wait()` on a detached OS thread — a kernel wait
+`Task.cancel()` cannot interrupt — so the cooperative pool is never blocked and the loader
+genuinely keeps running after cancellation. It is completed only by the test calling `release()`.
+
+The test asserts the thing round 2 never did: not merely that the caller returned on time, but
+that **at the moment it returned, the loader had not finished** (`finishCount == 0`,
+`isStillRunning`), and that when the loader finally does return it reports that cancellation had
+been delivered to its task and ignored (`observedCancellationOnFinish == true`).
+
+**And a control, because a passing test proves nothing unless it could have failed.** Round 2's
+ceiling test passed while the ceiling was fictional, so
+`roundTwoStructuredCeilingDoesNotBoundABlindLoader` attacks that hole from the other side: it
+runs the SAME blind loader against round 2's exact `withTaskGroup` shape (reproduced in the test
+file) and asserts that shape does NOT return, 2 seconds after a 0.2s deadline. The fixture is
+therefore shown to defeat the old design and be survived by the new one, which is the only thing
+that makes the new one's pass mean anything.
+
+Quoted from a real local run (`xcodebuild test`, full `VoiceInkTests` suite):
+
+```
+Test case 'FluidAudioMeetingDiarizerTests/hungCancellationBlindLoadIsBoundedByTheCeiling()' passed on 'My Mac - VoiceInk Dev (9337)' (1.026 seconds)
+Test case 'FluidAudioMeetingDiarizerTests/afterTheCeilingFiresTheNextAttemptStartsAFreshLoad()' passed on 'My Mac - VoiceInk Dev (9337)' (1.054 seconds)
+Test case 'FluidAudioMeetingDiarizerTests/lateResultFromAnAbandonedLoadIsQuarantined()' passed on 'My Mac - VoiceInk Dev (9337)' (1.026 seconds)
+Test case 'FluidAudioMeetingDiarizerTests/roundTwoStructuredCeilingDoesNotBoundABlindLoader()' passed on 'My Mac - VoiceInk Dev (9337)' (2.064 seconds)
+```
+
+**How to read those numbers, since round 2's numbers were also real.** The wall-clock times are
+NOT the evidence; the in-test assertions are, and the durations only rule out the trivial
+explanation. `hungCancellationBlindLoadIsBoundedByTheCeiling` at 1.026s against a 0.2s deadline
+asserts, at the instant the caller returned, `loader.finishCount == 0` and `loader.isStillRunning`
+-- so the caller demonstrably did not return because the load ended. Its remaining ~0.8s is the
+test then releasing the loader and waiting for it to drain, after which it asserts
+`observedCancellationOnFinish == true`: cancellation HAD been delivered to the load task and the
+load ignored it. The control at 2.064s is the same loader against round 2's shape, still not
+returned two full seconds after a 0.2s deadline. Same fixture, opposite outcomes.
+
+The full local `VoiceInkTests` suite is green with these in it: **411 test cases passed, 0
+failed, `** TEST SUCCEEDED **`**.
+
+
+#### B3 — retroactive `@unchecked Sendable` on a third-party type
+
+**The finding, accepted in full.** `extension DiarizerManager: @unchecked Sendable {}` is a
+module-wide promise that FluidAudio's mutable class may cross concurrency domains safely, no
+matter what the comment above it claims, and every future FluidAudio bump inherits it silently.
+A grep-based sole-owner convention is neither scoped nor enforceable.
+
+**The design.** The conformance is deleted. In its place, a `private` single-field wrapper:
+
+```swift
+private struct LoadedDiarizerBox: @unchecked Sendable {
+    let manager: DiarizerManager
+}
+```
+
+Why this is genuinely narrower rather than the same promise wearing a hat: the conformance is on
+a `private` type declared in this file, so it cannot be seen, extended or relied on anywhere else
+in the target, and a future FluidAudio version cannot acquire it. Its two use sites are one hop —
+created inside the load task, immediately consumed by `finishLoad`, which stores the manager in
+actor-isolated state — and the manager is reachable from nowhere else at that moment.
+
+The redesign the reviewer offered as the alternative was taken as well, where it applies: the
+test seam no longer hands a `DiarizerManager` out of the actor at all.
+`resolvedManager()` is `private` again, and `resolvedManagerIdentity()` returns an
+`ObjectIdentifier` — a `Sendable` value — so a test can still assert two calls resolved the SAME
+instance while the actor's exclusive ownership is widened by exactly nothing. That is strictly
+stronger than round 2, which widened `resolvedManager()` to `internal`.
+
+**What could NOT be proven, stated plainly.** The natural compile-time control for this — assert
+`DiarizerManager` is not `Sendable` in this target — does not work here. The project builds in
+the Swift 5 language mode (`SWIFT_VERSION = 5.0`, no `SWIFT_STRICT_CONCURRENCY`), where a missing
+`Sendable` conformance is a warning, not an error. It was written as a sixth negative-control
+attack, produced no diagnostic at all, and the verifier correctly reported it as a missing
+expectation rather than passing quietly; it was then removed and the reason recorded in the
+attack file itself. The regression tripwire for B3 is therefore a text scan
+(`SharedModelDuplicationTests.diarizerDoesNotRetroactivelyConformAPackageType`, asserting the
+file contains no `extension DiarizerManager`), and it is labelled there as the weaker thing it
+is. It catches the exact regression by name; it does not prove the absence of every possible
+retroactive conformance.
+
+#### `SharedModelDuplicationTests` — record kept accurate, language not upgraded
+
+The source scan remains a modest regression tripwire and is now labelled as one in the file's own
+header: indirection defeats a substring scan, and it cannot prove that composition injects the
+same instance. That wording was NOT strengthened despite B1's fix being stronger; the stronger
+claim lives where it can be enforced, in the negative control. The one changed assertion tracks
+the renamed accessor and pins the no-argument call shape
+(`contains("sharedService.borrowedAsrManager()")`), so a reintroduced parameterised accessor
+fails here as well as failing the negative control.
+
+### Fix round 4 (cross-vendor review of fix round 3: B4.1-B4.4)
+
+Round 3 was validated on the parts that mattered most -- B1 reasons (i) and (ii), B2's ceiling and
+its blind-loader proof, the module-wide `@unchecked Sendable` removal, and the negative-control
+verifier itself. Round 4 fixes two holes in claims round 3 MADE, and two defects review found
+new. The uncomfortable pattern worth stating plainly: both holes were places where a sentence in
+a comment asserted enforcement that the code did not have. That is now the third time on this
+branch, so round 4 spends its effort on making the claims checkable rather than on new prose.
+
+#### B4.1 -- guarantee (iii) was false: `cleanup()` is internal
+
+**The finding, accepted in full.** Round 3's accessor comment said "It calls nothing ... those
+remain `private`", then parenthetically noted `cleanup()` is internal and substituted "is called
+from no meeting file". A convention, inside a paragraph claiming enforcement, for the single most
+dangerous call in the file: `cleanup()` nils the loaded CoreML models out of the active dictation
+manager. Worse, `FluidAudioSharedModelAttacks.swift` never tried it, so a suite named for this
+property did not test it.
+
+**The fix: capability narrowing, not a comment.** `FluidAudioMeetingSegmentTranscriber` no longer
+holds `FluidAudioTranscriptionService`. Its initializer takes `any MeetingAsrManagerBorrowing`
+(one member: `borrowedAsrManager()`), and it stores a closed-over `MeetingAsrManagerBorrow`
+capability -- a `@MainActor @Sendable` closure, which has no members at all. `cleanup()`,
+`loadModel(for:)` and the concrete type are not nameable in that file. Three new attacks enforce
+it, and they fired first time (full verifier output quoted under GATES):
+
+```
+    ok  line 66: value of type 'any MeetingAsrManagerBorrowing' has no member 'cleanup'
+    ok  line 71: value of type 'any MeetingAsrManagerBorrowing' has no member 'loadModel'
+    ok  line 75: cannot convert value of type 'any MeetingAsrManagerBorrowing' to specified type 'FluidAudioTranscriptionService'
+```
+
+> **RETRACTED by fix round 5 — these diagnostics are real, and the guarantee they were offered as
+> evidence for was FALSE.** All three attacks pass, and the boundary was still defeated, because
+> the list did not contain a downcast. Line 75 is the tell: it tests COERCION
+> (`let _: FluidAudioTranscriptionService = borrowing`), which errors, while the sibling form
+> `borrowing as? FluidAudioTranscriptionService` compiled with zero diagnostics and reached
+> `cleanup()`. Round 4 read a green suite as a proven boundary when it was only a proven list.
+> See "Fix round 5" below for the replacement design and the split, one-mechanism-per-file suite.
+
+**Why the bad state is impossible rather than unlikely:** eviction is not a call the seam is
+allowed to fail to make; it is a call that does not type-check where the seam lives. The
+protocol and the closure are the entire surface, and both are checked by the compiler on every CI
+run rather than by a reviewer reading call sites.
+
+**And what stays CONVENTIONAL, said as such** (this is the clause round 3 got wrong, so it is
+spelled out here and in FOLLOWUPS.md): `cleanup()` is unchanged and still `internal`, because
+making it `private` means changing its existing upstream callers -- larger than the
+accessor-sized touchpoint authorised, so not done. App-target code that obtains the CONCRETE
+service can still call it. ENFORCED: the meeting seam is never given that concrete type.
+CONVENTIONAL: that a future meeting file does not reach around the capability to fetch the
+service itself.
+
+The upstream touchpoint is untouched by this: the protocol and its conformance live in a
+fork-owned file (`MeetingAsrSharing.swift`), so `FluidAudioTranscriptionService.swift` stays at
+the same `47 ++++ / 0 deletions` review has already accepted.
+
+#### B4.2 (new) -- sharing the actor protected memory and exposed latency
+
+**The finding, accepted in full.** `AsrManager` is a `public actor`, so meeting and dictation
+inference are mutually serialized. A dictation Mark starts a moment after a meeting chunk entered
+`transcribe` queues behind that inference. Round 3's comment presented that serialization purely
+as safety. It is both, and the value at risk is the same one the whole task has been protecting,
+one layer down: not memory now, Mark waiting on his own dictation.
+
+**The policy: dictation-priority admission.** `admitAndBorrow()` reads the priority check and
+takes the manager as two synchronous statements in ONE `@MainActor` step. A refusal raises
+`.dictationHasPriority`, which `MeetingTranscriptionCoordinator` routes to its flat-fallback path
+(losing per-token segment timings for that chunk, which `MicTurnNormalizer` then sentence-splits
+-- the donor's own behaviour for every other backend).
+
+**What it GUARANTEES:** a meeting chunk never STARTS inference while dictation is active or
+pending. There is no window rather than a narrow one: `VoiceInkEngine` starts a dictation on
+`@MainActor`, and there is no `await` between the check and the borrow, so dictation cannot flip
+from idle to active inside that step.
+
+**What it does NOT guarantee, stated plainly:**
+- It cannot PREEMPT. A dictation starting after `manager.transcribe` is already running still
+  queues behind that chunk. The exposure is one chunk's inference, and that duration has never
+  been measured on real hardware with real models -- it is in FOLLOWUPS.md with the other
+  real-audio prerequisites rather than guessed at here. Preempting would need cancellation inside
+  FluidAudio's own inference, which this fork cannot add from outside.
+- It is only as good as the closure a composition root supplies. There is deliberately NO
+  default, so the decision cannot be inherited silently; attack E9 asserts that omitting it does
+  not compile (`missing argument for parameter 'isDictationActiveOrPending' in call`).
+
+#### B4.3 -- abandoned loads could accumulate without bound
+
+**The finding, accepted in full.** Round 3 disclosed "one abandoned load alongside its
+replacement". Against a PERMANENTLY stuck load that understates it: every later meeting `stop()`
+could start another cancellation-blind CoreML load. The UUID guard prevents stale STATE, not
+stale RESOURCES.
+
+**The fix: a circuit breaker.** `expireLoad` increments `outstandingAbandonedLoads`; only a load
+actually reporting back decrements it. While the count is at `maxOutstandingAbandonedLoads` (1),
+`startLoadIfNeeded` throws `.loadAbandonedAndStillOutstanding` BEFORE creating either task.
+
+**Why unbounded accumulation is now impossible:** the count is incremented on the same
+actor-isolated step that abandons a generation and checked on the same actor-isolated step that
+would start one, so there is no interleaving in which two abandonments both pass the guard. At
+most two loads exist at once -- one live, one abandoned -- for any number of meetings.
+
+**Proof, using the existing blind-loader fixture** (`abandonedLoadsAreCappedSoTheyCannotAccumulate`):
+one load is abandoned, then FIVE further attempts each fail with
+`.loadAbandonedAndStillOutstanding` while `startCount` stays at 1 and `finishCount` at 0 -- round
+3 would have started five more. Each refusal is asserted to return in under 150ms, i.e. below the
+200ms ceiling, proving it refuses rather than waiting out another deadline. Releasing the stuck
+load then closes the breaker and the next attempt starts load number two, not number seven.
+
+If the abandoned load never returns, the breaker stays open for the session. That is the intended
+outcome, not a regression: a failed diarization is recoverable (audio and segments are persisted
+before `stop()` reaches this call), and the alternative is the accumulation this fixes.
+
+#### B4.4 -- the injectable seam let a caller supply and retain a manager
+
+**The finding, accepted in full**, including the observation that this is the third test-only seam
+on this project that turned out to be a real hole. Round 3's initializer took
+`() async throws -> DiarizerManager`, so any same-module caller could construct a manager, RETAIN
+it, and hand it in while the actor treated it as exclusively its own. "Reachable from nowhere
+else" was false against the available API.
+
+**The fix is the seam's TYPE, not a configuration gate.** `#if DEBUG` was considered and
+rejected on the reasoning already paid for here: the next integrator writes and runs code in
+Debug, which is how the previous seams leaked. Instead the injectable initializer takes
+`loadStep: () async throws -> Void`. It decides only WHEN a generation completes -- hang, throw,
+succeed -- and its type has nowhere to put a manager.
+
+**Why supplying one is now impossible:** the actor constructs every `DiarizerManager` itself,
+inside its own load task, from `DiarizerModels`. `DiarizerModels` is FluidAudio's own
+`public struct ... Sendable` whose memberwise initializer is NOT public, so no code in this
+target can fabricate one either. A production-module caller of the injectable initializer
+therefore gains no capability a test has, which is why leaving it `internal` is safe. Attack E10
+pins the old signature as gone (`extra argument 'loadManager' in call`), and
+`injectedLoadStepCannotSupplyTheManagerTheActorResolves` pins the behaviour at runtime: a manager
+the closure constructs and retains is not the one the actor resolves.
+
+A side effect worth recording: `LoadedDiarizerBox` is gone too. Round 3 needed it because a
+manager was carried from the load task into the actor; round 4 moves the construction ONTO the
+actor (`finishLoad`), so the only value crossing that hop is `DiarizerModels?`, which FluidAudio
+already declares `Sendable`. There is now **no `@unchecked` conformance anywhere in the production
+meeting-transcription code**.
+
+Precisely, since this is the kind of clause that has been wrong before: the `Result`'s error half
+is `any Error`, which is not `Sendable`, so errors do cross that hop -- as they do at every
+`async throws` boundary in this codebase. The claim is about the manager and the models, the
+values B3 and B4.4 are actually about, not that the hop carries nothing.
+
+#### Three comment clauses I wrote in this round and then found false
+
+Caught by re-reading my own diff against the code before pushing, in the specific places the bar
+says to look. Recording them because "the comment was wrong" has been the actual bug on this
+branch once already:
+
+1. "`FluidAudioMeetingSegmentTranscriber` stores this protocol type" -- it stores the closure, not
+   the existential, after the isolation fix above. Corrected to say the initializer takes the
+   protocol and the stored form is narrower.
+2. "The actor constructs every `DiarizerManager` itself, inside `finishLoad`" -- as first written
+   it constructed it inside the load TASK, which is not the actor. Rather than correct the comment
+   to match the code, the CODE was changed to match the safer claim, which also removed the last
+   isolation crossing of a non-Sendable value.
+3. "the manager is never carried across an isolation boundary at all" -- true only after fix (2),
+   and still needed the `any Error` qualification above to be honest.
+
+#### An isolation bug found while fixing B4.1, and how
+
+The first draft of the capability stored `any MeetingAsrManagerBorrowing` on the actor and read
+it from a `@MainActor` method. The build succeeded, but emitted
+`actor-isolated property 'borrowing' can not be referenced from the main actor; this is an error
+in the Swift 6 language mode`. Rather than accept a warning under this target's Swift 5 mode, the
+design was changed to store a `@MainActor @Sendable` closure (`MeetingAsrManagerBorrow`), which
+IS `Sendable`, so the property is honestly `nonisolated`. That was verified directly rather than
+inferred from a quiet build: the shape was type-checked standalone under
+`swiftc -swift-version 5 -strict-concurrency=complete`, which reports the existential version and
+accepts the closure version with no diagnostics. The closure is also strictly narrower than the
+protocol, since a closure has no members at all.
+
+### Fix round 5 (cross-vendor review of fix round 4: B1, B2)
+
+Round 4 was accepted on the diarizer ceiling (with its cancellation-blind fixture and the round-2
+control), on `MeetingEngine.stop()` no longer being able to hang, on removing the module-wide
+`extension DiarizerManager: @unchecked Sendable`, on `borrowModel`'s release discipline, on the
+naive-killer test and on fallback timestamp safety. None of that is touched here.
+
+Two findings remained. Both were verified against the real code before anything was changed,
+because a claim from a reviewer is a hypothesis, not a fact — and on this branch the last four
+rounds have each shipped at least one comment whose text outran what the code did.
+
+#### B1 — the capability boundary was defeated by a downcast. CONFIRMED, then fixed.
+
+**Verification first.** The claim was built, not read. A probe file was staged into the app target
+and compiled with a full `xcodebuild`:
+
+```swift
+@MainActor
+func probeDowncast(borrowing: any MeetingAsrManagerBorrowing) async {
+    if let concrete = borrowing as? FluidAudioTranscriptionService {
+        await concrete.cleanup()
+    }
+}
+```
+
+```
+=== BUILD EXIT: 0 (0 = THE ATTACK COMPILED) ===
+=== diagnostics against __Probe.swift ===
+=== other errors ===
+```
+
+Zero diagnostics. The finding reproduces exactly: an existential carries its concrete type and
+hands it back to anyone who writes `as?`, so round 4's "`cleanup()` is not a member of this type"
+was true of the protocol and false of what a holder of the protocol could do. Round 4's own
+attack suite tested *coercion* (`let _: FluidAudioTranscriptionService = borrowing`), which
+errors, and never tested the downcast beside it.
+
+**The fix: a value, not an existential.** `MeetingAsrRuntimeAccess` is a `struct` whose only
+stored properties are two `@MainActor @Sendable` closures. `FluidAudioMeetingSegmentTranscriber`
+takes and stores that value. There is no protocol existential to downcast, no class reference to
+recover, and no member to call but the capability itself. The protocol
+`MeetingAsrManagerBorrowing` and its retroactive conformance are DELETED, so the type that
+carried the concrete service no longer exists anywhere in the seam.
+
+**Why the unsafe call cannot be expressed**, mechanism by mechanism, each verified by compiling
+it (full list and verbatim diagnostics under GATES below):
+
+- `access as? FluidAudioTranscriptionService` and `access as!` — a struct and a class are
+  unrelated types, so the compiler does not merely fail to find a conversion, it **proves the cast
+  can never succeed**: `cast from 'MeetingAsrRuntimeAccess' to unrelated type
+  'FluidAudioTranscriptionService' always fails`.
+- `access.cleanup()` / `access.loadModel(for:)` — `value of type 'MeetingAsrRuntimeAccess' has no
+  member 'cleanup'` / `... has no member 'loadModel'`.
+- `let _: FluidAudioTranscriptionService = access` — `cannot convert value of type ... to
+  specified type ...`.
+- Downcasting the closure itself, which is the field that actually captures the service —
+  `cast from 'MeetingAsrManagerBorrow' (aka '@MainActor @Sendable () -> ...') to unrelated type
+  'FluidAudioTranscriptionService' always fails`.
+
+**What COMPILES, disclosed rather than argued away.** Three attack classes are legal Swift against
+any value and are not prevented:
+
+1. **`as?` / `as!` themselves compile** — they produce a warning, not an error, so the build
+   succeeds. They cannot *succeed*: the compiler statically proves they always fail, `as?` yields
+   nil and `as!` traps. The controls for these run in a new `must-warn` verifier mode that asserts
+   the "always fails" diagnostic is PRESENT, precisely because its disappearance is what a
+   regression to an existential would look like.
+2. **`Mirror`, extensions and type-erased generic casts compile.** Their safety is a runtime
+   property, so it is asserted at runtime in
+   `Tests/.../MeetingCapabilityReflectionAttackTests.swift` rather than left as an argument.
+   Measured result: `Mirror` yields the two closures as **empty tuples** — the Swift runtime
+   cannot even demangle a `@MainActor @Sendable` closure type — so neither a one-level walk nor a
+   recursive one to depth 8 ever reaches the captured service.
+3. **`unsafeBitCast` and raw memory are NOT defended against**, and no test pretends otherwise.
+   The closures genuinely do capture the service in their context, so reconstructing an
+   undocumented closure-context layout would reach it. That is a cost, not a defence. It is
+   recorded the same way FOLLOWUPS.md already records it for `MeetingStore`.
+
+**And what stays CONVENTIONAL, said as such.** `MeetingAsrSharing.swift` itself names
+`FluidAudioTranscriptionService`, in one function,
+`MeetingAsrRuntimeAccess.sharingDictationRuntime(of:isDictationActiveOrPending:)`. Minting a
+capability from a service is what an adapter is for, and authority is delegated at exactly one
+place rather than nowhere. `cleanup()` remains `internal`, so code that already holds the concrete
+service can still call it — that is dictation's own lifecycle API and making it `private` would be
+a change to upstream code beyond this PR's authorised touchpoints. What round 5 changed is that
+the meeting seam is no longer such code, and can no longer *become* such code by writing `as?`.
+
+#### B2 — scoped down per Mark's ruling: hoist what can be hoisted, disclose the rest.
+
+**Verification first.** `decoderLayerCount` is a `public var` on `public actor AsrManager`
+(FluidAudio `AsrManager.swift:24`), so reading it from outside genuinely requires `await` and is a
+suspension. The finding reproduces.
+
+**(a) What was closed, at zero cost.** Round 4 ran: check → `await manager.decoderLayerCount` →
+`await manager.transcribe(...)`. The `decoderLayerCount` read is a full round trip into the
+`AsrManager` actor and back, sitting *between* the decision and the inference. Round 5 hoists it
+ABOVE the final check and adds `reconfirmDictationIsIdle()` immediately before `transcribe`, so
+the ordering is now: early check + borrow → `decoderLayerCount` → **final check** → `transcribe`.
+
+**Every remaining `await` between the final check and inference: exactly one.** It is
+`await manager.transcribe(url, decoderState: &decoderState)` — the hop from `@MainActor` into the
+`AsrManager` actor. Nothing else suspends in between:
+`TdtDecoderState.make(decoderLayers:)` is a synchronous static function on a `Sendable` struct
+(FluidAudio `TdtDecoderState.swift:52`), and the local `var decoderState` is a plain assignment.
+
+**(b) What was NOT attempted.** Shared admission with the dictation path. Per Mark's explicit
+scope ruling, that is a materially larger change into code this fork merges from a daily-pushed
+upstream, and is his call.
+
+**(c) The residual, recorded as a HARD PREREQUISITE.** FOLLOWUPS.md's new `⛔ WIRING GATE` carries
+it as gate item 2, with the exact suspension, the losing interleaving (a dictation enqueues on the
+`AsrManager` actor after our check returned but before our `transcribe` lands, so it queues
+behind the chunk), the user-visible consequence (latency on a dictation Mark starts mid-chunk;
+no data loss, no eviction), and the statement that closing it requires shared admission.
+
+#### The not-wired status, made hard to lose
+
+Nothing in production constructs this coordinator; `MeetingEngine` still defaults to
+`NullMeetingTranscriptionCoordinator`. FOLLOWUPS.md now opens that region with a single
+`⛔ WIRING GATE` heading and a five-row table: real-model smoke testing, the B2 residual, a
+dictation-priority closure that is actually correct (passing `{ false }` silently disables
+admission entirely), transcribe.cpp concurrent-session safety, and a diarizer timeout chosen from
+data rather than picked. A future session cannot wire this without reading it.
+
+#### Verifier changes, and the check that it still fails correctly
+
+The single `FluidAudioSharedModelAttacks.swift` is gone, replaced by **one mechanism per file** —
+eight files, each compiled in its own build, so no attack can borrow another's diagnostics or
+another's conformances. Three verifier changes:
+
+- A `must-warn` mode, for controls whose diagnostic is a warning rather than an error.
+- A guard rejecting markers of the wrong kind for the mode, so an `expect-error` in a `must-warn`
+  file cannot sit there unchecked and read as coverage.
+- A same-line-collision check: two markers expecting diagnostics on the SAME line are rejected,
+  because one diagnostic would satisfy both. Duplicate marker TEXT on DIFFERENT lines is reported
+  as a note and allowed, because matching is line-anchored —
+  `MeetingStoreIsolationAttacks.swift` relies on that deliberately (A3 and A14 produce identical
+  text) and its header already records why.
+
+### GATES
+
+Full local `VoiceInkTests` suite green (`xcodebuild test-without-building`, all suites including
+every new file in this fix round). CI green on PR #16 (see the PR's own checks). Both re-verified
+after this fix round, not just the original round — see the PR conversation for the exact run.
+
+**Fix round 4 gates.** Full local `VoiceInkTests` suite green: **414 test cases passed, 0
+failed**, `** TEST SUCCEEDED **`. Negative controls green with all ten attacks firing on the
+exact lines their markers name, quoted verbatim from
+`scripts/verify-meeting-store-isolation.sh`:
+
+```
+==> FluidAudioSharedModelAttacks.swift
+  --- compiler diagnostics ---
+    __NegativeControl.swift:30:57: error: argument passed to call that takes no arguments
+    __NegativeControl.swift:36:23: error: 'ensureModelsLoaded' is inaccessible due to 'private' protection level
+    __NegativeControl.swift:40:19: error: 'cleanupLoadedManagers' is inaccessible due to 'private' protection level
+    __NegativeControl.swift:44:23: error: 'ensureUnifiedModelsLoaded' is inaccessible due to 'private' protection level
+    __NegativeControl.swift:48:23: error: 'ensureNemotronModelsLoaded' is inaccessible due to 'private' protection level
+    __NegativeControl.swift:66:21: error: value of type 'any MeetingAsrManagerBorrowing' has no member 'cleanup'
+    __NegativeControl.swift:71:26: error: value of type 'any MeetingAsrManagerBorrowing' has no member 'loadModel'
+    __NegativeControl.swift:75:45: error: cannot convert value of type 'any MeetingAsrManagerBorrowing' to specified type 'FluidAudioTranscriptionService'
+    __NegativeControl.swift:84:65: error: missing argument for parameter 'isDictationActiveOrPending' in call
+    __NegativeControl.swift:93:73: error: extra argument 'loadManager' in call
+  --- end diagnostics ---
+All negative controls still fail to compile, for the expected reasons,
+each on the exact line its marker names, with no unattributed diagnostics.
+```
+
+Upstream diff unchanged by round 4: still `47 ++++` / `26 ++++`, **0 deletions**, the same two
+authorised files. The capability protocol and its conformance are fork-owned
+(`MeetingAsrSharing.swift`), so no third upstream file was needed and no STOP-and-report was
+triggered. Files changed in round 4: `MeetingAsrSharing.swift` (new),
+`FluidAudioMeetingSegmentTranscriber.swift`, `MeetingTranscriptionCoordinator.swift`,
+`FluidAudioMeetingDiarizer.swift`, `FluidAudioMeetingDiarizerTests.swift`,
+`MeetingTranscriptionCoordinatorTests.swift`, `SharedModelDuplicationTests.swift`,
+`scripts/negative-controls/FluidAudioSharedModelAttacks.swift`,
+`scripts/verify-meeting-store-isolation.sh`, `FOLLOWUPS.md`, `FORK-PATCHES.md`.
+
+**Fix round 3 gates.** Full local `VoiceInkTests` suite green: 411 test cases passed, 0 failed,
+`** TEST SUCCEEDED **` (`xcodebuild test`, Debug, `platform=macOS`). Structural negative controls
+green, including the new one — quoted verbatim from `scripts/verify-meeting-store-isolation.sh`:
+
+```
+==> FluidAudioSharedModelAttacks.swift
+  --- compiler diagnostics ---
+    __NegativeControl.swift:30:57: error: argument passed to call that takes no arguments
+    __NegativeControl.swift:36:23: error: 'ensureModelsLoaded' is inaccessible due to 'private' protection level
+    __NegativeControl.swift:40:19: error: 'cleanupLoadedManagers' is inaccessible due to 'private' protection level
+    __NegativeControl.swift:44:23: error: 'ensureUnifiedModelsLoaded' is inaccessible due to 'private' protection level
+    __NegativeControl.swift:48:23: error: 'ensureNemotronModelsLoaded' is inaccessible due to 'private' protection level
+  --- end diagnostics ---
+    ok  line 30: argument passed to call that takes no arguments
+    ok  line 36: 'ensureModelsLoaded' is inaccessible due to 'private' protection level
+    ok  line 40: 'cleanupLoadedManagers' is inaccessible due to 'private' protection level
+    ok  line 44: 'ensureUnifiedModelsLoaded' is inaccessible due to 'private' protection level
+    ok  line 48: 'ensureNemotronModelsLoaded' is inaccessible due to 'private' protection level
+All negative controls still fail to compile, for the expected reasons,
+each on the exact line its marker names, with no unattributed diagnostics.
+```
+
+Upstream diff still `47 ++++` / `26 ++++`, **0 deletions** across the two authorised files. Files
+changed in fix round 3: `FluidAudioTranscriptionService.swift` (accessor replaced, still purely
+additive), `FluidAudioMeetingSegmentTranscriber.swift`, `MeetingTranscriptionCoordinator.swift`,
+`FluidAudioMeetingDiarizer.swift`, `FluidAudioMeetingDiarizerTests.swift`,
+`MeetingTranscriptionCoordinatorTests.swift`, `SharedModelDuplicationTests.swift`,
+`scripts/negative-controls/FluidAudioSharedModelAttacks.swift` (new),
+`scripts/verify-meeting-store-isolation.sh`, `.github/workflows/ci.yml` (step renamed),
+`FOLLOWUPS.md`, `FORK-PATCHES.md` (this section).
+
+No upstream file touched beyond the ONE authorised touchpoint above (2 files:
+`FluidAudioTranscriptionService.swift`, `OfflineTranscribeCppService.swift`, both purely
+additive). No SPM dependency added. Files changed in the previous fix round:
+`FluidAudioTranscriptionService.swift`, `OfflineTranscribeCppService.swift`,
+`FluidAudioMeetingSegmentTranscriber.swift`, `TranscribeCppMeetingSegmentTranscriber.swift`,
+`FluidAudioMeetingDiarizer.swift`, `FluidAudioMeetingDiarizerTests.swift` (new),
+`TranscribeCppMeetingSegmentTranscriberTests.swift` (new), `SharedModelDuplicationTests.swift`
+(new), `FOLLOWUPS.md`, `FORK-PATCHES.md` (this section).

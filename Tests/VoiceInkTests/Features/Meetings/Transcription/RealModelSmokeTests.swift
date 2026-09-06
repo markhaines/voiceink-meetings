@@ -73,7 +73,7 @@
 // gate mode on a CI runner by accident; if they do, a loud failure beats a silent green.
 //
 // MAKING THAT FAILURE SELF-EXPLANATORY -- CORRECTLY, THIS TIME. An earlier round of this fix put
-// the explanation (naming the missing prerequisite and the CI environment) into the three
+// the explanation (naming the missing prerequisite and the CI environment) into the
 // `.disabled(if: ..., "...")` SKIP messages above and claimed a gate-mode failure would carry it.
 // That was wrong, and the reasoning error is worth stating precisely: `!isGateRunningMode` is
 // ANDed into every one of those `.disabled` conditions, so gate mode is EXACTLY the thing that
@@ -87,11 +87,16 @@
 // prerequisite explicitly, under `if isGateRunningMode { ... }`, BEFORE touching any real
 // FluidAudio/diarizer work, and throws `GateModePrerequisiteMissing` (see below) with a message
 // naming the specific missing prerequisite and, when `isRunningInCI` is also true, stating
-// plainly that `VOICEINK_CI` identifies this environment as a CI runner with no downloaded models
-// or real audio hardware by design -- so a reader of a red CI run understands "this runner cannot
-// satisfy this gate," not "the product is broken." Because this check only fires when the
-// prerequisite is ACTUALLY missing, it never masks a genuine failure in the real load/inference
-// path on a machine where the prerequisite is present.
+// plainly that `VOICEINK_CI` identifies this run as CI mode and that THIS runner lacks the
+// prerequisite just named -- deliberately NOT a universal claim that CI has no models or audio
+// hardware at all (an earlier version of this note said exactly that, and it was false: in the
+// very run that proved this mechanism, the diarizer's model WAS present and that test passed for
+// real in the same invocation where Parakeet's model was absent -- `VOICEINK_CI` only establishes
+// that this is CI mode, never that every prerequisite is unmet). So a reader of a red CI run
+// understands "this runner cannot satisfy THIS gate," not "the product is broken," without being
+// misled into thinking every gate or every prerequisite must be absent here. Because this check
+// only fires when the prerequisite is ACTUALLY missing, it never masks a genuine failure in the
+// real load/inference path on a machine where the prerequisite is present.
 //
 // What gate mode still does NOT guarantee: anything on an ordinary run where gate mode is NOT
 // engaged (including every CI run and every plain local `xcodebuild test`) -- a missing
@@ -174,15 +179,19 @@ private let diarizerSkippedOnCIMessage: String = """
     """
 
 /// Appended to a gate-mode prerequisite-failure message when `isRunningInCI` is also true, so a
-/// reader of a red CI run is told plainly that this environment cannot satisfy the gate rather
-/// than mistaking the failure for a product defect. Empty on a non-CI machine: there, a missing
-/// prerequisite failing under gate mode needs no CI-specific caveat.
+/// reader of a red CI run is told plainly that THIS runner lacks the specific prerequisite named
+/// earlier in the same message, rather than mistaking the failure for a product defect. Emitted
+/// ONLY when `isRunningInCI` is true (see the `guard` below) -- a developer running gate mode
+/// locally with a missing prerequisite never sees a CI mention. Deliberately does NOT claim CI has
+/// no models or audio hardware in general: that claim would be false (this file's own diarizer
+/// prerequisite can be, and has been, present and passing on CI-mode runs where Parakeet's was
+/// not) -- `VOICEINK_CI` establishes only that this run is using CI mode, never that every
+/// prerequisite is unmet.
 private var ciEnvironmentNote: String {
     guard isRunningInCI else { return "" }
     return """
-         VOICEINK_CI is set, identifying this environment as a CI runner: CI has no downloaded \
-        models and no real audio hardware by design, so this failure here is expected -- it means \
-        this runner cannot satisfy this gate, not that the product is broken.
+         VOICEINK_CI is set, so this run is using CI mode; this runner lacks the prerequisite \
+        named above and cannot satisfy this gate -- that is expected here, not a product defect.
         """
 }
 

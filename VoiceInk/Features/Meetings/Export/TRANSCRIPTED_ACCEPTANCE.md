@@ -8,10 +8,32 @@ one.
 
 `TranscriptedMarkdownExporterTests.swift`'s `ReferenceIndexerParser`-based tests (byte-equality
 against a real fixture, the two-space separator, header-line-shape/mandatory-`/`/blank-line
-conformance, the `**`-in-speakerLabel identity proof, the sanitization fail-silent proofs) pin
+conformance, the speakerLabel identity proof (exported == resolved, and header == `speakers:`), the sanitization fail-silent proofs) pin
 this exporter's OUTPUT against a verbatim port of the real indexer's parsing rule, copied from
 source. These require no external binary, run everywhere, and their being green is genuine,
 unconditional proof that this exporter's format matches the real regex/chunking contract.
+
+## The speaker-label policy, and why it is only a last line of defence
+
+The real indexer deletes every literal `**` from an utterance's header line before it reads the
+label, and it unescapes nothing — not Markdown, not backslashes (`parseStyledTranscriptEntry`
+and `parseFrontmatterSpeakers`, both read from source). So a run of two or more consecutive
+asterisks in a speaker label CANNOT be represented: whatever the file stores is what a reader
+sees, and any `**` in it is silently deleted on the way into the index.
+
+`TranscriptSanitizer.speakerLabel` therefore collapses each run of 2+ asterisks to a single
+`*`, and leaves everything else — a lone `*` included — byte-identical. That is deterministic
+and idempotent, and it is deliberately, visibly lossy: `**Mark**` is exported and indexed as
+`*Mark*`, and `**` and `****` alike become `*`. Run length is not recoverable. Two earlier
+designs failed here — preserving `**` let the indexer silently rename the speaker; escaping
+every `*` stored backslashes the reader then sees forever, in both the transcript header and
+the `speakers:` names.
+
+**The durable fix is input validation at the speaker-rename UI, which is Phase 2 work that does
+not exist yet.** That is where a person can be told a name cannot be stored exactly while they
+still have the keyboard in their hands. This exporter's transform is a last line of defence
+behind that, not the primary guard, and it is documented as such in
+`TranscriptedMarkdownExporter.swift` as well as here.
 
 ## The real-indexer acceptance check — NOT YET a proven gate
 

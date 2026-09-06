@@ -354,17 +354,19 @@ private struct SanitizedSegment {
 ///   isn't mangled for a risk that isn't real. Newlines and other control characters are
 ///   removed/collapsed, because those are the only inputs that can put a line break inside a
 ///   single-line header.
-///   `*` is a DIFFERENT, SILENT failure, not a dropped-utterance one: before the header regex
-///   ever runs, `parseStyledTranscriptEntry` does
-///   `header.replacingOccurrences(of: "**", with: "")` on the WHOLE header line — the
+///   A RUN OF TWO OR MORE consecutive `*` is a DIFFERENT, SILENT failure, not a
+///   dropped-utterance one: before the header regex ever runs, `parseStyledTranscriptEntry`
+///   does `header.replacingOccurrences(of: "**", with: "")` on the WHOLE header line — the
 ///   timestamp's own `**MM:SS**` markup relies on exactly this to get stripped away. That
 ///   same call strips ANY `**` inside the label too: `"Jo**hn"` resolves to `"John"`,
 ///   `"**Mark**"` resolves to `"Mark"`, a label that is just `"**"` resolves to an EMPTY
 ///   string. The utterance survives (the regex still matches), but the resolved identity
 ///   silently differs from what this exporter wrote — which is worse than dropping the
-///   utterance, because there is no signal anywhere that anything changed. See
-///   `speakerLabel(_:)`'s own doc comment for the fix: every `*` is escaped so no `**`
-///   substring can ever reach the indexer's strip step.
+///   utterance, because there is no signal anywhere that anything changed.
+///   A LONE `*` IS NOT AFFECTED and is deliberately left alone: `replacingOccurrences` only
+///   matches the literal two-character substring, so `"a*b"`, `"*Mark*"` and `"* *"` already
+///   resolve back byte-identically. Verified directly against the real rule, not assumed —
+///   see `speakerLabel(_:)` for the policy applied to the runs that genuinely cannot survive.
 /// - `text` is transcription output. A literal blank line inside it (`\n\n`) IS the exact
 ///   chunk boundary above — it silently truncates the utterance: everything up to the blank
 ///   line survives as one dropped-looking-fine chunk, everything after becomes an orphaned
@@ -380,22 +382,57 @@ enum TranscriptSanitizer {
     /// the original to a person. `[`, `]`, `/` pass through untouched; see this type's doc
     /// comment for why those are safe.
     ///
-    /// `*` does NOT pass through untouched. THE INVARIANT: the label this exporter writes and
-    /// the label the real indexer resolves must be the same string. The indexer strips every
-    /// literal `**` from the whole header line unconditionally (see this type's doc comment) —
-    /// that is not a bug to route around, it is the mechanism that removes the timestamp's own
-    /// bold markup, and this exporter cannot change it. The only way to guarantee identity is
-    /// to make sure the label never CONTAINS the substring `**` (in any run — `"a***b"` strips
-    /// to `"a*b"` under the real rule, not just an exact pair) by the time it leaves this
-    /// exporter. Backslash-escaping every `*` — the same convention Markdown itself uses for a
-    /// literal asterisk, and consistent with this file's existing `yamlQuoted` escaping — does
-    /// exactly that: `"Jo**hn"` becomes `"Jo\*\*hn"`, which contains no `**` substring anywhere
-    /// (a backslash always sits between any two escaped asterisks), so the indexer's strip step
-    /// has nothing to remove from it. The resolved label is therefore always byte-identical to
-    /// what this exporter exported — never a silently different, shorter string. A bare `"**"`
-    /// label becomes `"\*\*"`, not `""`: the fix preserves that the source contained two
-    /// asterisks rather than erasing them, the same way it would for any other character.
+    /// THE INVARIANT, and the whole reason this function touches `*` at all: the label this
+    /// exporter WRITES and the label the real indexer RESOLVES must be the same string, and it
+    /// must be a string a human would recognise as the name they typed.
+    ///
+    /// The indexer strips every literal `**` from the whole header line unconditionally (see
+    /// this type's doc comment). That is not a bug to route around — it is the mechanism that
+    /// removes the timestamp's own bold markup, and this exporter cannot change it. It matches
+    /// the literal two-character substring only, so the hazard is EXACTLY "a run of two or more
+    /// consecutive asterisks", and nothing else:
+    ///
+    /// - Losslessly representable, LEFT ENTIRELY ALONE: no asterisk at all (`"Jane Doe"`,
+    ///   `"D'Angelo"`), and any lone asterisk (`"a*b"`, `"*Mark*"`, `"* *"`). Each of these
+    ///   already round-trips byte-identically through the real rule. Transforming them would
+    ///   corrupt input that was never at risk, so this function is a no-op for them — enforced
+    ///   by the early return below, not merely intended.
+    /// - Not representable at all: a run of 2+ asterisks. Whatever is written, the indexer
+    ///   deletes pairs from it, so no run of 2+ can survive. There is no encoding that fixes
+    ///   this, because the indexer performs NO unescaping of any kind — not Markdown, not
+    ///   backslashes (confirmed by reading `parseStyledTranscriptEntry`, and
+    ///   `parseFrontmatterSpeakers`, which only strips surrounding `"` characters). Writing
+    ///   `\*` therefore stores literal backslashes that the reader then SEES, in both the
+    ///   transcript header and the `speakers:` names — a persistent visible corruption, and the
+    ///   reason that approach was withdrawn.
+    ///
+    /// THE POLICY for that unrepresentable case: collapse each run of 2+ asterisks to a single
+    /// `*`. Deterministic, idempotent, and provably safe for any run length — the output can
+    /// contain no `**` substring at all, so the indexer's strip step has nothing to remove and
+    /// the resolved label is byte-identical to the exported one. It is LOSSY, deliberately and
+    /// visibly: `"**Mark**"` exports and indexes as `"*Mark*"`, `"Jo**hn"` as `"Jo*hn"`, and
+    /// `"**"` / `"****"` alike as `"*"`. Run length is not recoverable. That is the price of a
+    /// consumer with no escape syntax, and it is preferred to the alternatives:
+    /// - REJECTING the export would fail (or silently skip) a whole meeting because a speaker
+    ///   name has two asterisks in it — disproportionate, and there is no UI on this path to
+    ///   surface the rejection to anyone.
+    /// - SUBSTITUTING a Unicode lookalike (`∗`, U+2217) would round-trip, but stores a
+    ///   character the user never typed and cannot type back, and reads as a different name
+    ///   everywhere the label is later displayed or matched.
+    /// - MIRRORING the indexer and deleting the pairs ourselves would agree with the indexer
+    ///   while erasing the asterisks entirely, turning a bare `"**"` label into an empty
+    ///   string. Collapsing keeps the evidence that an asterisk was there.
+    ///
+    /// THIS IS A LAST LINE OF DEFENCE, NOT THE DURABLE FIX. The durable fix is input validation
+    /// at the Phase 2 speaker-rename UI, where a person can be told "that name cannot be stored
+    /// exactly" while they still have the keyboard in their hands. That UI does not exist yet.
+    /// Until it does, this function's job is to guarantee the invariant no matter what reaches
+    /// it, and to be lossy in a way that is documented and predictable rather than silent.
     static func speakerLabel(_ raw: String) -> String {
+        // Whitespace and control normalization runs FIRST, and the asterisk pass runs on its
+        // result — never the other way round. Dropping a control character can join two
+        // previously separated asterisks into a new run (`"*\u{0000}*"` becomes `"**"`), so an
+        // asterisk pass over the raw input would miss exactly the case it exists to catch.
         var scalars = String.UnicodeScalarView()
         for scalar in raw.unicodeScalars {
             if CharacterSet.whitespacesAndNewlines.contains(scalar) {
@@ -412,7 +449,36 @@ enum TranscriptSanitizer {
             .filter { !$0.isEmpty }
             .joined(separator: " ")
 
-        return whitespaceCollapsed.replacingOccurrences(of: "*", with: "\\*")
+        return collapsingAsteriskRuns(whitespaceCollapsed)
+    }
+
+    /// Collapses every run of two or more consecutive `*` to a single `*`. Everything else,
+    /// lone asterisks included, is returned untouched — the `contains("**")` early return makes
+    /// that a structural guarantee rather than a property of the loop below.
+    ///
+    /// The output can never contain `**`: every run becomes exactly one asterisk, and two runs
+    /// cannot merge because a non-asterisk always separated them in the input.
+    private static func collapsingAsteriskRuns(_ value: String) -> String {
+        guard value.contains("**") else { return value }
+
+        var result = ""
+        result.reserveCapacity(value.count)
+        var asteriskRun = 0
+        for character in value {
+            if character == "*" {
+                asteriskRun += 1
+                continue
+            }
+            if asteriskRun > 0 {
+                result.append("*")
+                asteriskRun = 0
+            }
+            result.append(character)
+        }
+        if asteriskRun > 0 {
+            result.append("*")
+        }
+        return result
     }
 
     /// Collapses every blank line (any line that is empty after trimming) out of the text —

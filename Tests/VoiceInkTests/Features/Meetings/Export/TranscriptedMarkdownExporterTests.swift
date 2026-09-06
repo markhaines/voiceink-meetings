@@ -342,6 +342,50 @@ struct TranscriptedMarkdownExporterTests {
             return chunks.compactMap(parseStyledTranscriptEntry)
         }
 
+        /// Narrowed verbatim port of `parseFrontmatterSpeakers`
+        /// (`CaptureMarkdownParser.swift:307-389`): the same `---` fence detection, the same
+        /// `speakers:` block location, the same per-line `name:` extraction (strip the key,
+        /// trim whitespace, then trim `"` characters — and NOTHING else: the real parser does
+        /// no backslash or Markdown unescaping of any kind, which is precisely why storing
+        /// escape syntax here would be read back literally), and the same terminator rule
+        /// (only an UNINDENTED, non-`-` key ends the block). The id/channel/db_id/confidence
+        /// bookkeeping is omitted because only the resolved NAME is under test here.
+        static func parseFrontmatterSpeakerNames(fromMarkdown markdown: String) -> [String] {
+            guard markdown.hasPrefix("---\n"),
+                  let endRange = markdown.range(
+                    of: "\n---\n",
+                    range: markdown.index(markdown.startIndex, offsetBy: 4)..<markdown.endIndex
+                  ) else {
+                return []
+            }
+            let frontmatter = String(markdown[markdown.index(markdown.startIndex, offsetBy: 4)..<endRange.lowerBound])
+            let speakerLines: [String]
+            if frontmatter.hasPrefix("speakers:\n") {
+                speakerLines = String(frontmatter.dropFirst("speakers:\n".count)).components(separatedBy: "\n")
+            } else if let sectionRange = frontmatter.range(of: "\nspeakers:\n") {
+                speakerLines = String(frontmatter[sectionRange.upperBound...]).components(separatedBy: "\n")
+            } else {
+                return []
+            }
+
+            var names: [String] = []
+            for rawLine in speakerLines {
+                let trimmed = rawLine.trimmingCharacters(in: .whitespaces)
+                if trimmed.hasPrefix("name:") {
+                    names.append(
+                        trimmed
+                            .replacingOccurrences(of: "name:", with: "")
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                            .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+                    )
+                } else if !trimmed.isEmpty, !trimmed.hasPrefix("-"),
+                          !(rawLine.first?.isWhitespace ?? false) {
+                    break
+                }
+            }
+            return names
+        }
+
         /// Verbatim port of `parseStyledTranscriptEntry`'s control flow and regex.
         private static func parseStyledTranscriptEntry(_ chunk: String) -> Entry? {
             let lines = chunk.components(separatedBy: "\n").filter { !$0.isEmpty }
@@ -534,15 +578,20 @@ struct TranscriptedMarkdownExporterTests {
     @Test(
         "the exported speakerLabel and the label the real indexer resolves are always the same string",
         arguments: [
-            "Jo**hn",
-            "**Mark**",
+            "",             // empty label: renders as `[System/]`, still parses, resolves to ""
+            "*",            // lone asterisk: already lossless, must be untouched
             "**",
-            "*",
             "***",
             "****",
+            "a*b",          // lone asterisk mid-string: already lossless, must be untouched
             "a***b",
-            "Team [Lead]",
-            "D'Angelo",
+            "Jo**hn",
+            "**Mark**",
+            "*Mark*",       // already lossless, must be untouched (Round 3 corrupted this one)
+            "**********",   // a label that is only asterisks
+            "Jane Doe",     // clean negative control
+            "D'Angelo",     // clean negative control
+            "Team [Lead]",  // clean negative control, brackets deliberately preserved
         ]
     )
     func exportedLabelMatchesIndexerResolvedLabel(rawLabel: String) throws {
@@ -560,5 +609,77 @@ struct TranscriptedMarkdownExporterTests {
             entries.first?.label == exportedLabel,
             "resolved label \(String(describing: entries.first?.label)) != exported label \(exportedLabel) for raw input \(rawLabel)"
         )
+
+        // ROUND 4, requirement 2: one label, rendered in two places, must resolve to the SAME
+        // string in both. The transcript header and the frontmatter `speakers:` list go through
+        // different reader code in the real indexer (`parseStyledTranscriptEntry` vs
+        // `parseFrontmatterSpeakers`) and different writers here (raw interpolation vs
+        // `yamlQuoted`), so agreement between them is a real assertion, not a restatement of
+        // the one above. Round 3's backslash escaping failed exactly here: `\*Mark\*` in the
+        // header, but `\\*Mark\\*` in `speakers:` once `yamlQuoted` doubled the backslashes,
+        // and the frontmatter reader unescapes neither.
+        let speakerNames = ReferenceIndexerParser.parseFrontmatterSpeakerNames(fromMarkdown: rendered.markdown)
+        #expect(speakerNames == [exportedLabel], "speakers: entry \(speakerNames) != exported label \(exportedLabel) for raw input \(rawLabel)")
+        #expect(
+            speakerNames.first == entries.first?.label,
+            "speakers: entry \(String(describing: speakerNames.first)) != transcript header label \(String(describing: entries.first?.label)) for raw input \(rawLabel)"
+        )
+    }
+
+    // MARK: - Round 4: the transform must be NARROW, not just safe
+
+    /// ROUND 4, requirement 3, and the finding that sank Round 3. Round 3 escaped EVERY `*`,
+    /// which made the round trip technically hold but corrupted input that was never at risk:
+    /// `"*Mark*"` — which resolved perfectly before — became `"\*Mark\*"` in the transcript and
+    /// `"\\*Mark\\*"` in `speakers:`, and stayed that way forever, because the real indexer
+    /// performs no unescaping at all. This test pins the narrowness directly: for every input
+    /// that the real strip rule (`replacingOccurrences(of: "**", with: "")`, literal
+    /// two-character substring only) cannot damage, the sanitizer must be the IDENTITY
+    /// function. It fails against Round 3's code on every asterisk-bearing case here.
+    @Test(
+        "labels that already round-trip losslessly are left byte-identical",
+        arguments: [
+            "*",
+            "a*b",
+            "*Mark*",
+            "* *",
+            "*/*",
+            "[*]",
+            "Jane Doe",
+            "D'Angelo",
+            "Team [Lead]",
+            "",
+        ]
+    )
+    func losslesslyRepresentableLabelsAreLeftUntouched(rawLabel: String) {
+        #expect(
+            TranscriptSanitizer.speakerLabel(rawLabel) == rawLabel,
+            "sanitizer altered \(rawLabel.debugDescription), which the real indexer would have returned unchanged"
+        )
+    }
+
+    /// The documented policy itself, at unit level: runs of 2+ collapse to exactly one `*`,
+    /// lone asterisks survive, and the collapse runs AFTER control-character removal so a
+    /// control character sitting between two asterisks cannot smuggle a new `**` run past it.
+    @Test("TranscriptSanitizer.speakerLabel collapses only runs of two or more asterisks")
+    func sanitizerCollapsesOnlyAsteriskRunsOfTwoOrMore() {
+        #expect(TranscriptSanitizer.speakerLabel("**Mark**") == "*Mark*")
+        #expect(TranscriptSanitizer.speakerLabel("Jo**hn") == "Jo*hn")
+        #expect(TranscriptSanitizer.speakerLabel("**") == "*")
+        #expect(TranscriptSanitizer.speakerLabel("***") == "*")
+        #expect(TranscriptSanitizer.speakerLabel("****") == "*")
+        #expect(TranscriptSanitizer.speakerLabel("**********") == "*")
+        #expect(TranscriptSanitizer.speakerLabel("a***b") == "a*b")
+        #expect(TranscriptSanitizer.speakerLabel("**a**b**") == "*a*b*")
+        // Idempotent: re-sanitizing an already-sanitized label changes nothing.
+        #expect(TranscriptSanitizer.speakerLabel(TranscriptSanitizer.speakerLabel("**Mark**")) == "*Mark*")
+        // No backslash (or any other escape syntax) is ever introduced — the real indexer
+        // unescapes nothing, so anything stored here is what a reader would literally see.
+        #expect(!TranscriptSanitizer.speakerLabel("**Mark**").contains("\\"))
+        // ORDER: the control character is dropped first, joining the two asterisks into a run,
+        // which the asterisk pass then collapses. Sanitizing in the other order would emit
+        // `**` and lose the identity silently.
+        #expect(TranscriptSanitizer.speakerLabel("*\u{0000}*") == "*")
+        #expect(TranscriptSanitizer.speakerLabel("*\n*") == "* *")  // whitespace separates: no run
     }
 }

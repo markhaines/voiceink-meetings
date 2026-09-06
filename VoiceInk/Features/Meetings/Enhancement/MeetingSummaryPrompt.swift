@@ -60,7 +60,7 @@ enum MeetingSummaryPrompt {
         "- Name: the action", using the same name or label the transcript uses for that person.
         When no owner is clear from the transcript, write just "- the action" with no name and
         no colon before it. Never invent or guess an owner. If there are no action items, write
-        exactly: None.
+        the single word None and nothing else.
 
         # Rules
         - Never invent facts, names, numbers, decisions, or action items that are not actually in

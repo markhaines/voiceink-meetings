@@ -135,7 +135,12 @@
 //   NAMES that path (`ExportError.rollbackFailed`, whose `errorDescription` spells out the
 //   recovery `mv`). That failure is never swallowed.
 // - The exporter never deletes, moves or modifies any source URL it was given, under any
-//   circumstance.
+//   circumstance. That is now enforced rather than merely intended: a source living INSIDE the
+//   destination tree (or inside one of this exporter's own scratch directories under the same
+//   root) would be carried aside with the old export and then deleted with the backup by a
+//   SUCCESSFUL re-export — losing a WAV original and leaving only the lossy M4A derived from it.
+//   Such a source is rejected up front with `ExportError.sourceInsideDestination`, before
+//   anything is created or moved. See `validateSourcesAreOutside`.
 //
 // WHAT IT DOES NOT GUARANTEE — RESIDUE. It does NOT guarantee that no leftover directory exists
 // anywhere. Removing a staging or backup directory is a best-effort `removeItem` that can itself
@@ -299,45 +304,81 @@ enum TranscriptedAudioExporter {
         /// A re-export left the original audio somewhere other than its documented path. Never
         /// data loss, always recoverable by hand — see `RollbackFailure`.
         case rollbackFailed(RollbackFailure)
+        /// A supplied source lives inside the directory tree this export is about to replace, or
+        /// inside one of this exporter's own scratch directories under the same root — both places
+        /// a SUCCESSFUL export moves or deletes. Rejected before anything is created or moved, so
+        /// nothing has happened when this is thrown. See `validateSourcesAreOutside`.
+        case sourceInsideDestination(source: URL, container: URL)
     }
 
-    // MARK: - Filesystem seam
+    // MARK: - Scratch naming
 
-    /// The directory-level filesystem operations `export` and `commit` perform, injected rather
-    /// than called directly on `FileManager`.
-    ///
-    /// This exists for ONE reason: the recovery paths in `commit` must be proven by tests that
-    /// FORCE the failure, not by tests that describe it — and the two failures that matter
-    /// (`staging -> final` fails, then `backup -> final` also fails, or the destination is
-    /// occupied when recovery reaches it) cannot be provoked through the real `FileManager`.
-    /// Both live strictly BETWEEN two renames inside a single synchronous call, so a test has no
-    /// moment at which to intervene: there is no permission bit, flag or path shape that makes
-    /// the second rename of a sibling directory fail while the first, structurally identical
-    /// one succeeds. Injecting the operation is the only way to exercise the branch that exists
-    /// to protect audio nobody can re-record, and untested recovery code is how this exporter
-    /// shipped a swallowed rollback failure in the first place.
-    ///
-    /// The same `@Sendable`-closure seam this feature area already uses for exactly this purpose
-    /// — see `StreamingVadController.processStreamChunk` and
-    /// `FluidAudioMeetingDiarizer.loadModels`. Production always uses `.live`, which is the
-    /// parameter's default, so no caller passes anything and no production behaviour changes.
-    /// Per-FILE writes (`writeAudioFile`) deliberately do NOT go through this seam: their
-    /// failure modes are provokable for real with a corrupt source, and the existing tests do
-    /// exactly that.
-    struct FileOperations: Sendable {
-        var exists: @Sendable (URL) -> Bool
-        var createDirectory: @Sendable (URL) throws -> Void
-        var move: @Sendable (URL, URL) throws -> Void
-        var remove: @Sendable (URL) throws -> Void
+    /// Every scratch directory this exporter creates is a sibling of the destination whose name
+    /// begins with this. Hoisted to one constant because three separate things have to agree on
+    /// it exactly: the names created below, the source-containment guard, and the fault
+    /// injector's prefix match.
+    static let scratchPrefix = ".TranscriptedAudioExporter-"
+    private static let stagingPrefix = scratchPrefix + "staging-"
+    private static let backupPrefix = scratchPrefix + "backup-"
 
-        static let live = FileOperations(
-            exists: { FileManager.default.fileExists(atPath: $0.path) },
-            createDirectory: {
-                try FileManager.default.createDirectory(at: $0, withIntermediateDirectories: true)
-            },
-            move: { try FileManager.default.moveItem(at: $0, to: $1) },
-            remove: { try FileManager.default.removeItem(at: $0) }
-        )
+    // MARK: - Fault injection
+
+    /// A closed, declarative description of failures this exporter can be asked to simulate. It is
+    /// the ONLY thing a caller may inject, and it exists because the recovery branches in `commit`
+    /// must be proven by tests that FORCE the failure rather than describe it: those branches live
+    /// strictly BETWEEN two renames inside one synchronous call, so a test has no moment at which
+    /// to intervene, and no permission bit, `chflags` flag or path shape makes the second rename of
+    /// a sibling directory fail while the first, structurally identical one succeeds.
+    ///
+    /// **THIS TYPE DELIBERATELY CARRIES NO CODE, AND THAT IS THE WHOLE POINT.** The previous design
+    /// was a struct of `@Sendable` closures, and review defeated it in one line three different
+    /// ways — a `move` that returned success without moving anything, a `move` that deleted the
+    /// source and reported success, and a copy-then-delete substituted for `rename(2)` — each of
+    /// which let `export` return SUCCESS with the previous export silently destroyed. That was the
+    /// fourth time on this project that a test-only seam was defended as safe-by-convention and
+    /// then broken, so the capability is removed rather than documented away: a value of this type
+    /// is pure data, so it cannot perform, skip, substitute, reorder or observe a filesystem
+    /// operation, and it cannot report that a rename happened when it did not. Those three attacks
+    /// are no longer things nobody writes; they are things that do not compile, which is asserted
+    /// on every CI run by `scripts/negative-controls/TranscriptedAudioExportSeamAttacks.swift`.
+    ///
+    /// **The residual capability, stated rather than glossed:** a caller passing a non-`.none`
+    /// value can make an export FAIL that would have succeeded, and can cause the simulated
+    /// concurrent writer below to create an empty marker directory at the destination on a path
+    /// that is already failing. Neither can lose audio: nothing here deletes, and a failing export
+    /// leaves the original either at its own path or at the backup path named in the thrown error.
+    /// That is a bug a caller could cause, not the data-loss class this guard exists to close, and
+    /// it is bounded by the type rather than by a comment.
+    struct FaultInjection: Equatable, Sendable {
+        /// Make any directory rename whose SOURCE directory name begins with one of these prefixes
+        /// throw `SimulatedRenameFailure` instead of running. It cannot make a rename succeed, and
+        /// cannot change what a rename that does run actually does.
+        var failRenamesOfDirectoriesPrefixed: [String] = []
+
+        /// Simulate ANOTHER PROCESS claiming the destination path in the window between a
+        /// re-export's two renames. This is the one condition `.destinationOccupied` exists to
+        /// handle and the only one a test cannot produce for itself, for the reason above. It only
+        /// ever runs on an already-failing path, and it only ever CREATES: see `commit`.
+        var simulateConcurrentWriterAtDestination = false
+
+        /// Production. Every caller gets this by default and no caller passes anything else.
+        static let none = FaultInjection()
+
+        /// What the simulated concurrent writer leaves behind, so a test can assert those exact
+        /// bytes survived a recovery that must never delete what it finds.
+        static let concurrentWriterFilename = "written-by-another-process.txt"
+        static let concurrentWriterContents = "simulated concurrent writer"
+
+        /// Thrown by a rename this value declared should fail. A distinct type, so a test can tell
+        /// "the fault fired" apart from "something genuinely went wrong", and so it can never be
+        /// mistaken for one of `ExportError`'s real cases.
+        struct SimulatedRenameFailure: Error, Equatable {
+            let source: URL
+        }
+
+        fileprivate func shouldFailRename(of source: URL) -> Bool {
+            failRenamesOfDirectoriesPrefixed.contains { source.lastPathComponent.hasPrefix($0) }
+        }
     }
 
     // MARK: - Planning
@@ -404,34 +445,46 @@ enum TranscriptedAudioExporter {
     /// ever appears at the destination path, and a pre-existing export there is never destroyed —
     /// on any item failure the final directory (existing or not) is left byte-for-byte as it was,
     /// and the staging directory is discarded on a best-effort basis, its path logged if that
-    /// removal itself fails. `fileOperations` defaults to the real filesystem and exists so the
-    /// recovery paths can be tested by forcing their failures; see `FileOperations`.
+    /// removal itself fails.
+    ///
+    /// Throws `ExportError.sourceInsideDestination` before touching anything if a source lives
+    /// where a SUCCESSFUL export would consume it; see `validateSourcesAreOutside`. `faults`
+    /// defaults to `.none` and exists so the recovery paths can be tested by forcing their
+    /// failures; it is pure data and cannot alter what any filesystem operation does. See
+    /// `FaultInjection`.
     @discardableResult
     static func export(
         meeting: Meeting,
         sources: AudioSources,
         to directory: URL,
-        fileOperations: FileOperations = .live
+        faults: FaultInjection = .none
     ) async throws -> URL {
         let resolvedPlan = try plan(meeting: meeting, sources: sources)
+        let fileManager = FileManager.default
         let finalDirectory = directory.appendingPathComponent(resolvedPlan.audioDirectoryName, isDirectory: true)
+
+        // BEFORE anything is created or moved. A source inside the destination tree is consumed by
+        // a SUCCESSFUL export, and nothing after this point could undo that, so nothing before it
+        // is allowed to have happened.
+        try validateSourcesAreOutside(resolvedPlan, destinationRoot: directory, finalDirectory: finalDirectory)
+
         let stagingDirectory = directory.appendingPathComponent(
-            ".TranscriptedAudioExporter-staging-\(UUID().uuidString)", isDirectory: true
+            stagingPrefix + UUID().uuidString, isDirectory: true
         )
 
-        try fileOperations.createDirectory(stagingDirectory)
+        try fileManager.createDirectory(at: stagingDirectory, withIntermediateDirectories: true)
         do {
             for item in resolvedPlan.items {
                 let destinationURL = stagingDirectory.appendingPathComponent(item.destinationFilename)
                 try await writeAudioFile(from: item.sourceURL, to: destinationURL)
             }
         } catch {
-            discardScratchDirectory(stagingDirectory, using: fileOperations)
+            discardScratchDirectory(stagingDirectory)
             throw error
         }
 
         do {
-            try commit(stagingDirectory: stagingDirectory, to: finalDirectory, using: fileOperations)
+            try commit(stagingDirectory: stagingDirectory, to: finalDirectory, faults: faults)
         } catch {
             // `commit` can throw from its OWN renames, which leaves the complete staging
             // directory orphaned next to the destination. Discarding it here is three lines and
@@ -455,11 +508,76 @@ enum TranscriptedAudioExporter {
                     """
                 )
             } else {
-                discardScratchDirectory(stagingDirectory, using: fileOperations)
+                discardScratchDirectory(stagingDirectory)
             }
             throw error
         }
         return finalDirectory
+    }
+
+    // MARK: - Source containment guard
+
+    /// Rejects any source that lives inside the directory tree this export is about to replace, or
+    /// inside one of this exporter's own scratch directories under the same root.
+    ///
+    /// This guard exists because the promise in this file's header — that the exporter never
+    /// deletes, moves or modifies a supplied source, under ANY circumstance — was not true for such
+    /// a source, and the way it failed was both silent and unrecoverable. A SUCCESSFUL re-export
+    /// renames the old destination aside to the backup, taking anything living inside it along, and
+    /// then removes that backup once the replacement is in place. For a WAV source that leaves the
+    /// user holding only the lossy M4A this exporter derived from it, with the original gone and
+    /// the export reporting success. That is the worst outcome available here: not a failure, not a
+    /// partial write, but a clean "done" over the top of the only copy of a recording.
+    ///
+    /// It is rejected rather than tolerated because it is a caller error with no legitimate shape:
+    /// nothing sensible stores a capture inside the very directory that capture is exported into.
+    /// The claim in the header is kept true by making the case impossible, not by narrowing it.
+    ///
+    /// Containment is decided on RESOLVED, STANDARDISED paths, so `/tmp` against `/private/tmp`, a
+    /// symlinked parent, or a `..` segment cannot walk a source past the guard; and COMPONENT-WISE,
+    /// so a sibling directory named `<stem>_audio-old` is never mistaken for something inside
+    /// `<stem>_audio`.
+    private static func validateSourcesAreOutside(
+        _ resolvedPlan: ExportPlan,
+        destinationRoot: URL,
+        finalDirectory: URL
+    ) throws {
+        let rootComponents = resolvedComponents(destinationRoot)
+        let finalComponents = resolvedComponents(finalDirectory)
+
+        for item in resolvedPlan.items {
+            let sourceComponents = resolvedComponents(item.sourceURL)
+
+            if isContained(sourceComponents, in: finalComponents) {
+                throw ExportError.sourceInsideDestination(source: item.sourceURL, container: finalDirectory)
+            }
+
+            // The scratch directories are siblings of the destination under the same root, and this
+            // exporter DELETES them. A source inside one — a caller reaching into a leftover backup
+            // to recover audio after a rollback failure, which is exactly what that error tells
+            // them to do — must not then be exported from the one place it can be swept away.
+            guard isContained(sourceComponents, in: rootComponents) else { continue }
+            for depth in rootComponents.count..<sourceComponents.count
+            where sourceComponents[depth].hasPrefix(scratchPrefix) {
+                var container = URL(fileURLWithPath: "/", isDirectory: true)
+                for component in sourceComponents[1...depth] {
+                    container.appendPathComponent(component)
+                }
+                throw ExportError.sourceInsideDestination(source: item.sourceURL, container: container)
+            }
+        }
+    }
+
+    /// Path components after standardising, resolving symlinks, and standardising again — the
+    /// second pass matters because resolving can reintroduce a `..` from a symlink's target.
+    private static func resolvedComponents(_ url: URL) -> [String] {
+        url.standardizedFileURL.resolvingSymlinksInPath().standardizedFileURL.pathComponents
+    }
+
+    /// True when `candidate` IS `container` or lies beneath it. Compared component-wise, never as a
+    /// string prefix, so `/a/bc` is not treated as inside `/a/b`.
+    private static func isContained(_ candidate: [String], in container: [String]) -> Bool {
+        candidate.count >= container.count && Array(candidate.prefix(container.count)) == container
     }
 
     /// Swaps a fully-populated `stagingDirectory` into `finalDirectory`'s place. `stagingDirectory`
@@ -493,22 +611,34 @@ enum TranscriptedAudioExporter {
     private static func commit(
         stagingDirectory: URL,
         to finalDirectory: URL,
-        using fileOperations: FileOperations
+        faults: FaultInjection
     ) throws {
-        guard fileOperations.exists(finalDirectory) else {
-            try fileOperations.move(stagingDirectory, finalDirectory)
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: finalDirectory.path) else {
+            try moveDirectory(from: stagingDirectory, to: finalDirectory, faults: faults)
             return
         }
 
         let backupDirectory = finalDirectory.deletingLastPathComponent().appendingPathComponent(
-            ".TranscriptedAudioExporter-backup-\(UUID().uuidString)", isDirectory: true
+            backupPrefix + UUID().uuidString, isDirectory: true
         )
-        try fileOperations.move(finalDirectory, backupDirectory)
+        try moveDirectory(from: finalDirectory, to: backupDirectory, faults: faults)
 
         do {
-            try fileOperations.move(stagingDirectory, finalDirectory)
+            try moveDirectory(from: stagingDirectory, to: finalDirectory, faults: faults)
         } catch {
-            guard !fileOperations.exists(finalDirectory) else {
+            // TEST FAULT, and the ONLY filesystem mutation `FaultInjection` can cause. It stands in
+            // for another process creating something at the destination in the window between the
+            // two renames -- the single condition `.destinationOccupied` exists to handle, and the
+            // only one a test cannot produce for itself. It runs only on an already-failing path,
+            // and it only ever CREATES: it cannot delete or relocate anything.
+            if faults.simulateConcurrentWriterAtDestination {
+                try? fileManager.createDirectory(at: finalDirectory, withIntermediateDirectories: true)
+                try? Data(FaultInjection.concurrentWriterContents.utf8).write(
+                    to: finalDirectory.appendingPathComponent(FaultInjection.concurrentWriterFilename)
+                )
+            }
+            guard !fileManager.fileExists(atPath: finalDirectory.path) else {
                 throw ExportError.rollbackFailed(RollbackFailure(
                     originalAudioDirectory: backupDirectory,
                     intendedDirectory: finalDirectory,
@@ -517,7 +647,7 @@ enum TranscriptedAudioExporter {
                 ))
             }
             do {
-                try fileOperations.move(backupDirectory, finalDirectory)
+                try moveDirectory(from: backupDirectory, to: finalDirectory, faults: faults)
             } catch let restoreError {
                 throw ExportError.rollbackFailed(RollbackFailure(
                     originalAudioDirectory: backupDirectory,
@@ -529,7 +659,20 @@ enum TranscriptedAudioExporter {
             throw error
         }
 
-        discardScratchDirectory(backupDirectory, using: fileOperations)
+        discardScratchDirectory(backupDirectory)
+    }
+
+    /// The ONE place a directory rename happens. `FaultInjection` can do exactly one thing to it:
+    /// decide that a rename which would otherwise have run throws instead. It cannot perform the
+    /// rename itself, skip it, substitute a non-atomic copy-then-delete for `rename(2)`, or report
+    /// that it happened when it did not — because it is a value carrying no code. That is what
+    /// makes "production always does the real thing" a property of the types rather than a claim
+    /// about today's call sites.
+    private static func moveDirectory(from source: URL, to destination: URL, faults: FaultInjection) throws {
+        if faults.shouldFailRename(of: source) {
+            throw FaultInjection.SimulatedRenameFailure(source: source)
+        }
+        try FileManager.default.moveItem(at: source, to: destination)
     }
 
     /// Best-effort removal of a staging or backup directory this exporter itself created, with
@@ -541,9 +684,9 @@ enum TranscriptedAudioExporter {
     /// Only scratch paths are logged, and only as a public parent + dot-prefixed UUID name: those
     /// carry no meeting title. The final directory's name does carry one, so it is never logged —
     /// it reaches the user through `RollbackFailure.message` instead, where it is needed to act on.
-    private static func discardScratchDirectory(_ url: URL, using fileOperations: FileOperations) {
+    private static func discardScratchDirectory(_ url: URL) {
         do {
-            try fileOperations.remove(url)
+            try FileManager.default.removeItem(at: url)
         } catch {
             logger.error(
                 """
@@ -636,6 +779,15 @@ extension TranscriptedAudioExporter.ExportError: LocalizedError {
             return "This meeting's audio could not be converted to M4A."
         case .rollbackFailed(let failure):
             return failure.message
+        case .sourceInsideDestination(let source, let container):
+            return """
+                This meeting's audio cannot be exported from inside the folder it is being \
+                exported into — a successful export would move or delete the original. Move it \
+                somewhere else first, then export again.
+                    Source: \(source.path)
+                    Inside: \(container.path)
+                Nothing was created, moved or deleted.
+                """
         }
     }
 }

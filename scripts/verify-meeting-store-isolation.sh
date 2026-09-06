@@ -281,6 +281,13 @@ run_case MeetingCapabilityReturnValueEvictionAttack.swift 2 must-not-compile
 run_case MeetingReceiptMutatingApiAttack.swift 5 must-not-compile
 run_case MeetingSeamCannotNameAsrManagerAttack.swift 9 must-not-compile
 
+# Round 7 (PR #22, TranscriptedAudioExporter): the exporter's fault-injection seam. Its previous
+# design was a struct of @Sendable closures, and review defeated it in one line three ways, each
+# letting `export` report SUCCESS with the previous export destroyed. `FaultInjection` now carries
+# no code at all, so those three substitutions have nowhere to go. Same lesson as every control
+# above it: a seam defended by convention gets defeated, so the compiler defends this one.
+run_case TranscriptedAudioExportSeamAttacks.swift 6 must-not-compile
+
 run_case MeetingCapabilityConditionalDowncastAttack.swift 1 must-warn
 run_case MeetingCapabilityForcedDowncastAttack.swift 1 must-warn
 run_case MeetingCapabilityBorrowClosureDowncastAttack.swift 1 must-warn

@@ -26,6 +26,43 @@ caller sets directly. Setting the unprefixed form on the outer `xcodebuild` invo
 nothing: it never crosses that boundary, the test process reads it as absent, and a missing
 prerequisite quietly skips and reports green.
 
+**Whenever a gate has a CI skip, gate mode must override it -- no exception.** Not every gate has
+one: `TranscriptedIndexerAcceptanceTests.swift` defines no independent CI-disable trait at all, so
+gate mode simply wins there with nothing to override. `RealModelSmokeTests.swift` DOES have one
+(the `isRunningInCI` / `VOICEINK_CI` idiom `AudioGraphExceptionBridgeTests.swift` established), as
+a convenience for ordinary CI runs that have neither downloaded models nor real audio hardware.
+Wherever such a CI-disable trait exists, it must be written
+`.disabled(if: isRunningInCI && !isGateRunningMode, ...)` -- gate mode ANDed against the CI check,
+never a bare `.disabled(if: isRunningInCI, ...)` that gate mode cannot reach. The reasoning is the
+same one that justifies gate mode existing at all: the whole point is that a pass means the real
+path ran and a missing prerequisite fails loudly, so an environment variable a caller may not know
+about -- CI or otherwise -- must never be able to silently downgrade an explicitly requested gate
+into a skip. A gate-mode failure on a runner with no models is not an unrelated failure; it is
+exactly the information an operator who set that flag asked for.
+
+`RealModelSmokeTests.swift` got this wrong twice in successive rounds, and both mistakes are worth
+recording so a future gate doesn't repeat either. First (fixed 2026-09-06): it applied its CI
+disable unconditionally, with a header arguing that was deliberate -- the mistake this section's
+opening rule now exists to prevent. Second (fixed in the same round, after review): its fix
+claimed the explanation (naming the missing prerequisite and the CI environment) lived in the
+`.disabled` SKIP messages, and that a gate-mode failure would carry it. That is impossible by
+construction -- `!isGateRunningMode` is ANDed into every one of those conditions, so gate mode is
+exactly what stops them firing, and a skip message that never displays explains nothing. A gate
+that wants a self-explanatory gate-mode failure has to put the explanation somewhere gate mode
+actually reaches: an explicit check inside the test body itself (see `GateModePrerequisiteMissing`
+in that file), not a `.disabled` trait's message. See that file's header, "MAKING THAT FAILURE
+SELF-EXPLANATORY," for the full story and the proof. Any new gate landing here with its own
+CI-disable trait must use the ANDed form from the start, and if it wants its gate-mode failures to
+be self-explanatory, that explanation belongs in the test body, not in a skip message.
+
+**Exemption: `AudioGraphExceptionBridgeTests.swift`'s three CI disables are NOT part of this
+convention, and should not be "fixed" to match it.** They read a bare
+`.disabled(if: isRunningInCI, ...)` with no `isGateRunningMode` in sight, because that file defines
+no `<GATE>_GATE_MODE` flag at all -- there is nothing for gate mode to override. Those three tests
+exist to skip a ~600s hang against this CI runner's specific CoreAudio device inventory; they are
+not real-model/real-audio prerequisite gates, so the ANDed form and this section's convention
+simply don't apply to them.
+
 | Flag (external, `TEST_RUNNER_`-prefixed) | Test file | Status |
 |---|---|---|
 | `TEST_RUNNER_REALMODEL_SMOKE_GATE_MODE` | `Tests/VoiceInkTests/Features/Meetings/Transcription/RealModelSmokeTests.swift` | Live (2026-09-06) |

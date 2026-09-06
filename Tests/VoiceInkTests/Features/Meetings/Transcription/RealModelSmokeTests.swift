@@ -56,15 +56,52 @@
 // What gate mode DOES guarantee, once engaged with the command above: with
 // `TEST_RUNNER_REALMODEL_SMOKE_GATE_MODE=1` set on the `xcodebuild` invocation, this suite
 // passing means both tests actually executed their real model-load/inference path end to end --
-// a missing prerequisite fails the run instead of skipping it. What it does NOT guarantee: it
-// does not change the `VOICEINK_CI` check, which always disables both tests on CI regardless of
-// gate mode -- CI has no models and no audio hardware, so forcing these tests to run there would
-// fail for an unrelated, uninteresting reason (no environment), not prove anything about the
-// gate. Gate mode is for a real Mac with the real prerequisites available; run it there when the
-// point is to prove nothing was skipped, not on CI. It also does not guarantee anything on an
-// ordinary run where gate mode is NOT engaged (including every CI run and every plain local
-// `xcodebuild test`): a missing prerequisite there still produces a quiet skip and a green
-// suite, which remains correct, desired convenience behavior, not a new guarantee.
+// a missing prerequisite fails the run instead of skipping it, and that now includes the
+// `VOICEINK_CI` check: GATE MODE OVERRIDES THE CI SKIP, on CI or anywhere else.
+//
+// An earlier version of this file disabled both tests unconditionally whenever `VOICEINK_CI` was
+// set, gate mode or not, on the reasoning that CI has no downloaded models and no real audio
+// hardware, so forcing these tests to run there would fail for an unrelated, uninteresting reason
+// rather than prove anything about the gate. That reasoning is now superseded, and its strongest
+// point deserves an answer, not a silent deletion: a gate-mode failure on a runner with no models
+// is NOT an unrelated failure -- it is exactly the information an operator who explicitly set
+// `TEST_RUNNER_REALMODEL_SMOKE_GATE_MODE=1` asked for. The entire purpose of gate mode is that a
+// pass means the real path ran and a missing prerequisite fails loudly; an environment variable a
+// caller may not know about -- whether it happens to be CI or anything else -- must never be able
+// to silently downgrade an explicitly requested gate into a skip, or the guarantee becomes
+// conditional in exactly the false-assurance way this mechanism exists to eliminate. Nobody sets
+// gate mode on a CI runner by accident; if they do, a loud failure beats a silent green.
+//
+// MAKING THAT FAILURE SELF-EXPLANATORY -- CORRECTLY, THIS TIME. An earlier round of this fix put
+// the explanation (naming the missing prerequisite and the CI environment) into the
+// `.disabled(if: ..., "...")` SKIP messages above and claimed a gate-mode failure would carry it.
+// That was wrong, and the reasoning error is worth stating precisely: `!isGateRunningMode` is
+// ANDed into every one of those `.disabled` conditions, so gate mode is EXACTLY the thing that
+// stops them from firing -- the skip messages exist only in the branch gate mode is designed to
+// never take. Proven empirically: with the Parakeet v3 model deliberately absent and gate mode
+// engaged, the real failure text was FluidAudio's own generic library error --
+// `Caught error: .loadingFailed("Parakeet model files are incomplete. Download the model from AI
+// Models.")` -- naming neither the CI environment nor this file's own diagnosis, because the code
+// path that ran was the ordinary real-model-load path, which has no reason to know about CI or
+// gate mode at all. Fixed properly this time: each test body below now re-checks its own
+// prerequisite explicitly, under `if isGateRunningMode { ... }`, BEFORE touching any real
+// FluidAudio/diarizer work, and throws `GateModePrerequisiteMissing` (see below) with a message
+// naming the specific missing prerequisite and, when `isRunningInCI` is also true, stating
+// plainly that `VOICEINK_CI` identifies this run as CI mode and that THIS runner lacks the
+// prerequisite just named -- deliberately NOT a universal claim that CI has no models or audio
+// hardware at all (an earlier version of this note said exactly that, and it was false: in the
+// very run that proved this mechanism, the diarizer's model WAS present and that test passed for
+// real in the same invocation where Parakeet's model was absent -- `VOICEINK_CI` only establishes
+// that this is CI mode, never that every prerequisite is unmet). So a reader of a red CI run
+// understands "this runner cannot satisfy THIS gate," not "the product is broken," without being
+// misled into thinking every gate or every prerequisite must be absent here. Because this check
+// only fires when the prerequisite is ACTUALLY missing, it never masks a genuine failure in the
+// real load/inference path on a machine where the prerequisite is present.
+//
+// What gate mode still does NOT guarantee: anything on an ordinary run where gate mode is NOT
+// engaged (including every CI run and every plain local `xcodebuild test`) -- a missing
+// prerequisite there still produces a quiet skip and a green suite, which remains correct,
+// desired convenience behavior, not a new guarantee.
 //
 // AUDIO PROVENANCE, stated plainly:
 //   - The transcription test uses ONE of Mark's own real dictation recordings, found under
@@ -105,8 +142,12 @@ private var isRunningInCI: Bool {
 
 /// See this file's header, "GATE-RUNNING MODE", for the full mechanism and the canonical command.
 /// When set, a missing prerequisite is no longer grounds to skip -- the test runs anyway and
-/// fails for real if the prerequisite truly is not met. Does NOT affect `isRunningInCI`: CI is
-/// disabled unconditionally, gate mode or not.
+/// fails for real if the prerequisite truly is not met. This OVERRIDES the `isRunningInCI` skip
+/// too: both `.disabled` traits below read `isRunningInCI && !isGateRunningMode`, so gate mode
+/// makes the test actually run instead of skip, on CI or anywhere else. The self-explanatory
+/// naming of the missing prerequisite does NOT come from those `.disabled` traits, which gate
+/// mode causes to never fire -- see the file header's "MAKING THAT FAILURE SELF-EXPLANATORY"
+/// section and `GateModePrerequisiteMissing` below for where that explanation actually lives.
 ///
 /// READ THIS BEFORE SETTING ANYTHING: the string below, `REALMODEL_SMOKE_GATE_MODE`, is the
 /// UNPREFIXED name this already-launched test process reads its own environment for -- it is
@@ -117,6 +158,71 @@ private var isRunningInCI: Bool {
 /// anything set on the outer `xcodebuild` command reaches this `ProcessInfo` lookup at all.
 private var isGateRunningMode: Bool {
     ProcessInfo.processInfo.environment["REALMODEL_SMOKE_GATE_MODE"] != nil
+}
+
+/// Pulled out to a plain constant, not built inline with `+` inside the `@Test` attribute:
+/// string concatenation directly inside a macro's argument list made the type checker time out
+/// ("unable to type-check this expression in reasonable time"). A single string literal referenced
+/// by name type-checks trivially.
+private let transcriptionSkippedOnCIMessage: String = """
+    hardware/model test skipped on CI (no Parakeet v3 model, no audio hardware) -- see \
+    AudioGraphExceptionBridgeTests.swift for the same VOICEINK_CI idiom; set \
+    TEST_RUNNER_REALMODEL_SMOKE_GATE_MODE=1 to force this to run and fail loudly here instead \
+    of skipping
+    """
+
+private let diarizerSkippedOnCIMessage: String = """
+    hardware/model test skipped on CI (no diarizer model, no audio hardware) -- see \
+    AudioGraphExceptionBridgeTests.swift for the same VOICEINK_CI idiom; set \
+    TEST_RUNNER_REALMODEL_SMOKE_GATE_MODE=1 to force this to run and fail loudly here instead \
+    of skipping
+    """
+
+/// Appended to a gate-mode prerequisite-failure message when `isRunningInCI` is also true, so a
+/// reader of a red CI run is told plainly that THIS runner lacks the specific prerequisite named
+/// earlier in the same message, rather than mistaking the failure for a product defect. Emitted
+/// ONLY when `isRunningInCI` is true (see the `guard` below) -- a developer running gate mode
+/// locally with a missing prerequisite never sees a CI mention. Deliberately does NOT claim CI has
+/// no models or audio hardware in general: that claim would be false (this file's own diarizer
+/// prerequisite can be, and has been, present and passing on CI-mode runs where Parakeet's was
+/// not) -- `VOICEINK_CI` establishes only that this run is using CI mode, never that every
+/// prerequisite is unmet.
+private var ciEnvironmentNote: String {
+    guard isRunningInCI else { return "" }
+    return """
+         VOICEINK_CI is set, so this run is using CI mode; this runner lacks the prerequisite \
+        named above and cannot satisfy this gate -- that is expected here, not a product defect.
+        """
+}
+
+/// Thrown by the explicit gate-mode prerequisite checks at the top of each test body below. The
+/// `.disabled(if: ..., "...")` SKIP messages above cannot do this job: `!isGateRunningMode` is
+/// ANDed into every one of those conditions, so gate mode is precisely what makes them never
+/// fire, and the skip text they carry is never displayed on a gate-mode run. This type exists so
+/// gate mode's own failure -- not a `.disabled` trait -- carries the explanation instead. See the
+/// file header's "MAKING THAT FAILURE SELF-EXPLANATORY" section for the full story of why the
+/// first attempt at this put the explanation in the wrong place.
+private struct GateModePrerequisiteMissing: Error, CustomStringConvertible {
+    let description: String
+}
+
+private var transcriptionModelMissingGateFailureMessage: String {
+    "GATE MODE forced this test to run despite a missing prerequisite: no local Parakeet v3 "
+        + "model at \(AsrModels.defaultCacheDirectory(for: .v3).path)."
+        + ciEnvironmentNote
+}
+
+private var transcriptionAudioMissingGateFailureMessage: String {
+    "GATE MODE forced this test to run despite a missing prerequisite: no usable 8-20s "
+        + "recording found under \(RealAudioFixture.recordingsDirectory.path)."
+        + ciEnvironmentNote
+}
+
+private var diarizerModelMissingGateFailureMessage: String {
+    "GATE MODE forced this test to run despite a missing prerequisite: diarizer model not "
+        + "already cached locally and huggingface.co is unreachable -- cannot run this test for "
+        + "real."
+        + ciEnvironmentNote
 }
 
 private struct UnexpectedFallbackInvoked: Error {}
@@ -414,10 +520,7 @@ struct RealModelSmokeTests {
 
     @Test(
         "real Parakeet v3 loads and transcribes real dictation audio through MeetingTranscriptionCoordinator",
-        .disabled(
-            if: isRunningInCI,
-            "hardware/model test -- see AudioGraphExceptionBridgeTests.swift for the same VOICEINK_CI idiom"
-        ),
+        .disabled(if: isRunningInCI && !isGateRunningMode, "\(transcriptionSkippedOnCIMessage)"),
         .disabled(
             if: !RealModelAvailability.parakeetV3Present && !isGateRunningMode,
             "no local Parakeet v3 model at \(AsrModels.defaultCacheDirectory(for: .v3).path)"
@@ -428,6 +531,20 @@ struct RealModelSmokeTests {
         )
     )
     func realModelTranscribesRealAudio() async throws {
+        // Gate mode bypasses the `.disabled` traits above entirely, including their skip
+        // messages -- so if either prerequisite is genuinely still missing, check it again here,
+        // explicitly, before touching any real FluidAudio path, and fail with a message that
+        // names it (plus the CI environment, when applicable) instead of letting the run fall
+        // through to FluidAudio's own generic, unrelated-sounding error text.
+        if isGateRunningMode {
+            if !RealModelAvailability.parakeetV3Present {
+                throw GateModePrerequisiteMissing(description: transcriptionModelMissingGateFailureMessage)
+            }
+            if !RealAudioFixture.isAvailable {
+                throw GateModePrerequisiteMissing(description: transcriptionAudioMissingGateFailureMessage)
+            }
+        }
+
         let recording = try RealAudioFixture.copyForTesting()
         defer { try? FileManager.default.removeItem(at: recording) }
         let chunk = try RealAudioFixture.extractChunk(from: recording, startSeconds: 3, durationSeconds: 4)
@@ -524,10 +641,7 @@ struct RealModelSmokeTests {
 
     @Test(
         "real FluidAudioMeetingDiarizer loads and diarizes a synthesized multi-speaker recording, measured against its loadOperationTimeout ceiling",
-        .disabled(
-            if: isRunningInCI,
-            "hardware/model test -- see AudioGraphExceptionBridgeTests.swift for the same VOICEINK_CI idiom"
-        ),
+        .disabled(if: isRunningInCI && !isGateRunningMode, "\(diarizerSkippedOnCIMessage)"),
         .disabled(
             if: !RealModelAvailability.diarizerModelsPresent && !NetworkProbe.huggingFaceReachable
                 && !isGateRunningMode,
@@ -535,6 +649,13 @@ struct RealModelSmokeTests {
         )
     )
     func realDiarizerLoadsAndRuns() async throws {
+        // Same reasoning as the transcription test above: gate mode bypasses the `.disabled`
+        // traits (and their skip messages) entirely, so re-check the same prerequisite here,
+        // explicitly, and fail with a message naming it before touching any real diarizer path.
+        if isGateRunningMode, !RealModelAvailability.diarizerModelsPresent, !NetworkProbe.huggingFaceReachable {
+            throw GateModePrerequisiteMissing(description: diarizerModelMissingGateFailureMessage)
+        }
+
         let audio = try SyntheticMultiSpeakerAudio.make()
         defer { try? FileManager.default.removeItem(at: audio) }
 

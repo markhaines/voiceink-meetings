@@ -971,3 +971,49 @@ confirming Mark's Transcripted MCP / Anytype sync / other tooling actually reads
 job: it is Phase 3's *export* leg, additive and unwired (see the `retainRecording stays false`
 entry above for why wiring an actual caller is separately out of scope too), not a capture
 redesign.
+
+## Stale `TranscriptedAudioExporter` staging and backup directories are never swept
+
+`TranscriptedAudioExporter.export` stages a re-export in a sibling directory and commits it by
+renaming, which is what stops a failed re-export destroying a good prior export of audio nobody
+can re-record (see that file's header, "ATOMICITY, AND ITS EXACT LIMITS"). The cost of that
+shape is that a failure can leave a dot-prefixed scratch directory behind next to the
+destination:
+
+- `.TranscriptedAudioExporter-staging-<uuid>/` — a complete or partial staged export, when
+  removing it after a failure itself failed, or when it was deliberately KEPT because the
+  commit ended in `ExportError.rollbackFailed` and a human is recovering by hand.
+- `.TranscriptedAudioExporter-backup-<uuid>/` — the previous good export, when the process was
+  killed in the window between `old -> backup` and `staging -> final`, or when the restoring
+  rename failed. In the second case the path is carried out in the thrown error, with the
+  recovery `mv` spelled out in `errorDescription`; in the first case nothing survives to report
+  it, because a SIGKILL runs no code.
+
+**This is debris, not data loss, and the distinction is the reason nothing is built here.** The
+directories are dot-prefixed, uniquely suffixed, carry the type's own name, and are never at a
+destination path, so nothing reading Transcripted's layout sees them. The audio inside a
+`-backup-` one is complete and unmodified: it is in the wrong place, not gone.
+
+**Deliberately NOT built in this PR**, per the review ruling on it: a debris-reaping subsystem
+is a different piece of work from the data-loss fix, and bolting one on unreviewed to a change
+whose whole point is not deleting things carelessly would be the wrong trade. What was done
+instead is narrower and matches what the code actually delivers: the header's old unconditional
+claim that no partial output remained "anywhere, ever" was corrected to name this residue, and
+every best-effort cleanup now LOGS the path it failed to remove
+(`Logger(subsystem: "com.hainesy.voiceinkmeetings", category: "TranscriptedAudioExporter")`)
+instead of discarding the result with `try?`, so residue is observable rather than invisible.
+
+**What a sweep would have to get right**, if one is ever wanted: it must not delete a `-backup-`
+directory it cannot prove is orphaned, since that is a real recording; it needs an age threshold
+well clear of the longest legitimate export; and it has to run somewhere with a view of the
+destination root, which today is nowhere, because this exporter still has no caller at all (see
+the `retainRecording stays false` entry).
+
+**A related, separate limit worth recording next to this one:** the commit is two renames, and
+two renames are not one atomic unit. Darwin's `renameatx_np` with `RENAME_SWAP` would collapse
+them into one atomic syscall and close the kill window entirely. It was NOT adopted, on purpose:
+the real destination is under `~/Library/CloudStorage/OneDrive-ATEME/`, a File Provider volume
+whose `RENAME_SWAP` support cannot be verified from this fork's test environment, and an
+unsupported filesystem returns `ENOTSUP`. Shipping it would mean shipping it AND the two-rename
+fallback, leaving the window in place on precisely the volume that matters, in exchange for a
+second untested code path. Worth revisiting only with a real measurement on that volume.

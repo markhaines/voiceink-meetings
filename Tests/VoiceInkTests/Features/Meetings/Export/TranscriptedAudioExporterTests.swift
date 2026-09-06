@@ -300,6 +300,7 @@ final class TranscriptedAudioExporterTests {
         let scratch = makeTemporaryDirectory()
         let brokenWAVURL = scratch.appendingPathComponent(UUID().uuidString).appendingPathExtension("wav")
         try Data("not a real wav file".utf8).write(to: brokenWAVURL)
+        let brokenWAVBytes = try Data(contentsOf: brokenWAVURL)
         let sources = TranscriptedAudioExporter.AudioSources(playbackURL: brokenWAVURL)
         let destinationRoot = makeTemporaryDirectory()
 
@@ -311,8 +312,12 @@ final class TranscriptedAudioExporterTests {
             )
         }
 
-        // The source must survive -- it is the only copy of this channel's audio.
-        #expect(FileManager.default.fileExists(atPath: brokenWAVURL.path))
+        // The source must survive -- it is the only copy of this channel's audio. FIX ROUND 2:
+        // compared BYTE-FOR-BYTE, not merely by existence, so the assertion actually checks what
+        // its own wording claims. A source that had been truncated, rewritten or transcoded in
+        // place would still "exist".
+        let brokenWAVBytesAfter = try Data(contentsOf: brokenWAVURL)
+        #expect(brokenWAVBytesAfter == brokenWAVBytes)
 
         // FIX ROUND (BLOCKING 2): a failed export must leave no directory at the final path at
         // all (nothing had ever existed there before this attempt) -- not an empty directory,
@@ -392,6 +397,8 @@ final class TranscriptedAudioExporterTests {
         let validMicURL = try makeWAVFile(in: retryScratch, samples: Array(repeating: 999, count: 16_000))
         let brokenSystemURL = retryScratch.appendingPathComponent(UUID().uuidString).appendingPathExtension("wav")
         try Data("not a real wav file".utf8).write(to: brokenSystemURL)
+        let validMicBytes = try Data(contentsOf: validMicURL)
+        let brokenSystemBytes = try Data(contentsOf: brokenSystemURL)
         let retrySources = TranscriptedAudioExporter.AudioSources(
             microphoneURL: validMicURL,
             systemAudioURL: brokenSystemURL
@@ -401,9 +408,13 @@ final class TranscriptedAudioExporterTests {
             _ = try await TranscriptedAudioExporter.export(meeting: meeting, sources: retrySources, to: destinationRoot)
         }
 
-        // Both sources of the failed retry survive, unmodified.
-        #expect(FileManager.default.fileExists(atPath: validMicURL.path))
-        #expect(FileManager.default.fileExists(atPath: brokenSystemURL.path))
+        // Both sources of the failed retry survive, unmodified. FIX ROUND 2: "unmodified" is now
+        // asserted BYTE-FOR-BYTE rather than by existence alone, so the check matches the claim --
+        // a source read, rewritten or truncated in place would have passed the old assertion.
+        let validMicBytesAfter = try Data(contentsOf: validMicURL)
+        let brokenSystemBytesAfter = try Data(contentsOf: brokenSystemURL)
+        #expect(validMicBytesAfter == validMicBytes)
+        #expect(brokenSystemBytesAfter == brokenSystemBytes)
 
         // The prior good export is EXACTLY as it was: same single file, same bytes -- not
         // deleted, not replaced with a partial microphone-only directory, not left empty.
@@ -417,5 +428,288 @@ final class TranscriptedAudioExporterTests {
         // the only thing there is the one real, complete audio directory.
         let rootContents = try FileManager.default.contentsOfDirectory(atPath: destinationRoot.path)
         #expect(rootContents == [audioDirectory.lastPathComponent])
+    }
+
+    // MARK: - commit() recovery paths — FORCED failures, not described ones
+    //
+    // FIX ROUND 2 (BLOCKING 1). Every test below drives the REAL `export(...)` entry point over
+    // the REAL filesystem and makes exactly one directory rename fail, through the
+    // `FileOperations` seam. That seam exists because these branches cannot be provoked any other
+    // way: both live strictly BETWEEN two renames inside one synchronous call, so a test has no
+    // moment at which to intervene, and there is no permission bit, `chflags` flag or path shape
+    // that makes the second rename of a sibling directory fail while the first, structurally
+    // identical one succeeds (an approach that blocks the second blocks the first, and the
+    // function then never reaches recovery at all). Everything else in each test is real: real
+    // audio written by this fork's own writer, real prior export, real bytes compared afterwards.
+    //
+    // HONEST LIMIT, stated rather than glossed: these four tests cannot be run against the
+    // PRE-FIX implementation to show them failing first, because the parameter they inject
+    // through did not exist there and the file would not compile. What was done instead is
+    // recorded in this task's report: each fix was reverted IN PLACE, one at a time, and the
+    // corresponding test observed to fail, with the failure messages quoted.
+
+    private enum InjectedRenameFailure: Error, Equatable {
+        /// Stands in for anything that can make `staging -> final` fail: ENOSPC, EIO, a vanished
+        /// volume, a sandbox denial. What it is does not matter; that it happens does.
+        case commitRename
+        /// The restoring `backup -> final` rename failing — the path whose whole reason for
+        /// existing is to guarantee recovery, and which an earlier version silenced with `try?`.
+        case restoreRename
+    }
+
+    /// A prior good export at the destination, plus its exact bytes, so every test below can
+    /// prove the ORIGINAL audio survived rather than merely that a directory exists.
+    private func makePriorGoodExport(
+        in destinationRoot: URL,
+        meeting: Meeting
+    ) async throws -> (directory: URL, playbackURL: URL, bytes: Data) {
+        let scratch = makeTemporaryDirectory()
+        let wavURL = try makeWAVFile(in: scratch, samples: Array(repeating: 4321, count: 16_000))
+        let directory = try await TranscriptedAudioExporter.export(
+            meeting: meeting,
+            sources: TranscriptedAudioExporter.AudioSources(playbackURL: wavURL),
+            to: destinationRoot
+        )
+        let playbackURL = directory.appendingPathComponent("playback.m4a")
+        let bytes = try Data(contentsOf: playbackURL)
+        #expect(!bytes.isEmpty)
+        return (directory, playbackURL, bytes)
+    }
+
+    /// Sources for a re-export over that prior good export. Valid, so the staging half succeeds
+    /// for real and the failure under test is genuinely the COMMIT, not a transcode.
+    private func makeValidReExportSources(scratch: URL) throws -> TranscriptedAudioExporter.AudioSources {
+        TranscriptedAudioExporter.AudioSources(
+            playbackURL: try makeWAVFile(in: scratch, samples: Array(repeating: 999, count: 16_000))
+        )
+    }
+
+    private func stagingLeftovers(under root: URL) throws -> [String] {
+        try FileManager.default.contentsOfDirectory(atPath: root.path)
+            .filter { $0.hasPrefix(".TranscriptedAudioExporter-staging-") }
+    }
+
+    /// Outcome 1 of three: the replacement rename fails, the aside copy IS successfully renamed
+    /// back, and the caller therefore gets the ORIGINAL commit error rather than a rollback error.
+    /// The destination must end up byte-for-byte as it was — this is the ordinary, expected shape
+    /// of a failed re-export, and the one the other two tests are the fallbacks for.
+    @Test("a failed commit whose rollback succeeds restores the original bytes and surfaces the commit error")
+    func commitFailureWithSuccessfulRollbackRestoresTheOriginalAndSurfacesTheCommitError() async throws {
+        let destinationRoot = makeTemporaryDirectory()
+        let meeting = Self.makeMeeting()
+        let prior = try await makePriorGoodExport(in: destinationRoot, meeting: meeting)
+        let sources = try makeValidReExportSources(scratch: makeTemporaryDirectory())
+
+        // Only `staging -> final` fails. `old -> backup` and the restoring `backup -> final` both
+        // run for real against the real filesystem.
+        var operations = TranscriptedAudioExporter.FileOperations.live
+        let liveMove = TranscriptedAudioExporter.FileOperations.live.move
+        operations.move = { source, destination in
+            if source.lastPathComponent.hasPrefix(".TranscriptedAudioExporter-staging-") {
+                throw InjectedRenameFailure.commitRename
+            }
+            try liveMove(source, destination)
+        }
+
+        var caught: (any Error)?
+        do {
+            _ = try await TranscriptedAudioExporter.export(
+                meeting: meeting, sources: sources, to: destinationRoot, fileOperations: operations
+            )
+            Issue.record("export unexpectedly succeeded despite an injected commit-rename failure")
+        } catch {
+            caught = error
+        }
+
+        // The caller sees the real cause, NOT a rollback error: recovery worked, so there is
+        // nothing extra to tell them.
+        #expect(caught as? InjectedRenameFailure == .commitRename)
+
+        // The prior good export is back at its documented path, byte for byte.
+        #expect(FileManager.default.fileExists(atPath: prior.directory.path))
+        let restoredBytes = try Data(contentsOf: prior.playbackURL)
+        #expect(restoredBytes == prior.bytes)
+        let contents = try FileManager.default.contentsOfDirectory(atPath: prior.directory.path)
+        #expect(Set(contents) == ["playback.m4a"])
+
+        // Nothing left behind: the backup was consumed by the restore, and the staging directory
+        // was discarded because this was NOT a rollback failure.
+        let rootContents = try FileManager.default.contentsOfDirectory(atPath: destinationRoot.path)
+        #expect(rootContents == [prior.directory.lastPathComponent])
+    }
+
+    /// Outcome 2 of three, and the proof the escalation asked for by name: the RESTORING rename
+    /// fails. The caller must receive an error that NAMES WHERE THE ORIGINAL AUDIO ACTUALLY IS.
+    ///
+    /// This is the exact defect being closed. The previous implementation wrote
+    /// `try? removeItem(final)` then `try? moveItem(backup, final)`, so this failure was
+    /// swallowed whole: the caller saw only the unrelated commit error while a complete, unplayed
+    /// recording sat under a `.TranscriptedAudioExporter-backup-<uuid>` name nobody could guess
+    /// and the documented destination was empty. Lines of prose two above it claimed restoration
+    /// was guaranteed and that neither version could be absent.
+    @Test("when the restoring rename fails, the caller gets an error naming where the original audio is")
+    func restoreFailureSurfacesRollbackFailedNamingTheBackupLocation() async throws {
+        let destinationRoot = makeTemporaryDirectory()
+        let meeting = Self.makeMeeting()
+        let prior = try await makePriorGoodExport(in: destinationRoot, meeting: meeting)
+        let sources = try makeValidReExportSources(scratch: makeTemporaryDirectory())
+
+        // Both the replacement rename AND the restoring rename fail. `old -> backup` still runs
+        // for real, so the original really is sitting under the backup name when this resolves.
+        var operations = TranscriptedAudioExporter.FileOperations.live
+        let liveMove = TranscriptedAudioExporter.FileOperations.live.move
+        operations.move = { source, destination in
+            if source.lastPathComponent.hasPrefix(".TranscriptedAudioExporter-staging-") {
+                throw InjectedRenameFailure.commitRename
+            }
+            if source.lastPathComponent.hasPrefix(".TranscriptedAudioExporter-backup-") {
+                throw InjectedRenameFailure.restoreRename
+            }
+            try liveMove(source, destination)
+        }
+
+        var caught: (any Error)?
+        do {
+            _ = try await TranscriptedAudioExporter.export(
+                meeting: meeting, sources: sources, to: destinationRoot, fileOperations: operations
+            )
+            Issue.record("export unexpectedly succeeded despite injected commit and restore failures")
+        } catch {
+            caught = error
+        }
+
+        let exportError = try #require(caught as? TranscriptedAudioExporter.ExportError)
+        guard case .rollbackFailed(let failure) = exportError else {
+            Issue.record("expected .rollbackFailed, got \(exportError)")
+            return
+        }
+        #expect(failure.reason == .restoreFailed(String(describing: InjectedRenameFailure.restoreRename)))
+        #expect(failure.intendedDirectory == prior.directory)
+        #expect(failure.commitFailure == String(describing: InjectedRenameFailure.commitRename))
+
+        // THE LOAD-BEARING ASSERTION: the path in the error is not decoration. The original audio
+        // is really there, complete and byte-identical, and a human following this error recovers
+        // it. Nothing is lost -- it is only in the wrong place, and the error says which place.
+        #expect(FileManager.default.fileExists(atPath: failure.originalAudioDirectory.path))
+        let rescuedBytes = try Data(contentsOf: failure.originalAudioDirectory.appendingPathComponent("playback.m4a"))
+        #expect(rescuedBytes == prior.bytes)
+        let rescuedContents = try FileManager.default.contentsOfDirectory(
+            atPath: failure.originalAudioDirectory.path
+        )
+        #expect(Set(rescuedContents) == ["playback.m4a"])
+
+        // The documented destination really is empty -- i.e. this test is checking the state the
+        // old code left silently, not a state that happened to look fine anyway.
+        #expect(FileManager.default.fileExists(atPath: prior.directory.path) == false)
+
+        // The message a person actually sees carries the recovery path verbatim. An error that
+        // only said "export failed" would strand audio nobody can re-record.
+        let description = try #require(exportError.errorDescription)
+        #expect(description.contains(failure.originalAudioDirectory.path))
+        #expect(description.contains(prior.directory.path))
+
+        // Deliberate: the assembled replacement is KEPT, not deleted, while a human is recovering.
+        let keptStaging = try stagingLeftovers(under: destinationRoot)
+        #expect(keptStaging.count == 1)
+    }
+
+    /// Outcome 3 of three: something else has created a directory at the destination in the window
+    /// between the two renames. The recovery must REFUSE to delete it and surface a distinct error
+    /// naming the backup, rather than recursively destroying a stranger's data on the assumption
+    /// that anything at that path is our own debris.
+    ///
+    /// The previous implementation did exactly that: `try? removeItem(at: finalDirectory)`,
+    /// unconditionally, as the first act of its recovery path.
+    @Test("an unexpected directory at the destination is never deleted, and the error names the backup")
+    func unexpectedDirectoryAtDestinationIsNotDeletedAndErrorNamesTheBackup() async throws {
+        let destinationRoot = makeTemporaryDirectory()
+        let meeting = Self.makeMeeting()
+        let prior = try await makePriorGoodExport(in: destinationRoot, meeting: meeting)
+        let sources = try makeValidReExportSources(scratch: makeTemporaryDirectory())
+
+        let strangerFilename = "written-by-someone-else.txt"
+        let strangerBytes = Data("another process put this here".utf8)
+
+        // The replacement rename fails, and in failing leaves a directory at the final path --
+        // the observable shape of "another process claimed that path in the window".
+        var operations = TranscriptedAudioExporter.FileOperations.live
+        let liveMove = TranscriptedAudioExporter.FileOperations.live.move
+        operations.move = { source, destination in
+            if source.lastPathComponent.hasPrefix(".TranscriptedAudioExporter-staging-") {
+                try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+                try strangerBytes.write(to: destination.appendingPathComponent(strangerFilename))
+                throw InjectedRenameFailure.commitRename
+            }
+            try liveMove(source, destination)
+        }
+
+        var caught: (any Error)?
+        do {
+            _ = try await TranscriptedAudioExporter.export(
+                meeting: meeting, sources: sources, to: destinationRoot, fileOperations: operations
+            )
+            Issue.record("export unexpectedly succeeded despite an occupied destination")
+        } catch {
+            caught = error
+        }
+
+        let exportError = try #require(caught as? TranscriptedAudioExporter.ExportError)
+        guard case .rollbackFailed(let failure) = exportError else {
+            Issue.record("expected .rollbackFailed, got \(exportError)")
+            return
+        }
+        #expect(failure.reason == .destinationOccupied)
+
+        // THE LOAD-BEARING ASSERTION: the stranger's directory is untouched. A blind
+        // `removeItem(at: finalDirectory)` would have recursively deleted it and its contents.
+        let strangerURL = prior.directory.appendingPathComponent(strangerFilename)
+        let strangerBytesAfter = try Data(contentsOf: strangerURL)
+        #expect(strangerBytesAfter == strangerBytes)
+        let occupiedContents = try FileManager.default.contentsOfDirectory(atPath: prior.directory.path)
+        #expect(Set(occupiedContents) == [strangerFilename])
+
+        // And the original audio is still whole, at the path the error names.
+        let preservedOriginalBytes = try Data(
+            contentsOf: failure.originalAudioDirectory.appendingPathComponent("playback.m4a")
+        )
+        #expect(preservedOriginalBytes == prior.bytes)
+        let description = try #require(exportError.errorDescription)
+        #expect(description.contains(failure.originalAudioDirectory.path))
+    }
+
+    /// FIX ROUND 2 (BLOCKING 3). `commit` throwing from its own rename with NO prior export at the
+    /// destination used to orphan the complete staging directory: `export` did not wrap the call,
+    /// so nothing removed it, while the file's header claimed no residue was left "anywhere, ever".
+    /// The claim is now narrowed to what the code delivers AND the cleanup is actually done here.
+    @Test("a commit rename failure with no prior export leaves no staging directory behind")
+    func commitRenameFailureWithNoPriorExportDiscardsTheStagingDirectory() async throws {
+        let destinationRoot = makeTemporaryDirectory()
+        let sources = try makeValidReExportSources(scratch: makeTemporaryDirectory())
+
+        // Nothing at the destination, so `commit` takes its single-rename path -- and that one
+        // rename fails.
+        var operations = TranscriptedAudioExporter.FileOperations.live
+        let liveMove = TranscriptedAudioExporter.FileOperations.live.move
+        operations.move = { source, destination in
+            if source.lastPathComponent.hasPrefix(".TranscriptedAudioExporter-staging-") {
+                throw InjectedRenameFailure.commitRename
+            }
+            try liveMove(source, destination)
+        }
+
+        var caught: (any Error)?
+        do {
+            _ = try await TranscriptedAudioExporter.export(
+                meeting: Self.makeMeeting(), sources: sources, to: destinationRoot, fileOperations: operations
+            )
+            Issue.record("export unexpectedly succeeded despite an injected commit-rename failure")
+        } catch {
+            caught = error
+        }
+        #expect(caught as? InjectedRenameFailure == .commitRename)
+
+        // No destination directory was created, and no staging directory survives.
+        let rootContents = try FileManager.default.contentsOfDirectory(atPath: destinationRoot.path)
+        #expect(rootContents.isEmpty)
     }
 }

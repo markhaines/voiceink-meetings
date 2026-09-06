@@ -88,22 +88,64 @@
 // `destinationFilename(for:sources:)` below is a function of the COMPLETE `AudioSources`, not
 // of one field read in isolation, so this can never be computed correctly per-channel.
 //
-// ATOMICITY (fix round): this exporter's earlier version wrote each planned item directly into
-// the final `<stem>_audio/` directory, one at a time. That has two failure modes that matter a
-// great deal for audio nobody can re-record: (1) if an earlier item succeeded and a later one
-// failed, the earlier item's file was left behind alongside a freshly-created but incomplete
-// final directory; (2) a RE-export first deleted any file already at a destination path before
-// writing its replacement, so a re-export that failed partway could destroy a good, pre-existing
-// export while producing nothing usable in its place. `export(meeting:sources:to:)` now stages
-// every item in a throwaway sibling directory OUTSIDE the final directory's own path, and only
-// after every single item has succeeded does `commit(stagingDirectory:to:)` swap the staging
-// directory into place. That commit is a single `FileManager.moveItem` (a `rename(2)` at the
-// filesystem level, atomic, because the staging directory is created as a sibling of the final
-// directory under the SAME parent — guaranteed same volume, never a cross-volume copy) when no
-// prior export exists, or a rename-aside / rename-in / remove-backup sequence when one does,
-// with the aside copy restored if the final rename itself fails. Either way: if any item fails
-// during staging, the final directory (existing or not) is never touched at all, and the failed
-// staging directory is deleted — no partial output, anywhere, ever reaches the destination path.
+// ============================================================================================
+// ATOMICITY, AND ITS EXACT LIMITS
+// ============================================================================================
+//
+// This exporter's first version wrote each planned item directly into the final `<stem>_audio/`
+// directory, one at a time. That had two failure modes that matter a great deal for audio
+// nobody can re-record: (1) an earlier item succeeding and a later one failing left the earlier
+// item's file behind alongside a freshly-created but incomplete final directory; (2) a RE-export
+// DELETED whatever was already at a destination path BEFORE writing its replacement, so a
+// re-export that failed partway destroyed a good, pre-existing export while producing nothing
+// usable in its place. `export(meeting:sources:to:)` now stages every item in a throwaway
+// sibling directory OUTSIDE the final directory's own path, and only after every single item
+// has succeeded does `commit(stagingDirectory:to:)` swap staging into place.
+//
+// Each individual step of that commit is one `FileManager.moveItem` — a `rename(2)` at the
+// filesystem level, atomic, because the staging, backup and final directories are all siblings
+// under the SAME parent, guaranteed the same volume, never a cross-volume copy+delete. Where no
+// prior export exists that is a single rename, and the commit as a whole is genuinely atomic.
+//
+// **A RE-EXPORT IS TWO RENAMES, AND TWO RENAMES ARE NOT ONE ATOMIC UNIT.** That is the honest
+// limit of this design, and it is stated here, in the code, rather than only in a review report,
+// because a future reader gets this file and not that report. The sequence is `old -> backup`,
+// then `staging -> final`, then remove `backup`. Between the first and the second there is a
+// window in which the process can die outright — SIGKILL, kernel panic, power loss — leaving the
+// original audio at the `.TranscriptedAudioExporter-backup-<uuid>` path and NOTHING at the
+// documented `<stem>_audio/` path. No `catch` closes that window, because after a SIGKILL no
+// code in this process runs at all.
+//
+// Darwin does offer `renameatx_np` with `RENAME_SWAP`, which would exchange staging and final in
+// ONE atomic syscall and close the window entirely. It is deliberately NOT used here: the real
+// destination is inside `~/Library/CloudStorage/OneDrive-ATEME/`, a File Provider volume whose
+// `RENAME_SWAP` support cannot be verified from this fork's test environment, and an
+// unsupported volume returns `ENOTSUP` — so shipping it would mean shipping BOTH it and this
+// two-rename fallback, and the window would still exist on precisely the volume that matters.
+// One reviewed path with a documented limit beats two paths where the limit merely moves. See
+// FOLLOWUPS.md, "Stale staging and backup directories are never swept".
+//
+// WHAT THIS GUARANTEES, PRECISELY:
+// - A partial or failed export NEVER reaches the destination path `<stem>_audio/`. Content
+//   becomes visible there only by renaming an already-complete directory into place.
+// - A pre-existing good export is NEVER deleted to make room for a replacement. It is renamed
+//   aside, and removed only once the replacement rename has already succeeded.
+// - If the replacement cannot be installed AND the original cannot be put back at the documented
+//   path, the original is still intact under the backup name, and the error thrown to the caller
+//   NAMES that path (`ExportError.rollbackFailed`, whose `errorDescription` spells out the
+//   recovery `mv`). That failure is never swallowed.
+// - The exporter never deletes, moves or modifies any source URL it was given, under any
+//   circumstance.
+//
+// WHAT IT DOES NOT GUARANTEE — RESIDUE. It does NOT guarantee that no leftover directory exists
+// anywhere. Removing a staging or backup directory is a best-effort `removeItem` that can itself
+// fail (a permissions change, a vanished volume), and per the kill window above may never be
+// reached at all. Such leftovers are inert debris, not data loss: they are dot-prefixed, carry
+// this type's name, are uniquely suffixed, and are never at the destination path, so nothing
+// reading Transcripted's layout ever sees them. When a cleanup does fail the path is LOGGED, so
+// the residue is observable instead of invisible. An earlier version of this header claimed "no
+// partial output, anywhere, ever" — that claim was stronger than the code and is corrected here;
+// a sweep for the debris is deliberately out of scope and recorded in FOLLOWUPS.md.
 //
 // TRANSCODE-FAILURE POLICY, the established precedent this file follows rather than invents:
 // `MeetingRecordingWriter.persistTemporaryRecordingAsync`'s M4A path already answers "what
@@ -116,12 +158,22 @@
 
 import AVFoundation
 import Foundation
+import OSLog
 
 /// Thin planning + file-writing shell around Transcripted's audio layout. The planning half
 /// (`plan(meeting:sources:)`) is pure — no filesystem access, no I/O — exactly like
 /// `TranscriptedMarkdownExporter.render(meeting:segments:)`; only `export(meeting:sources:to:)`
 /// touches disk.
 enum TranscriptedAudioExporter {
+    /// Same `Logger(subsystem: "com.hainesy.voiceinkmeetings", category:)` convention as
+    /// `MeetingSummaryService` and `MeetingEngine`. Used for exactly one thing: reporting a
+    /// best-effort cleanup that failed, so leftover scratch directories are observable rather
+    /// than invisible. See this file's header, "WHAT IT DOES NOT GUARANTEE — RESIDUE".
+    private static let logger = Logger(
+        subsystem: "com.hainesy.voiceinkmeetings",
+        category: "TranscriptedAudioExporter"
+    )
+
     /// Whatever audio this fork's capture actually produced for a meeting. Any subset may be
     /// present; see this file's header for why only `playbackURL` is populated today, and why
     /// `microphoneURL`/`systemAudioURL` exist at all despite that.
@@ -172,7 +224,71 @@ enum TranscriptedAudioExporter {
         let items: [PlannedItem]
     }
 
-    enum ExportError: Error, Equatable {
+    // MARK: - Errors
+
+    /// Everything a human needs to get their audio back BY HAND after the one failure this
+    /// exporter cannot recover from itself: a re-export that could neither install its
+    /// replacement nor put the original back where it belongs.
+    ///
+    /// The original audio is NOT lost in this state — it is complete, unmodified, and sitting at
+    /// `originalAudioDirectory` under a dot-prefixed UUID name that nothing else on the system
+    /// knows to look for. That is the entire reason this type exists: an earlier version of
+    /// `commit` swallowed this failure with `try?`, so the caller saw only the unrelated
+    /// replacement error while a complete recording sat under an unguessable name and the
+    /// documented destination was empty. A caller that can only say "export failed" would strand
+    /// audio nobody can re-record, so the recovery path is carried IN the error, and repeated in
+    /// `errorDescription` as a literal `mv` command.
+    struct RollbackFailure: Equatable, Sendable {
+        /// Where the original, complete, pre-export audio directory ACTUALLY is right now.
+        let originalAudioDirectory: URL
+        /// Where it is supposed to be, and currently is not.
+        let intendedDirectory: URL
+        /// Why recovery could not finish.
+        let reason: Reason
+        /// Description of the failure that stopped the replacement being installed in the first
+        /// place — kept alongside the recovery information rather than replaced by it, so the
+        /// caller still learns why the export failed as well as what to do about it.
+        let commitFailure: String
+
+        enum Reason: Equatable, Sendable {
+            /// Renaming the original back to `intendedDirectory` was attempted and failed. The
+            /// payload is the underlying error's description.
+            case restoreFailed(String)
+            /// The restore was NOT attempted, deliberately. Something already existed at
+            /// `intendedDirectory` when recovery reached it — this function had just emptied
+            /// that path itself, so anything there was created by something outside this
+            /// process. Deleting it to make room would destroy a stranger's data on the
+            /// strength of a guess, so the original is left at `originalAudioDirectory` and the
+            /// caller is told where it is. See `commit(stagingDirectory:to:using:)`.
+            case destinationOccupied
+        }
+
+        /// Human-readable, actionable, and safe to show verbatim: names both paths and the exact
+        /// command that completes the recovery.
+        var message: String {
+            let obstruction: String
+            switch reason {
+            case .destinationOccupied:
+                obstruction = "something else had already created a file or folder at the "
+                    + "destination, and it was left untouched rather than deleted"
+            case .restoreFailed(let underlying):
+                obstruction = "moving it back failed: \(underlying)"
+            }
+            return """
+                The previous audio export could not be replaced, and could not be put back where \
+                it belongs. THE ORIGINAL AUDIO IS SAFE AND COMPLETE — it is at:
+                    \(originalAudioDirectory.path)
+                instead of:
+                    \(intendedDirectory.path)
+                Restore it by hand with:
+                    mv "\(originalAudioDirectory.path)" "\(intendedDirectory.path)"
+                The replacement failed because: \(commitFailure)
+                Recovery could not finish because \(obstruction).
+                """
+        }
+    }
+
+    enum ExportError: Error, Equatable, Sendable {
         /// `AudioSources` had every field `nil` — nothing to write. Mirrors real
         /// Transcripted's own `RecordingAudioArchiver.archive` guard (`micURL != nil ||
         /// systemURL != nil`): an audio directory with zero files would be a worse signal than
@@ -180,7 +296,51 @@ enum TranscriptedAudioExporter {
         case noAudioSources
         case exportSessionUnavailable
         case transcodeFailed
+        /// A re-export left the original audio somewhere other than its documented path. Never
+        /// data loss, always recoverable by hand — see `RollbackFailure`.
+        case rollbackFailed(RollbackFailure)
     }
+
+    // MARK: - Filesystem seam
+
+    /// The directory-level filesystem operations `export` and `commit` perform, injected rather
+    /// than called directly on `FileManager`.
+    ///
+    /// This exists for ONE reason: the recovery paths in `commit` must be proven by tests that
+    /// FORCE the failure, not by tests that describe it — and the two failures that matter
+    /// (`staging -> final` fails, then `backup -> final` also fails, or the destination is
+    /// occupied when recovery reaches it) cannot be provoked through the real `FileManager`.
+    /// Both live strictly BETWEEN two renames inside a single synchronous call, so a test has no
+    /// moment at which to intervene: there is no permission bit, flag or path shape that makes
+    /// the second rename of a sibling directory fail while the first, structurally identical
+    /// one succeeds. Injecting the operation is the only way to exercise the branch that exists
+    /// to protect audio nobody can re-record, and untested recovery code is how this exporter
+    /// shipped a swallowed rollback failure in the first place.
+    ///
+    /// The same `@Sendable`-closure seam this feature area already uses for exactly this purpose
+    /// — see `StreamingVadController.processStreamChunk` and
+    /// `FluidAudioMeetingDiarizer.loadModels`. Production always uses `.live`, which is the
+    /// parameter's default, so no caller passes anything and no production behaviour changes.
+    /// Per-FILE writes (`writeAudioFile`) deliberately do NOT go through this seam: their
+    /// failure modes are provokable for real with a corrupt source, and the existing tests do
+    /// exactly that.
+    struct FileOperations: Sendable {
+        var exists: @Sendable (URL) -> Bool
+        var createDirectory: @Sendable (URL) throws -> Void
+        var move: @Sendable (URL, URL) throws -> Void
+        var remove: @Sendable (URL) throws -> Void
+
+        static let live = FileOperations(
+            exists: { FileManager.default.fileExists(atPath: $0.path) },
+            createDirectory: {
+                try FileManager.default.createDirectory(at: $0, withIntermediateDirectories: true)
+            },
+            move: { try FileManager.default.moveItem(at: $0, to: $1) },
+            remove: { try FileManager.default.removeItem(at: $0) }
+        )
+    }
+
+    // MARK: - Planning
 
     /// Pure: decides the audio directory's name and which files it will contain, without
     /// touching the filesystem or reading `sources`' URLs. Reuses
@@ -232,68 +392,176 @@ enum TranscriptedAudioExporter {
         }
     }
 
+    // MARK: - Export
+
     /// Writes `sources` into `<directory>/<stem>_audio/` per `plan(meeting:sources:)` and
-    /// returns its URL. Every item is staged into a throwaway sibling directory first; only
-    /// once ALL of them have succeeded is that staging directory atomically swapped into the
-    /// final path by `commit(stagingDirectory:to:)` — see this file's header, "ATOMICITY", for
-    /// why this is the only shape that can never leave a partial or destroyed destination behind
-    /// for audio nobody can re-record. On any item failure, the staging directory is removed and
-    /// the final directory (existing or not) is left byte-for-byte as it was.
+    /// returns its URL. Every item is staged into a throwaway sibling directory first; only once
+    /// ALL of them have succeeded is that staging directory swapped into the final path by
+    /// `commit(stagingDirectory:to:using:)`.
+    ///
+    /// See this file's header, "ATOMICITY, AND ITS EXACT LIMITS", for what that does and does not
+    /// guarantee. In short, for the failures this function can actually observe: nothing partial
+    /// ever appears at the destination path, and a pre-existing export there is never destroyed —
+    /// on any item failure the final directory (existing or not) is left byte-for-byte as it was,
+    /// and the staging directory is discarded on a best-effort basis, its path logged if that
+    /// removal itself fails. `fileOperations` defaults to the real filesystem and exists so the
+    /// recovery paths can be tested by forcing their failures; see `FileOperations`.
     @discardableResult
-    static func export(meeting: Meeting, sources: AudioSources, to directory: URL) async throws -> URL {
+    static func export(
+        meeting: Meeting,
+        sources: AudioSources,
+        to directory: URL,
+        fileOperations: FileOperations = .live
+    ) async throws -> URL {
         let resolvedPlan = try plan(meeting: meeting, sources: sources)
-        let fileManager = FileManager.default
         let finalDirectory = directory.appendingPathComponent(resolvedPlan.audioDirectoryName, isDirectory: true)
         let stagingDirectory = directory.appendingPathComponent(
             ".TranscriptedAudioExporter-staging-\(UUID().uuidString)", isDirectory: true
         )
 
-        try fileManager.createDirectory(at: stagingDirectory, withIntermediateDirectories: true)
+        try fileOperations.createDirectory(stagingDirectory)
         do {
             for item in resolvedPlan.items {
                 let destinationURL = stagingDirectory.appendingPathComponent(item.destinationFilename)
                 try await writeAudioFile(from: item.sourceURL, to: destinationURL)
             }
         } catch {
-            try? fileManager.removeItem(at: stagingDirectory)
+            discardScratchDirectory(stagingDirectory, using: fileOperations)
             throw error
         }
 
-        try commit(stagingDirectory: stagingDirectory, to: finalDirectory)
+        do {
+            try commit(stagingDirectory: stagingDirectory, to: finalDirectory, using: fileOperations)
+        } catch {
+            // `commit` can throw from its OWN renames, which leaves the complete staging
+            // directory orphaned next to the destination. Discarding it here is three lines and
+            // cannot introduce a new failure mode: the directory was created by this call, is
+            // uniquely named, is referenced by nothing else, and `commit` either consumed it (in
+            // which case it did not throw) or left it exactly as staged — `rename(2)` moves
+            // everything or nothing. The removal is best-effort and never replaces the caller's
+            // error with a housekeeping complaint.
+            //
+            // The ONE exception is a rollback failure. There the destination is in a state a
+            // human has to sort out by hand, guided by the path in the error, and this staging
+            // directory is a complete assembled copy of the new export sitting right next to it.
+            // Deleting evidence out from under that recovery is precisely the reflex this whole
+            // change exists to remove, so the directory is kept and its path logged instead.
+            if isRollbackFailure(error) {
+                logger.error(
+                    """
+                    Kept staged export at \(stagingDirectory.lastPathComponent, privacy: .public) \
+                    under \(directory.path, privacy: .public): a rollback failure needs manual \
+                    recovery and this is the assembled replacement.
+                    """
+                )
+            } else {
+                discardScratchDirectory(stagingDirectory, using: fileOperations)
+            }
+            throw error
+        }
         return finalDirectory
     }
 
-    /// Atomically swaps a fully-populated `stagingDirectory` into `finalDirectory`'s place.
-    /// `stagingDirectory` is a sibling of `finalDirectory` (same parent, guaranteed same
-    /// volume), so every `moveItem` here is a single `rename(2)`, not a cross-volume copy+
-    /// delete — that is what makes each step atomic at the filesystem level.
+    /// Swaps a fully-populated `stagingDirectory` into `finalDirectory`'s place. `stagingDirectory`
+    /// and the backup directory are both siblings of `finalDirectory` (same parent, guaranteed
+    /// same volume), so every move here is a single `rename(2)`, not a cross-volume copy+delete —
+    /// that is what makes each INDIVIDUAL step atomic at the filesystem level. The pair is not one
+    /// atomic unit; see this file's header, "ATOMICITY, AND ITS EXACT LIMITS", for the kill window
+    /// that leaves and why it is not closed with `renameatx_np`.
     ///
-    /// - No prior export exists: one rename, done.
-    /// - A prior export exists (a re-export): the existing directory is renamed aside first,
-    ///   the staging directory is renamed into the now-empty final path, and only THEN is the
-    ///   aside copy removed. If the second rename fails for any reason, the aside copy is
-    ///   renamed back into place and the failure propagates — so a failed re-export can never
-    ///   leave neither the old nor the new audio in place, which is the exact defect this
-    ///   function exists to close.
-    private static func commit(stagingDirectory: URL, to finalDirectory: URL) throws {
-        let fileManager = FileManager.default
-        guard fileManager.fileExists(atPath: finalDirectory.path) else {
-            try fileManager.moveItem(at: stagingDirectory, to: finalDirectory)
+    /// - No prior export exists: one rename, done, genuinely atomic.
+    /// - A prior export exists (a re-export): the existing directory is renamed ASIDE first (never
+    ///   deleted), the staging directory is renamed into the now-empty final path, and only THEN is
+    ///   the aside copy removed.
+    ///
+    /// If that second rename fails, recovery runs and there are exactly three outcomes, none of
+    /// which loses the original audio and none of which is silent:
+    /// 1. The aside copy is renamed back and the ORIGINAL commit error propagates — the caller
+    ///    learns the re-export failed, and the destination is byte-for-byte as it was.
+    /// 2. Renaming it back fails: `ExportError.rollbackFailed(.restoreFailed)`, carrying the path
+    ///    the original is actually at.
+    /// 3. Something has appeared at `finalDirectory` in the meantime: the delete is REFUSED, not
+    ///    performed. This function emptied that path itself moments earlier, so anything there now
+    ///    was created by something outside this process, and a recursive delete would destroy a
+    ///    stranger's data on the strength of a guess that it is our own debris. The original stays
+    ///    at the backup path and `ExportError.rollbackFailed(.destinationOccupied)` names it.
+    ///
+    /// An earlier version did `try? remove(final)` then `try? move(backup, final)` here, which got
+    /// both of those wrong at once: it blind-deleted whatever it found, and it discarded the result
+    /// of the restore, so a failed restore surfaced as the unrelated commit error while a complete
+    /// recording sat under an unguessable UUID name.
+    private static func commit(
+        stagingDirectory: URL,
+        to finalDirectory: URL,
+        using fileOperations: FileOperations
+    ) throws {
+        guard fileOperations.exists(finalDirectory) else {
+            try fileOperations.move(stagingDirectory, finalDirectory)
             return
         }
 
         let backupDirectory = finalDirectory.deletingLastPathComponent().appendingPathComponent(
             ".TranscriptedAudioExporter-backup-\(UUID().uuidString)", isDirectory: true
         )
-        try fileManager.moveItem(at: finalDirectory, to: backupDirectory)
+        try fileOperations.move(finalDirectory, backupDirectory)
+
         do {
-            try fileManager.moveItem(at: stagingDirectory, to: finalDirectory)
+            try fileOperations.move(stagingDirectory, finalDirectory)
         } catch {
-            try? fileManager.removeItem(at: finalDirectory)
-            try? fileManager.moveItem(at: backupDirectory, to: finalDirectory)
+            guard !fileOperations.exists(finalDirectory) else {
+                throw ExportError.rollbackFailed(RollbackFailure(
+                    originalAudioDirectory: backupDirectory,
+                    intendedDirectory: finalDirectory,
+                    reason: .destinationOccupied,
+                    commitFailure: String(describing: error)
+                ))
+            }
+            do {
+                try fileOperations.move(backupDirectory, finalDirectory)
+            } catch let restoreError {
+                throw ExportError.rollbackFailed(RollbackFailure(
+                    originalAudioDirectory: backupDirectory,
+                    intendedDirectory: finalDirectory,
+                    reason: .restoreFailed(String(describing: restoreError)),
+                    commitFailure: String(describing: error)
+                ))
+            }
             throw error
         }
-        try? fileManager.removeItem(at: backupDirectory)
+
+        discardScratchDirectory(backupDirectory, using: fileOperations)
+    }
+
+    /// Best-effort removal of a staging or backup directory this exporter itself created, with
+    /// the failure LOGGED rather than swallowed. A cleanup that fails here is debris, never data
+    /// loss — by the time this is called the audio is already exactly where it belongs — so it is
+    /// reported rather than escalated into the caller's error, which would replace a useful
+    /// diagnosis with a housekeeping complaint, or worse, fail an export that actually succeeded.
+    ///
+    /// Only scratch paths are logged, and only as a public parent + dot-prefixed UUID name: those
+    /// carry no meeting title. The final directory's name does carry one, so it is never logged —
+    /// it reaches the user through `RollbackFailure.message` instead, where it is needed to act on.
+    private static func discardScratchDirectory(_ url: URL, using fileOperations: FileOperations) {
+        do {
+            try fileOperations.remove(url)
+        } catch {
+            logger.error(
+                """
+                Failed to remove leftover scratch directory \
+                \(url.lastPathComponent, privacy: .public) under \
+                \(url.deletingLastPathComponent().path, privacy: .public): \
+                \(String(describing: error), privacy: .public). It is inert — dot-prefixed, \
+                uniquely named, and not at any Transcripted destination path — but it will not \
+                clean itself up.
+                """
+            )
+        }
+    }
+
+    private static func isRollbackFailure(_ error: any Error) -> Bool {
+        guard let exportError = error as? ExportError else { return false }
+        if case .rollbackFailed = exportError { return true }
+        return false
     }
 
     // MARK: - Per-file write
@@ -348,6 +616,26 @@ enum TranscriptedAudioExporter {
                 }
                 continuation.resume(returning: ())
             }
+        }
+    }
+}
+
+/// Makes `rollbackFailed`'s recovery instructions reach anything that shows an error to a
+/// person — an `NSAlert`, a `Text(error.localizedDescription)`, a log line — without that
+/// caller needing to know this enum exists. The whole point of `RollbackFailure` is that the
+/// path to the audio survives the trip out of this type; a default `Error` description
+/// ("The operation couldn't be completed") would throw it away at the last step.
+extension TranscriptedAudioExporter.ExportError: LocalizedError {
+    var errorDescription: String? {
+        switch self {
+        case .noAudioSources:
+            return "This meeting has no audio to export."
+        case .exportSessionUnavailable:
+            return "Could not start an audio export session for this meeting."
+        case .transcodeFailed:
+            return "This meeting's audio could not be converted to M4A."
+        case .rollbackFailed(let failure):
+            return failure.message
         }
     }
 }

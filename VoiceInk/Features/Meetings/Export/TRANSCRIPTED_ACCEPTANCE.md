@@ -21,9 +21,14 @@ and `parseFrontmatterSpeakers`, both read from source). So a run of two or more 
 asterisks in a speaker label CANNOT be represented: whatever the file stores is what a reader
 sees, and any `**` in it is silently deleted on the way into the index.
 
-`TranscriptSanitizer.speakerLabel` therefore collapses each run of 2+ asterisks to a single
-`*`, and leaves everything else — a lone `*` included — byte-identical. That is deterministic
-and idempotent, and it is deliberately, visibly lossy: `**Mark**` is exported and indexed as
+`TranscriptSanitizer.speakerLabel` first normalizes whitespace (collapsing runs, converting
+newlines to spaces) and drops control characters, THEN collapses each run of 2+ asterisks to a
+single `*` in that already-normalized value. For everything else — a lone `*` included — the
+asterisk pass makes no additional change: the result is byte-identical to the
+whitespace/control-normalized value, not to the raw input (`" Jane  Doe "` and `"*\u{0}a"` are
+not returned byte-identical to what was typed; only the final asterisk step is a no-op for
+them). That asterisk pass is deterministic and idempotent, and it is deliberately, visibly
+lossy: `**Mark**` is exported and indexed as
 `*Mark*`, and `**` and `****` alike become `*`. Run length is not recoverable. Two earlier
 designs failed here — preserving `**` let the indexer silently rename the speaker; escaping
 every `*` stored backslashes the reader then sees forever, in both the transcript header and
@@ -35,7 +40,7 @@ still have the keyboard in their hands. This exporter's transform is a last line
 behind that, not the primary guard, and it is documented as such in
 `TranscriptedMarkdownExporter.swift` as well as here.
 
-## The real-indexer acceptance check — NOT YET a proven gate
+## The real-indexer acceptance check — now has a required gate mode
 
 `TranscriptedIndexerAcceptanceTests.exportedMeetingIndexesWithRealCounts()`
 (`Tests/VoiceInkTests/Features/Meetings/Export/TranscriptedIndexerAcceptanceTests.swift`) is a
@@ -46,24 +51,45 @@ suite that can catch a defect the conformance tests, by construction, cannot: a 
 between the real binary's actual behavior and the `ReferenceIndexerParser` port of it (a stale
 port, a build the port doesn't match, a bug specific to the real binary).
 
-**This is currently gated by `.enabled(if:)` on the real binary's presence, which means CI —
-and any machine without Mark's Transcripted app installed — SKIPS it.** A skipped test reports
-as passing in `xcodebuild`'s summary, indistinguishable from a real pass in the CI status this
-PR shows. **A reader must not conclude, from a green CI run on this PR, that the real-indexer
-check ever executed.** It has only actually run, and only actually proven anything, on
-machines where it's been run BY HAND with the binary present (the mini, so far — see the
-measured result below) or where a FUTURE required gate-mode explicitly fails when the binary
-is absent rather than skipping.
+**On an ORDINARY run — every CI run, every plain local `xcodebuild test` — this still SKIPS on
+any machine without Mark's Transcripted app installed, including CI.** A skipped test reports as
+passing in `xcodebuild`'s summary, indistinguishable from a real pass. That remains correct,
+desired convenience behavior: CI has never had the binary and is not expected to gain it. **A
+reader must not conclude, from an ordinary green CI run, that the real-indexer check executed.**
 
-That gate-mode doesn't exist yet, deliberately. A sibling PR (`#19`,
-`phase2-realmodel-smoke`) is independently building an explicit "fail loudly if the
-prerequisite is absent" idiom for exactly this shape of problem — an env var that flips a
-test's missing-prerequisite behavior from skip to hard-fail. As of this round `#19` has not
-merged to `main`. This file deliberately does not invent a second, competing mechanism ahead
-of that: once `#19` lands, `TranscriptedIndexerAcceptanceTests` should adopt its exact idiom
-(same env var, same failure behavior) rather than grow its own. Until then, the honest
-description of this test is "an opportunistic real-indexer check with no required mode" — not
-"the acceptance gate" — and this file's title has been corrected accordingly.
+**ROUND 5: this test now has a required GATE-RUNNING MODE, closing that gap for anyone who
+deliberately wants proof.** It adopts the exact idiom `RealModelSmokeTests.swift`
+(`Tests/VoiceInkTests/Features/Meetings/Transcription/RealModelSmokeTests.swift`) built for this
+same shape of problem in PR #19 (`phase2-realmodel-smoke`, merged to `main`) — the same
+`.disabled(if: <prerequisite missing> && !isGateRunningMode, "...")` trait shape, the same
+two-name split, the same failure behavior — rather than growing a second, competing mechanism.
+See FOLLOWUPS.md's "Gate-running modes" central list for the repo-wide registry of every one of
+these flags.
+
+**Set the EXTERNAL, `TEST_RUNNER_`-prefixed form on the `xcodebuild` invocation — this is the
+thing to copy:**
+
+```
+TEST_RUNNER_TRANSCRIPTED_ACCEPTANCE_GATE_MODE=1 xcodebuild test \
+  -project VoiceInk.xcodeproj -scheme VoiceInk -destination 'platform=macOS' \
+  -only-testing:VoiceInkTests/TranscriptedIndexerAcceptanceTests
+```
+
+The UNPREFIXED form, `TRANSCRIPTED_ACCEPTANCE_GATE_MODE` (no `TEST_RUNNER_`), is what the
+already-launched test process reads back internally via `ProcessInfo` — it is never what an
+external caller sets. `xcodebuild test` launches the test host through a LaunchServices-mediated
+path that inherits nothing from the invoking shell except `TEST_RUNNER_`-prefixed variables,
+which it forwards with the prefix stripped; setting the unprefixed form on the outer `xcodebuild`
+command never crosses that boundary, so the missing binary quietly skips and the run reports
+green — the exact false assurance this mechanism exists to prevent. Documenting the unprefixed
+name as the thing to set was itself a blocking review finding against PR #19; do not repeat it
+here.
+
+With gate mode engaged and the binary genuinely absent, the test runs for real and fails (the
+`Process().run()` call against the missing binary path throws) instead of skipping. With gate
+mode engaged and the binary present, this proves the same thing running it by hand always
+proved — see the measured result below — except now a CI-style run can demand that proof
+instead of trusting prose.
 
 ## Why a real binary check exists at all, given the conformance tests
 

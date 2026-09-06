@@ -28,21 +28,52 @@
 //     directories, builds the scratch SQLite index, prints one JSON summary line, and exits —
 //     no long-lived process, no MCP stdio protocol to drive.
 //
-// ROUND 3, BLOCKING 2 — READ THIS BEFORE CHANGING THE GATING BELOW. `.enabled(if:)` means CI
-// (and any machine without the real Transcripted app installed) SKIPS this test — a skip
+// ROUND 3, BLOCKING 2 — READ THIS BEFORE CHANGING THE GATING BELOW. `.enabled(if:)` used to mean
+// CI (and any machine without the real Transcripted app installed) SKIPPED this test — a skip
 // reports as passing, indistinguishable in `xcodebuild`'s summary from a real pass. A green CI
-// run therefore proves NOTHING about whether the real indexer ever actually ran. That is a
-// real, open gap, not a resolved one. A sibling PR (#19, `phase2-realmodel-smoke`, NOT yet
-// merged to `main` as of this round) is independently building an explicit gate-running-mode
-// idiom for exactly this shape of problem (an env var that turns "skip if absent" into "fail
-// loudly if absent"). This file deliberately does NOT invent a second, rival mechanism ahead
-// of that one landing — see `TRANSCRIPTED_ACCEPTANCE.md` and this task's report for why, and
-// converge onto PR #19's mechanism once it lands rather than let two idioms coexist.
+// run therefore proved NOTHING about whether the real indexer ever actually ran.
 //
-// Until that convergence: `.enabled(if:)` stays as the ordinary-developer-convenience skip it
-// always was (correct for a fresh clone or a CI runner with neither the binary nor a use for
-// it), and this file's honest status is "an opportunistic real-indexer check with no required
-// mode" — not "the acceptance gate". Do not read a green CI run as evidence this test executed.
+// ROUND 5 — CLOSED, by adopting PR #19's (`phase2-realmodel-smoke`, merged to `main`) exact
+// gate-running-mode idiom rather than inventing a second one: same shape
+// (`.disabled(if: <prerequisite missing> && !isGateRunningMode, "...")`), same two-name split,
+// same failure behavior. See `RealModelSmokeTests.swift` for the sibling this was copied from,
+// and FOLLOWUPS.md's "Gate-running modes" central list for the repo-wide registry of these flags.
+//
+// THE COMMAND TO RUN, copy it exactly — this is the ONLY form that actually engages gate mode
+// from outside the test process:
+//
+//     TEST_RUNNER_TRANSCRIPTED_ACCEPTANCE_GATE_MODE=1 xcodebuild test \
+//       -project VoiceInk.xcodeproj -scheme VoiceInk -destination 'platform=macOS' \
+//       -only-testing:VoiceInkTests/TranscriptedIndexerAcceptanceTests
+//
+// TWO DIFFERENT NAMES, ON PURPOSE, and getting this wrong silently defeats the whole mechanism —
+// this was itself a BLOCKING review finding against PR #19, so it is spelled out again here
+// rather than assumed carried over: `TEST_RUNNER_TRANSCRIPTED_ACCEPTANCE_GATE_MODE` is the
+// EXTERNAL environment variable you set on the `xcodebuild` invocation above. `xcodebuild test`
+// launches the actual test host through a LaunchServices-mediated path that does not inherit
+// that shell's environment at all — except for variables prefixed `TEST_RUNNER_`, which it
+// forwards into the test host process WITH THE PREFIX STRIPPED.
+// `TRANSCRIPTED_ACCEPTANCE_GATE_MODE` (no `TEST_RUNNER_` prefix) is the UNPREFIXED name
+// `isGateRunningMode` below reads via `ProcessInfo.processInfo.environment` INSIDE that
+// already-launched test process — it is NOT something an external caller sets directly. Setting
+// the unprefixed form on `xcodebuild`'s own invocation
+// (`TRANSCRIPTED_ACCEPTANCE_GATE_MODE=1 xcodebuild test ...`) does NOTHING: it never crosses the
+// LaunchServices boundary, `isGateRunningMode` reads `nil` inside the test host exactly as if
+// gate mode were never requested, a missing prerequisite quietly SKIPS, and the run reports
+// green — the exact false assurance this mechanism exists to prevent, reintroduced by a reader
+// following an unprefixed instruction.
+//
+// What gate mode DOES guarantee, once engaged with the command above: with
+// `TEST_RUNNER_TRANSCRIPTED_ACCEPTANCE_GATE_MODE=1` set on the `xcodebuild` invocation, this
+// test passing means the real `transcripted-mcp` binary actually ran against a file this
+// exporter wrote and produced real counts — a missing binary fails the run instead of skipping
+// it. What it does NOT guarantee: it does not change ordinary runs where gate mode is NOT
+// engaged (every CI run, every plain local `xcodebuild test`) — a machine without Mark's
+// Transcripted app installed still skips cleanly there, which remains correct, desired
+// convenience behavior for a fresh clone or CI runner, not a new guarantee. CI has never had the
+// binary and is not expected to gain it, so CI never sets this flag — gate mode is for a real
+// Mac with the binary present (the mini, so far), run by hand when the point is to prove nothing
+// was skipped.
 
 import Foundation
 import Testing
@@ -66,9 +97,28 @@ struct TranscriptedIndexerAcceptanceTests {
         FileManager.default.fileExists(atPath: binaryPath) && FileManager.default.fileExists(atPath: sqlite3Path)
     }
 
+    /// See this file's header, "THE COMMAND TO RUN", for the full mechanism. When set, a missing
+    /// `transcripted-mcp` binary is no longer grounds to skip — the test runs anyway and fails
+    /// for real (the `Process().run()` call throws) if the binary truly is not present.
+    ///
+    /// READ THIS BEFORE SETTING ANYTHING: the string below, `TRANSCRIPTED_ACCEPTANCE_GATE_MODE`,
+    /// is the UNPREFIXED name this already-launched test process reads its own environment for —
+    /// it is NOT what an external caller sets. Engaging this from outside requires the EXTERNAL,
+    /// `TEST_RUNNER_`-prefixed form on the `xcodebuild` invocation instead:
+    /// `TEST_RUNNER_TRANSCRIPTED_ACCEPTANCE_GATE_MODE=1 xcodebuild test ...` — xcodebuild strips
+    /// the `TEST_RUNNER_` prefix when it forwards a variable into the test host, which is the
+    /// ONLY way anything set on the outer `xcodebuild` command reaches this `ProcessInfo` lookup
+    /// at all.
+    private static var isGateRunningMode: Bool {
+        ProcessInfo.processInfo.environment["TRANSCRIPTED_ACCEPTANCE_GATE_MODE"] != nil
+    }
+
     @Test(
         "a fork-produced meeting file, with multiple speakers and action items, indexes with real word/speaker/action-item counts",
-        .enabled(if: Self.binaryIsAvailable)
+        .disabled(
+            if: !Self.binaryIsAvailable && !Self.isGateRunningMode,
+            "no real transcripted-mcp binary at \(Self.binaryPath)"
+        )
     )
     func exportedMeetingIndexesWithRealCounts() throws {
         let scratchRoot = FileManager.default.temporaryDirectory

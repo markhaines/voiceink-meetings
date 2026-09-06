@@ -636,6 +636,13 @@ struct TranscriptedMarkdownExporterTests {
     /// that the real strip rule (`replacingOccurrences(of: "**", with: "")`, literal
     /// two-character substring only) cannot damage, the sanitizer must be the IDENTITY
     /// function. It fails against Round 3's code on every asterisk-bearing case here.
+    ///
+    /// NOTE ON SCOPE: every argument below is already in whitespace/control-normalized form
+    /// (no leading/trailing space, no internal run of spaces, no control characters), so
+    /// "byte-identical to `rawLabel`" and "byte-identical to the normalized value" coincide
+    /// here. That coincidence is exactly what let Round 4's claim of a raw-input identity
+    /// guarantee go unnoticed as too broad — see
+    /// `asteriskPassIsNoOpOnNormalizedValueNotRawInput` below for cases where they diverge.
     @Test(
         "labels that already round-trip losslessly are left byte-identical",
         arguments: [
@@ -655,6 +662,42 @@ struct TranscriptedMarkdownExporterTests {
         #expect(
             TranscriptSanitizer.speakerLabel(rawLabel) == rawLabel,
             "sanitizer altered \(rawLabel.debugDescription), which the real indexer would have returned unchanged"
+        )
+    }
+
+    // MARK: - Round 5: the no-op guarantee is against the normalized value, not the raw input
+
+    /// ROUND 5 FIX. `TRANSCRIPTED_ACCEPTANCE.md` and this file's doc comment on `speakerLabel`
+    /// used to claim the sanitizer's output is byte-identical to ANY losslessly-representable
+    /// raw label. That is false: whitespace normalization and control-character removal run
+    /// UNCONDITIONALLY, before the asterisk pass ever sees the value, so a raw input with
+    /// leading/trailing/doubled whitespace or a control character is not returned unchanged even
+    /// though it contains no run of 2+ asterisks. The corrected claim is narrower — the asterisk
+    /// pass makes no additional change beyond that normalization, i.e. the result is
+    /// byte-identical to the already whitespace/control-normalized value. This test asserts BOTH
+    /// halves for each case: the raw round trip does NOT hold, and the normalized round trip
+    /// does.
+    @Test(
+        "the sanitizer is byte-identical to the whitespace/control-normalized value, not to raw input that whitespace/control normalization changes",
+        arguments: [
+            (" Jane  Doe ", "Jane Doe"),
+            ("*\u{0000}a", "*a"),
+            ("Tab\tHere", "Tab Here"),
+            ("*\n*", "* *"),
+        ]
+    )
+    func asteriskPassIsNoOpOnNormalizedValueNotRawInput(rawLabel: String, normalizedValue: String) {
+        #expect(
+            TranscriptSanitizer.speakerLabel(rawLabel) != rawLabel,
+            "\(rawLabel.debugDescription) is not itself whitespace/control-normalized, so it must NOT round-trip byte-identically — a raw-input identity claim here would be the over-broad claim Round 5 fixed"
+        )
+        #expect(
+            TranscriptSanitizer.speakerLabel(rawLabel) == normalizedValue,
+            "sanitizer must land on the whitespace/control-normalized value \(normalizedValue.debugDescription)"
+        )
+        #expect(
+            TranscriptSanitizer.speakerLabel(normalizedValue) == normalizedValue,
+            "the asterisk pass must be a true no-op once the value is already normalized"
         )
     }
 

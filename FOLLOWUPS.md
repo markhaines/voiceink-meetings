@@ -29,15 +29,17 @@ prerequisite quietly skips and reports green.
 | Flag (external, `TEST_RUNNER_`-prefixed) | Test file | Status |
 |---|---|---|
 | `TEST_RUNNER_REALMODEL_SMOKE_GATE_MODE` | `Tests/VoiceInkTests/Features/Meetings/Transcription/RealModelSmokeTests.swift` | Live (2026-09-06) |
-| *(Transcripted real-indexer acceptance gate)* | in progress on PR #18 | Not yet landed -- add its row here, in this same `TEST_RUNNER_<GATE>_GATE_MODE` external form, once it does. Do not let a second one invent its own convention or rediscover this list from scratch. |
+| `TEST_RUNNER_TRANSCRIPTED_ACCEPTANCE_GATE_MODE` | `Tests/VoiceInkTests/Features/Meetings/Export/TranscriptedIndexerAcceptanceTests.swift` | Live (2026-09-06) -- adopted this exact idiom from PR #19 once it merged to `main`; see `TRANSCRIPTED_ACCEPTANCE.md` and that test file's header for the real-binary prerequisite this one gates on. |
 
 **Canonical command, run every gate-running mode this repo has together** (harmless for any not
 yet defined -- an env var nothing reads is simply ignored):
 
 ```
 TEST_RUNNER_REALMODEL_SMOKE_GATE_MODE=1 \
+TEST_RUNNER_TRANSCRIPTED_ACCEPTANCE_GATE_MODE=1 \
   xcodebuild test -project VoiceInk.xcodeproj -scheme VoiceInk -destination 'platform=macOS' \
-  -only-testing:VoiceInkTests/RealModelSmokeTests
+  -only-testing:VoiceInkTests/RealModelSmokeTests \
+  -only-testing:VoiceInkTests/TranscriptedIndexerAcceptanceTests
 ```
 
 Add each new gate's `TEST_RUNNER_<GATE>_GATE_MODE=1` on its own line above as it lands, and widen

@@ -392,11 +392,15 @@ enum TranscriptSanitizer {
     /// the literal two-character substring only, so the hazard is EXACTLY "a run of two or more
     /// consecutive asterisks", and nothing else:
     ///
-    /// - Losslessly representable, LEFT ENTIRELY ALONE: no asterisk at all (`"Jane Doe"`,
-    ///   `"D'Angelo"`), and any lone asterisk (`"a*b"`, `"*Mark*"`, `"* *"`). Each of these
-    ///   already round-trips byte-identically through the real rule. Transforming them would
-    ///   corrupt input that was never at risk, so this function is a no-op for them — enforced
-    ///   by the early return below, not merely intended.
+    /// - Losslessly representable AS FAR AS THE ASTERISK PASS IS CONCERNED: no asterisk at all
+    ///   (`"Jane Doe"`, `"D'Angelo"`), and any lone asterisk (`"a*b"`, `"*Mark*"`, `"* *"`). Each
+    ///   of these round-trips byte-identically through the real rule ONCE whitespace has been
+    ///   collapsed and control characters dropped — the normalization above always runs first
+    ///   and can change these inputs (`" Jane  Doe "` loses its extra spacing; a NUL byte is
+    ///   removed), so the guarantee is byte-identical to that already-normalized value, not to
+    ///   the raw input. Transforming the normalized value further would corrupt input that was
+    ///   never at risk, so the asterisk pass makes no additional change to it — enforced by the
+    ///   early return below, not merely intended.
     /// - Not representable at all: a run of 2+ asterisks. Whatever is written, the indexer
     ///   deletes pairs from it, so no run of 2+ can survive. There is no encoding that fixes
     ///   this, because the indexer performs NO unescaping of any kind — not Markdown, not

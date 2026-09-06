@@ -1,13 +1,17 @@
-// Structural negative control: the SECOND barrier keeping `FaultInjection` free of closures.
+// Structural negative control: a FUTURE barrier on `FaultInjection`, which enforces nothing today.
 //
-// Companion to `TranscriptedAudioExportSeamEquatableBarrierAttack.swift`, which carries the full
-// reasoning. Short version: a closure-bearing stored property on `FaultInjection` already fails to
-// build, because synthesised `Equatable` requires every stored property to be `Equatable`. The same
-// field independently trips `Sendable`, which today is a warning and under the Swift 6 language
-// mode is an error:
+// Read that first line literally. This project builds at `SWIFT_VERSION 5.0` with no strict
+// concurrency, so a non-`Sendable` stored closure on a `Sendable`-conforming struct is only a
+// WARNING here -- `Sendable` prevents nothing in the current language mode, and an earlier version
+// of this header wrongly called it a second present barrier. Under the Swift 6 language mode the
+// same diagnostic becomes an error, and at that point it does bite:
 //
 //     warning: stored property 'operationOverride' of 'Sendable'-conforming struct 'FaultInjection'
 //              contains non-Sendable type '() -> ()'; this is an error in the Swift 6 language mode
+//
+// The barrier that is real TODAY is synthesised `Equatable`, and only for a directly stored
+// closure-typed property; see `TranscriptedAudioExportSeamEquatableBarrierAttack.swift` for what
+// that does and does not cover.
 //
 // This is a MUST-WARN case, and deliberately so. A redundant `Sendable` conformance is a warning
 // rather than an error, so unlike its sibling this file COMPILES; what it asserts is that the

@@ -352,20 +352,38 @@ enum TranscriptedAudioExporter {
     /// That is a bug a caller could cause, not the data-loss class this guard exists to close, and
     /// it is bounded by the type rather than by a comment.
     ///
-    /// **WHY A CLOSURE CANNOT BE ADDED BACK, and it is the compiler that says so, not this
-    /// paragraph.** The `Equatable` conformance below is SYNTHESISED, and Swift only synthesises it
-    /// when every stored property is itself `Equatable`. A closure is not. So planting any
-    /// closure-bearing stored field on this type — under any name, not just the six the negative
-    /// controls spell out — fails to build today with `type
+    /// **ONE SHAPE OF CLOSURE CANNOT BE ADDED BACK, and the compiler says so — but it is one
+    /// shape, not the class.** The `Equatable` conformance below is SYNTHESISED, and Swift only
+    /// synthesises it when every stored property is itself `Equatable`. A closure is not. So a
+    /// DIRECTLY STORED closure-typed property fails to build today, under any name, with `type
     /// 'TranscriptedAudioExporter.FaultInjection' does not conform to protocol 'Equatable'`.
     /// Verified empirically by planting `var operationOverride: (() -> Void)?` and running a full
-    /// `xcodebuild`, not by reasoning about it. `Sendable` independently flags the same field
-    /// (a warning today, an error in the Swift 6 language mode). The ONE way around both is for
-    /// someone to hand-write a `static func ==`, which suppresses synthesis; that is not something
-    /// a negative control can detect from another file, and it is recorded as a known gap in
-    /// FOLLOWUPS.md rather than left implied. `Equatable` is therefore load-bearing here and must
-    /// not be removed or hand-implemented: `TranscriptedAudioExportSeamEquatableBarrierAttack.swift`
-    /// fails the build if the conformance is dropped.
+    /// `xcodebuild`, not by reasoning about it.
+    ///
+    /// **WHAT THAT DOES NOT COVER.** An earlier version of this comment claimed the barrier held
+    /// for "any closure-bearing stored field" and that a hand-written `==` was the only way past
+    /// it. That was broader than what was tested, and review named four ways through it that leave
+    /// synthesis intact and both barrier controls green:
+    /// 1. a stored field whose type is an `Equatable`, `@unchecked Sendable` WRAPPER that itself
+    ///    contains a closure — the stored property is `Equatable`, so synthesis is untroubled;
+    /// 2. a property wrapper whose stored backing type is `Equatable` while its `wrappedValue` is
+    ///    a closure — same reason, one level of indirection further;
+    /// 3. a COMPUTED closure property or a method, including one added in an extension — no stored
+    ///    property is involved at all, so synthesis never looks at it;
+    /// 4. a hand-written `static func ==`, which suppresses synthesis outright.
+    /// The first two restore a fully executable `operationOverride`-equivalent seam. So the honest
+    /// statement is: synthesised `Equatable` blocks the OBVIOUS re-introduction, and nothing here
+    /// blocks a determined one. Detecting the rest needs source-signature or AST machinery whose
+    /// own correctness would then need verifying and which rots when the source layout changes;
+    /// that is deliberately not built. See FOLLOWUPS.md, "the barrier covers directly stored
+    /// closures only".
+    ///
+    /// `Equatable` is still load-bearing for what it does cover and must not be removed or
+    /// hand-implemented; `TranscriptedAudioExportSeamEquatableBarrierAttack.swift` fails the build
+    /// if the conformance is dropped. `Sendable` is NOT a barrier in this build: the project
+    /// compiles at `SWIFT_VERSION 5.0` with no strict concurrency, so a non-`Sendable` stored
+    /// closure only WARNS here. Its control pins a barrier that becomes real under the Swift 6
+    /// language mode, and enforces nothing today.
     struct FaultInjection: Equatable, Sendable {
         /// Make any directory rename whose SOURCE directory name begins with one of these prefixes
         /// throw `SimulatedRenameFailure` instead of running. It cannot make a rename succeed, and
@@ -704,9 +722,12 @@ enum TranscriptedAudioExporter {
     /// already put a file of this name at the destination would have had it silently clobbered —
     /// while the doc two paragraphs up said this "only ever CREATES" and therefore could not lose
     /// audio. The destination is an audio directory, so the file destroyed could have been
-    /// somebody's recording. `.withoutOverwriting` makes the existence check and the create one
-    /// syscall (`O_CREAT|O_EXCL`); checking `fileExists` first and then writing is not a fix, it is
-    /// the same race with more steps.
+    /// somebody's recording. What `.withoutOverwriting` guarantees is the property this needs and
+    /// only that: the write ATOMICALLY REFUSES an existing destination rather than replacing it.
+    /// (An earlier version of this comment promised one `O_CREAT|O_EXCL` syscall. Foundation
+    /// documents the refusal, not the mechanism, so that was a claim about a presumed
+    /// implementation.) Checking `fileExists` first and then writing is not an alternative: that
+    /// re-opens the same race with more steps, which is exactly what the atomic refusal closes.
     ///
     /// A failure here is deliberately NOT propagated. This function's only purpose is to make the
     /// destination occupied, and if the write failed because a file was already there then it IS

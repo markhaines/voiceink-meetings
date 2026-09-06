@@ -66,6 +66,7 @@ simply don't apply to them.
 | Flag (external, `TEST_RUNNER_`-prefixed) | Test file | Status |
 |---|---|---|
 | `TEST_RUNNER_REALMODEL_SMOKE_GATE_MODE` | `Tests/VoiceInkTests/Features/Meetings/Transcription/RealModelSmokeTests.swift` | Live (2026-09-06) |
+| `TEST_RUNNER_MEETING_SUMMARY_SMOKE_GATE_MODE` | `Tests/VoiceInkTests/Features/Meetings/Enhancement/RealMeetingSummaryGateSmokeTests.swift` | Live (2026-09-06) |
 | `TEST_RUNNER_TRANSCRIPTED_ACCEPTANCE_GATE_MODE` | `Tests/VoiceInkTests/Features/Meetings/Export/TranscriptedIndexerAcceptanceTests.swift` | Live (2026-09-06) -- adopted this sibling's two-name convention once PR #19 merged to `main`, but DELIBERATELY WITHOUT its independent CI-disable trait, so gate mode overrides CI here (Mark's ruling; `RealModelSmokeTests` is expected to be realigned to this rule separately). See `TRANSCRIPTED_ACCEPTANCE.md` and that test file's header for the real-binary prerequisite this one gates on, and for the full reasoning. |
 
 **Canonical command, run every gate-running mode this repo has together** (harmless for any not
@@ -73,14 +74,85 @@ yet defined -- an env var nothing reads is simply ignored):
 
 ```
 TEST_RUNNER_REALMODEL_SMOKE_GATE_MODE=1 \
+TEST_RUNNER_MEETING_SUMMARY_SMOKE_GATE_MODE=1 \
 TEST_RUNNER_TRANSCRIPTED_ACCEPTANCE_GATE_MODE=1 \
   xcodebuild test -project VoiceInk.xcodeproj -scheme VoiceInk -destination 'platform=macOS' \
   -only-testing:VoiceInkTests/RealModelSmokeTests \
+  -only-testing:VoiceInkTests/RealMeetingSummaryGateSmokeTests \
   -only-testing:VoiceInkTests/TranscriptedIndexerAcceptanceTests
 ```
 
 Add each new gate's `TEST_RUNNER_<GATE>_GATE_MODE=1` on its own line above as it lands, and widen
 `-only-testing:` (or drop it to run the whole suite) to cover it.
+
+## `MeetingSummaryService`'s structured output has no join function into `Meeting.actionItems`/`Meeting.summary` yet
+
+Source: `VoiceInk/Features/Meetings/Enhancement/{MeetingSummaryService,MeetingSummaryTypes}.swift`;
+consumer: `TranscriptedMarkdownExporter.swift` (PR #18, `phase3-transcripted-export` branch, not on
+`main`).
+
+**OPEN, recorded rather than fixed, because it belongs to whichever PR does the actual wiring, not
+to the summarizer built in isolation from it.** `MeetingSummaryService.summarize` returns a
+`MeetingSummary` -- `purpose: String`, `questions: [String]`, `conclusions: [String]`,
+`actionItems: [MeetingActionItem]`, `participants: [String]`, `wasTruncated: Bool` -- entirely
+independent of `Meeting`'s own persisted, exporter-facing fields (`actionItems: [String]`,
+`summary: String?`). Reviewed and accepted on the understanding that the exporter can stay
+untouched ONLY once a future wiring step supplies two things neither this service nor the exporter
+currently has:
+
+1. **Action items: the join exists, but nothing calls it yet.** `MeetingActionItem.formatted`
+   ("Owner: text" or just "text") is exactly `Meeting.actionItems`' `[String]` element shape --
+   a future composition root should be able to write `Meeting.actionItems = summary.actionItems
+   .map(\.formatted)` and get `TranscriptedMarkdownExporter.actionItemsField`'s existing `"- item |
+   - item"` contract for free, unchanged. That call does not exist anywhere yet.
+2. **`Meeting.summary`: no formatter exists at all.** `Meeting.summary` is a single `String?`, but
+   `MeetingSummary` carries THREE separate prose/list fields (`purpose`, `questions`,
+   `conclusions`) with no defined function combining them into one string. Whoever wires this in
+   has to decide that shape (headed sections? just `purpose`? something the exporter's frontmatter
+   grows a field for instead of squeezing into the body?) -- it is a real, unresolved design
+   decision, not an oversight to fix mechanically.
+
+Also unresolved by the same wiring step: `MeetingSummary.participants` has no destination at all
+today -- `TranscriptedMarkdownExporter` (as it stands on PR #18) has no `auto_summary_participants`
+frontmatter key; only `auto_summary`, `auto_summary_action_items`, and `auto_summary_version`
+exist there. See that PR's own description, which calls the rest of the `auto_summary_*` family
+(participants included) a known, not-yet-built gap.
+
+## `MeetingSummaryResponseParser` refuses strictly, and nobody has measured what that costs in practice
+
+Source: `VoiceInk/Features/Meetings/Enhancement/{MeetingSummaryResponseParser,MeetingSummaryPrompt}.swift`.
+
+**OPEN, recorded rather than built, deliberately.** The parser refuses (`.unparseable(rawText:)`)
+on any line it cannot confidently attribute: text before the first header, an un-bulleted and
+un-indented line inside a bulleted section, a second un-bulleted line inside one block. That is the
+right default -- three separate review rounds established that guessing here produces a summary
+which reads as complete while a real agreed action is missing -- but it means an otherwise-good
+model response is rejected WHOLE over a formatting slip, and Mark gets no notes for that meeting.
+The response to that is deliberately on the INPUT side (the prompt now states "no text before the
+first header", "no closing remark", "every entry on its own `- ` line", "never wrap an entry",
+"never indent or nest" as hard rules, and says a breach is rejected in full), not on the parser's.
+
+Two follow-ups, in this order, neither started:
+
+1. **MEASURE the real refusal rate before changing anything else.** The measurement tool already
+   exists and does not need building: `RealMeetingSummaryGateSmokeTests.swift`, run in gate mode
+   with the external flag **`TEST_RUNNER_MEETING_SUMMARY_SMOKE_GATE_MODE=1`** (see this file's
+   "Gate-running modes: the central list" for the exact command). It already calls a real,
+   configured provider end to end and asserts a `.summary` outcome, so a `.unparseable` shows up as
+   a loud failure with the model's raw text in hand. What is missing is repetition and variety: a
+   handful of runs across the providers Mark actually uses, over a few different real transcript
+   fixtures, recording how often the tightened prompt is honoured. Without that number, "the
+   refusals are too aggressive" and "the refusals almost never fire" are both just opinions --
+   including the ones in the review that prompted this entry.
+2. **THEN consider one retry on `.unparseable`, with a stricter reminder.** `MeetingSummaryService
+   .summarize` currently makes exactly one provider call and reports the outcome. A single retry --
+   same transcript, same prompt plus a short "your previous response broke rule X; re-emit it
+   following the output format exactly" reminder -- would recover most formatting slips at the cost
+   of one extra real API call per failed meeting. It is NOT built here for three reasons: it
+   doubles the worst-case spend per meeting, it needs a decision about whether the retry's own
+   failure is reported differently from the first (a caller cannot currently tell "failed twice"
+   from "failed once"), and it should be aimed at whatever the measurement in (1) says actually
+   breaks, rather than at a guess about which rule models most often ignore. Do (1) first.
 
 ## `retainRecording` stays `false` on `meetings-ui-shell` -- turning it on today would be worse, not better
 

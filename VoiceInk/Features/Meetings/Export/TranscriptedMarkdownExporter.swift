@@ -91,6 +91,17 @@ enum TranscriptedMarkdownExporter {
 
     // MARK: - Filename
 
+    /// `YYYY-MM-DD <Title>`, with no extension — the shared identity between this exporter's
+    /// `.md` file and `TranscriptedAudioExporter`'s `<stem>_audio/` directory. Pulled out of
+    /// `renderFilename` (Phase 3 audio export) so the audio exporter reuses this exact
+    /// derivation instead of re-implementing the colon/slash rule independently, which would
+    /// silently break the pairing between a meeting's markdown file and its audio directory if
+    /// the two rules ever drifted. Behaviorally identical to what `renderFilename` computed
+    /// before this split: same `dateStampFormatter`, same `filenameSafe`, same argument order.
+    static func renderStem(date: Date, title: String) -> String {
+        "\(Self.dateStampFormatter.string(from: date)) \(filenameSafe(title))"
+    }
+
     /// `YYYY-MM-DD <Title>.md`. Transcripted's own filenames never contain a literal `:` —
     /// confirmed by comparing a real title's frontmatter/H1 form ("Meeting at 2:00 pm")
     /// against its on-disk filename ("2026-07-31 Meeting at 2 00 pm.md"): the colon becomes a
@@ -99,7 +110,7 @@ enum TranscriptedMarkdownExporter {
     /// real title — replacing it is a defensive addition, not a verified rule, since an
     /// unescaped `/` would otherwise split the path.
     static func renderFilename(date: Date, title: String) -> String {
-        "\(Self.dateStampFormatter.string(from: date)) \(filenameSafe(title)).md"
+        "\(renderStem(date: date, title: title)).md"
     }
 
     private static func filenameSafe(_ title: String) -> String {

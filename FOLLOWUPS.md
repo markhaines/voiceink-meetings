@@ -936,3 +936,38 @@ audit above: extend the wait to cover the state actually being asserted, never a
 **Not fixed here:** the remaining 1s/2s deadlines in that file (lines ~211-258) gate on a single
 in-flight operation rather than N serialized ones, so their margins are far wider. If either ever
 flakes, apply the same reasoning rather than assuming a behavioural cause.
+
+## `TranscriptedAudioExporter` can only ever populate `playback.m4a`, until this fork retains isolated channels
+
+Source: `VoiceInk/Features/Meetings/Export/TranscriptedAudioExporter.swift` (that file's own
+header carries the full evidence trail); `VoiceInk/Features/Meetings/Capture/
+MeetingRecordingWriter.swift`; `~/code/transcripted`'s `RecordingAudioArchiver.swift` and
+`MeetingAudioStorageManager.swift` (Mark's real, separate Transcripted app).
+
+Real Transcripted's audio directory (`meetings/audio/<stem>_audio/`) holds up to three files:
+`microphone.m4a` (isolated mic capture), `system_audio.m4a` (isolated system-audio-tap
+capture), and `playback.m4a` (a derived, voice-activity-gated mix of the first two, produced by
+an async maintenance pass, never at capture time, and only when BOTH are present and usable —
+confirmed by reading `createPlaybackMixIfNeeded`). This fork's `MeetingRecordingWriter` has no
+equivalent to the first two: it mixes mic and system PCM together AS THEY ARRIVE into one mono
+16kHz file and never retains either channel in isolation. So `TranscriptedAudioExporter`, fed
+this fork's only real capture output, can honestly write only `playback.m4a` — writing the same
+combined bytes under `microphone.m4a` or `system_audio.m4a` would claim an isolated capture
+that was never made, which is worse than the gap.
+
+**This produces a shape never observed in any real Transcripted directory**: in all 33 real
+examples that have `playback.m4a` at all, it is accompanied by both its sources. A
+fork-produced directory with `playback.m4a` alone is a combination Mark's existing tooling has
+never had to parse before. Nothing here proves that tooling handles it gracefully — this task
+verified the WRITER's honesty, not every READER's tolerance for a Transcripted-shaped directory
+that only ever has one file in it.
+
+**Would need revisiting**, together, if this fork ever wants full parity: (a) retaining mic and
+system in isolation somewhere in the capture pipeline (a `MeetingRecordingWriter` redesign, or
+a second writer alongside it — out of scope for that file today), (b) re-deriving a real
+`playback.m4a` from those two rather than reusing the already-mixed file for that slot, and (c)
+confirming Mark's Transcripted MCP / Anytype sync / other tooling actually reads a
+`playback`-only directory without assuming the other two exist. None of that is this file's
+job: it is Phase 3's *export* leg, additive and unwired (see the `retainRecording stays false`
+entry above for why wiring an actual caller is separately out of scope too), not a capture
+redesign.

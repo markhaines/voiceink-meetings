@@ -23,6 +23,27 @@
 // native transcript body never renders a `## Summary` section in the body even when the
 // frontmatter carries a full `auto_summary` — only Transcripted's separate Anytype-import path
 // does that. Both were confirmed against the real files, not assumed.
+//
+// ROUND 2 — verified against the real INDEXER's source, not just its output files.
+// `~/code/transcripted` is Mark's own separate project (the "Transcripted" app); its MCP
+// server shares parsing logic with the CLI via
+// `Tools/TranscriptedCaptureKit/Sources/TranscriptedCaptureKit/CaptureMarkdownParser.swift`.
+// Reading `parseTranscriptEntries`/`parseStyledTranscriptEntry` there (confirmed by grep +
+// `sed`, not assumed) settles two things this file used to get slightly wrong:
+//
+// 1. The two-space separator below (`**MM:SS**  [Channel/Label]`) is BYTE-PARITY with what
+//    Transcripted itself writes — nothing more. The indexer's own header regex is
+//    `^([0-9:]+)\s+\[(.+?)\]$` (`\s+`, one-or-more whitespace, not two literal spaces), so a
+//    single space would index identically. Two spaces earns its place here only because
+//    matching Transcripted's own byte output was this exporter's Round 1 mandate.
+// 2. The ACTUAL fail-silent invariants the indexer enforces are: (a) each utterance's header,
+//    after stripping `**`, must be a single physical line matching that regex; (b) the
+//    bracketed content must contain a `/` (there is no fallback source/label separator); and
+//    (c) `## Transcript\n\n` splits the rest of the document into chunks on blank lines
+//    (`\n\n`) BEFORE the header regex ever runs — a chunk whose header doesn't match is
+//    dropped by `compactMap` with no error, no warning, and the file still looks correct to a
+//    human. See `TranscriptSanitizer` below for what that means for two fields this exporter
+//    doesn't control the content of.
 
 import Foundation
 
@@ -37,14 +58,21 @@ enum TranscriptedMarkdownExporter {
 
     /// Renders `meeting` + `segments` into Transcripted's markdown shape. Pure: no I/O, no
     /// clock reads beyond what `meeting`/`segments` already carry.
+    ///
+    /// Every segment is passed through `TranscriptSanitizer` exactly once, here, before
+    /// anything downstream (the transcript header, the `speakers:` block, the mic/system
+    /// speaker counts, the word count) ever sees it — see that type's doc comment for why. A
+    /// single choke point means there is no second code path that could read the raw,
+    /// unsanitized `speakerLabel`/`text` and reintroduce the fail-silent case.
     static func render(meeting: Meeting, segments: [MeetingSegment]) -> RenderedMeeting {
         let ordered = segments.sorted { lhs, rhs in
             if lhs.startOffset != rhs.startOffset { return lhs.startOffset < rhs.startOffset }
             return lhs.orderIndex < rhs.orderIndex
         }
+        let sanitized = ordered.map(SanitizedSegment.init)
         return RenderedMeeting(
             filename: renderFilename(date: meeting.startDate, title: meeting.title),
-            markdown: renderMarkdown(meeting: meeting, segments: ordered)
+            markdown: renderMarkdown(meeting: meeting, segments: sanitized)
         )
     }
 
@@ -82,7 +110,7 @@ enum TranscriptedMarkdownExporter {
 
     // MARK: - Markdown body
 
-    private static func renderMarkdown(meeting: Meeting, segments: [MeetingSegment]) -> String {
+    private static func renderMarkdown(meeting: Meeting, segments: [SanitizedSegment]) -> String {
         var out = "---\n"
         out += frontmatter(meeting: meeting, segments: segments)
         out += "---\n\n"
@@ -95,7 +123,7 @@ enum TranscriptedMarkdownExporter {
         return out
     }
 
-    private static func recordedLine(meeting: Meeting, segments: [MeetingSegment]) -> String {
+    private static func recordedLine(meeting: Meeting, segments: [SanitizedSegment]) -> String {
         let totalWordCount = segments.reduce(0) { $0 + wordCount(in: $1.text) }
         let turnCount = segments.count
         return "Recorded \(recordedDateFormatter.string(from: meeting.startDate)) at "
@@ -105,10 +133,10 @@ enum TranscriptedMarkdownExporter {
             + "\(turnCount) turn\(turnCount == 1 ? "" : "s")"
     }
 
-    private static func transcriptBody(segments: [MeetingSegment]) -> String {
+    private static func transcriptBody(segments: [SanitizedSegment]) -> String {
         segments
             .map { segment in
-                let channelWord = segment.sourceChannel == .mic ? "Mic" : "System"
+                let channelWord = segment.channel == .mic ? "Mic" : "System"
                 return "**\(timestamp(segment.startOffset))**  [\(channelWord)/\(segment.speakerLabel)]\n\(segment.text)"
             }
             .joined(separator: "\n\n")
@@ -116,9 +144,9 @@ enum TranscriptedMarkdownExporter {
 
     // MARK: - Frontmatter
 
-    private static func frontmatter(meeting: Meeting, segments: [MeetingSegment]) -> String {
-        let micSegments = segments.filter { $0.sourceChannel == .mic }
-        let systemSegments = segments.filter { $0.sourceChannel == .system }
+    private static func frontmatter(meeting: Meeting, segments: [SanitizedSegment]) -> String {
+        let micSegments = segments.filter { $0.channel == .mic }
+        let systemSegments = segments.filter { $0.channel == .system }
         let micSpeakers = Set(micSegments.map(\.speakerLabel))
         let systemSpeakers = orderedUnique(systemSegments.map(\.speakerLabel))
         let totalWordCount = segments.reduce(0) { $0 + wordCount(in: $1.text) }
@@ -152,6 +180,17 @@ enum TranscriptedMarkdownExporter {
             }
         }
 
+        // `auto_summary_version` is not merely another gap-filled field: the real indexer's
+        // `CaptureSummaryParser.parse` (`~/code/transcripted/Tools/TranscriptedCaptureKit/
+        // Sources/TranscriptedCaptureKit/CaptureSummaryParser.swift:72`) only reads
+        // `auto_summary_action_items`/`auto_summary` at all when
+        // `values["auto_summary_version"] != nil` — every real native-capture file always
+        // carries this key (verified across all 30). Omitting it, as Round 1 did, means the
+        // action items below are syntactically well-formed but the indexer never looks at
+        // them: `read_meeting`/`list_action_items` would silently return nothing, for a
+        // reason invisible from the file's own action-items line. Round 2 found this by
+        // tracing the real parser source for deliverable 3, not by observation of a symptom.
+        lines.append("auto_summary_version: \"1\"")
         lines.append("auto_summary_action_items: \(yamlQuoted(actionItemsField(meeting.actionItems)))")
         lines.append("auto_summary: \(yamlQuoted(summaryField(meeting.summary)))")
 
@@ -195,8 +234,15 @@ enum TranscriptedMarkdownExporter {
     /// `M+:SS` — total minutes (never fewer than 2 digits, never wrapping to hours) and
     /// zero-padded seconds. Verified against a real 132-minute meeting: `**68:28**`, not
     /// `**01:08:28**`.
+    ///
+    /// Clamped to a non-negative offset: the indexer's own timestamp character class is
+    /// `[0-9:]+` (see the header regex cited at the top of this file) with no `-`, so a
+    /// negative offset — which should never occur, but nothing upstream of this formatter is
+    /// typed to make it impossible — would otherwise render a leading `-` that fails the
+    /// header regex outright and silently drops the utterance, the same class of failure
+    /// `TranscriptSanitizer` exists to close off for `speakerLabel`/`text`.
     private static func timestamp(_ interval: TimeInterval) -> String {
-        let totalSeconds = Int(interval.rounded())
+        let totalSeconds = max(0, Int(interval.rounded()))
         let minutes = totalSeconds / 60
         let seconds = totalSeconds % 60
         return String(format: "%02d:%02d", minutes, seconds)
@@ -259,4 +305,100 @@ enum TranscriptedMarkdownExporter {
         formatter.dateFormat = "HH:mm"
         return formatter
     }()
+}
+
+/// A `MeetingSegment` with `speakerLabel`/`text` already passed through
+/// `TranscriptSanitizer`. Built exactly once, in `render(meeting:segments:)` — every renderer
+/// below consumes this type, never `MeetingSegment` directly, so there is no path from a raw
+/// segment to the output markdown that skips sanitization.
+private struct SanitizedSegment {
+    let startOffset: TimeInterval
+    let channel: MeetingSegmentChannel
+    let speakerLabel: String
+    let text: String
+
+    init(_ segment: MeetingSegment) {
+        self.startOffset = segment.startOffset
+        self.channel = segment.sourceChannel
+        self.speakerLabel = TranscriptSanitizer.speakerLabel(segment.speakerLabel)
+        self.text = TranscriptSanitizer.utteranceText(segment.text)
+    }
+}
+
+/// Sanitization boundary for the two user/transcriber-supplied strings that flow into
+/// Transcripted's fail-silent utterance format: `MeetingSegment.speakerLabel` and `.text`.
+///
+/// WHY THIS EXISTS, traced from the real indexer's source
+/// (`~/code/transcripted/Tools/TranscriptedCaptureKit/Sources/TranscriptedCaptureKit/
+/// CaptureMarkdownParser.swift`, `parseTranscriptEntries`/`parseStyledTranscriptEntry`,
+/// confirmed by reading the function bodies, not inferred from behavior):
+///
+/// - `## Transcript\n\n` splits everything after it into chunks on blank lines (`\n\n`)
+///   BEFORE any per-utterance parsing happens (`components(separatedBy: "\n\n")`, line 434).
+/// - Each chunk's first physical line, after stripping `**`, must match
+///   `^([0-9:]+)\s+\[(.+?)\]$` (line 477) and the bracket content must contain a `/` (line
+///   483) or the ENTIRE chunk is dropped by `compactMap` — silently: no error, no warning,
+///   the file still looks correct to a human, `word_count`/`speaker_count` just come back low
+///   or zero.
+///
+/// Two fields this exporter renders into that scaffold are not under this exporter's control:
+///
+/// - `speakerLabel` becomes user-editable once the Phase 2 speaker-rename UI lands. A
+///   newline inside it breaks the header across two physical lines — the regex's `$` anchor
+///   then never sees a closing `]` on the SAME line as the timestamp, the whole utterance is
+///   dropped. `]`, `[`, and `/` inside a label were checked against the actual regex
+///   (non-greedy `.+?` anchored to end-of-line via `$`, and a `firstIndex(of: "/")` split
+///   against a bracket that always starts with a slash-free `Mic`/`System` constant) and do
+///   NOT trigger this failure — they are deliberately left untouched here rather than
+///   sanitized away, so a legitimate name (`"D'Angelo"`, a label someone chose to bracket)
+///   isn't mangled for a risk that isn't real. Only newlines and other control characters are
+///   removed/collapsed, because those are the only inputs that can put a line break inside a
+///   single-line header.
+/// - `text` is transcription output. A literal blank line inside it (`\n\n`) IS the exact
+///   chunk boundary above — it silently truncates the utterance: everything up to the blank
+///   line survives as one dropped-looking-fine chunk, everything after becomes an orphaned
+///   chunk with no valid header, which fails the regex and vanishes from the index while
+///   still sitting, visibly, in the `.md` file on disk. Collapsing blank lines makes a
+///   mid-utterance chunk split structurally impossible, not just unlikely — there is no
+///   longer any string this function can produce that contains `\n\n`.
+enum TranscriptSanitizer {
+    /// Replaces every newline (and other whitespace-ish control character, e.g. tab) with a
+    /// single space — never removes the label's content entirely, a two-line label becomes
+    /// one line, not nothing — drops genuinely non-whitespace control characters (NUL and
+    /// friends) outright, and collapses runs of whitespace so the result reads the same as
+    /// the original to a person. Everything else in the label — including `[`, `]`, `/`, `*`
+    /// — passes through untouched; see this type's doc comment for why those are safe.
+    static func speakerLabel(_ raw: String) -> String {
+        var scalars = String.UnicodeScalarView()
+        for scalar in raw.unicodeScalars {
+            if CharacterSet.whitespacesAndNewlines.contains(scalar) {
+                scalars.append(" ")
+            } else if CharacterSet.controlCharacters.contains(scalar) {
+                continue
+            } else {
+                scalars.append(scalar)
+            }
+        }
+
+        return String(scalars)
+            .components(separatedBy: .whitespaces)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+
+    /// Collapses every blank line (any line that is empty after trimming) out of the text —
+    /// not just "\n\n" literally, so "\n \n" (whitespace-only line) and longer runs of blank
+    /// lines are caught too — while preserving single line breaks between otherwise non-empty
+    /// lines, and trims leading/trailing whitespace so the sanitized text can never itself
+    /// begin or end with a newline that could recombine with this exporter's own `\n\n`
+    /// block separator into a new blank line at a chunk boundary.
+    static func utteranceText(_ raw: String) -> String {
+        raw
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
+    }
 }

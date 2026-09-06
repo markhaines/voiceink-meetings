@@ -81,16 +81,43 @@ enum MeetingTranscriptBudget {
         let wasTruncated: Bool
     }
 
-    /// Trims and, only if necessary, hard-cuts `title` to `maxTitleLength`, reusing the same
+    /// Sanitizes and, only if necessary, hard-cuts `title` to `maxTitleLength`, reusing the same
     /// visible-marker `hardTruncate` the pathological-segment case below uses -- one truncation
     /// mechanism, not two. `wasTruncated` here means exactly what it means on `Result`: the
-    /// caller did not see the whole of what was asked to be summarized.
+    /// caller did not see the whole of what was asked to be summarized. Sanitizing alone never
+    /// sets it, because sanitizing removes no words -- see `sanitizeTitle`.
     static func truncateTitle(_ title: String) -> TitleResult {
-        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.count > maxTitleLength else {
-            return TitleResult(text: trimmed, wasTruncated: false)
+        let sanitized = sanitizeTitle(title)
+        guard sanitized.count > maxTitleLength else {
+            return TitleResult(text: sanitized, wasTruncated: false)
         }
-        return TitleResult(text: hardTruncate(trimmed, to: maxTitleLength), wasTruncated: true)
+        return TitleResult(text: hardTruncate(sanitized, to: maxTitleLength), wasTruncated: true)
+    }
+
+    /// Flattens a title to a single line of ordinary text: every whitespace or control character
+    /// becomes a space, runs of spaces collapse to one, and the ends are trimmed. A title that
+    /// holds nothing else -- whitespace only, or control characters only -- therefore comes back
+    /// empty, and `MeetingSummaryService` omits the "Meeting title:" line entirely rather than
+    /// sending an empty or garbage one. That is the same standard the transcript path already
+    /// applies to segment text (`MeetingSummaryService.summarize`'s `hasRealContent` check treats
+    /// a whitespace-only segment as no content at all), applied to the title too instead of only
+    /// to the transcript.
+    ///
+    /// Control characters and newlines are the point, not incidental tidying. A title is
+    /// arbitrary text this service splices into the prompt directly above the transcript, so a
+    /// title containing newlines could otherwise contribute extra lines that read to the model
+    /// exactly like transcript content -- a fake speaker turn, or a line mimicking the
+    /// "[... earlier segments omitted ...]" marker. Flattening removes that shape entirely while
+    /// keeping every word the title actually contained, which is why it does not count as
+    /// truncation.
+    private static func sanitizeTitle(_ title: String) -> String {
+        let flattened = String(
+            title.map { character in
+                character.unicodeScalars.allSatisfy {
+                    CharacterSet.whitespacesAndNewlines.contains($0) || CharacterSet.controlCharacters.contains($0)
+                } ? " " : character
+            })
+        return flattened.split(separator: " ", omittingEmptySubsequences: true).joined(separator: " ")
     }
 
     private static let omittedMarker = "[... earlier segments omitted to fit the context budget ...]"

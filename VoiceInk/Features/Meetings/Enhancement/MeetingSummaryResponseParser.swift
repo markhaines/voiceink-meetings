@@ -5,11 +5,61 @@
 // at all. Pure and synchronous: no networking, no model access, so it is testable directly
 // against fixed strings without a fake provider in the loop.
 //
-// PARSING PHILOSOPHY: lenient about formatting noise a real model can plausibly add despite the
-// prompt's instructions (a wrapping code fence, blank lines, a missing "- " bullet marker,
-// inconsistent header casing), strict about the one thing that actually matters -- never
-// inventing content. A section the model left out, or explicitly marked "None", comes back
-// empty; nothing here fills a missing section with a guess.
+// THE ONE PROPERTY THIS FILE EXISTS TO HOLD, stated once and then implemented literally:
+//
+//     A parse either represents EVERY line of the model's response, or it fails.
+//     It never returns a `ParsedMeetingSummarySections` -- which `MeetingSummaryService` turns
+//     into a `.summary`, i.e. a result that presents itself as complete -- while having silently
+//     DROPPED, TRUNCATED or ABSORBED any of that response's content.
+//
+// That property has been defeated twice, both times by a rule that was right for one real
+// response shape and wrong for another:
+//   1. Accepting a response carrying a single recognized header, with the other three sections
+//      silently defaulting to empty -- a `.summary` indistinguishable from a genuine four-section
+//      parse. Closed by requiring all four headers (see `parse`).
+//   2. The fix for a trailing model sign-off being absorbed as a list item: "stop collecting at
+//      the second un-bulleted line". Right for a sign-off; catastrophic for a wrapped
+//      continuation line, a multi-paragraph section, or a real final action item after a stray
+//      line, all of which it silently discarded while still returning a complete-looking
+//      `.summary`. A silently shortened ACTION_ITEMS list means an action Mark agreed to is
+//      simply absent from a document that reads as finished -- worse than no summary at all.
+//
+// THE RULE THIS FILE NOW FOLLOWS, in place of both:
+//
+//   * ATTRIBUTION IS BY HEADER. Every line between one recognized header and the next belongs to
+//     that section. Nothing under a header is ever discarded.
+//   * WITHIN A SECTION, THE SECTION'S KIND DECIDES HOW ITS LINES BECOME CONTENT.
+//     - PURPOSE is PROSE: all of it is the purpose. Paragraphs (blank-line-separated) are
+//       preserved as paragraphs; wrapped lines within a paragraph are joined. Prose has no
+//       internal structure for a foreign line to violate, so there is nothing to detect and
+//       nothing is dropped.
+//     - QUESTIONS / CONCLUSIONS / ACTION_ITEMS are LISTS, and a list has item boundaries that a
+//       line can be ambiguous about. Item boundaries come from exactly two unambiguous signals:
+//       a bullet marker, and a blank line. See `parseList` for the three cases and which one
+//       refuses.
+//   * WHEN A LINE'S ATTRIBUTION IS GENUINELY AMBIGUOUS, THIS PARSER REFUSES: `parse` returns
+//     `nil`, which `MeetingSummaryService` maps to `.unparseable(rawText:)`, keeping the model's
+//     full response for diagnostics. It does not guess, and it does not return a shortened
+//     result that reads as complete. On this project a loud failure has always been cheaper than
+//     a plausible wrong answer, and this is the file where that trade is actually made.
+//
+// WHAT REFUSING COSTS, stated plainly rather than left to be discovered: a model that appends
+// "Let me know if you have any other questions!" after its last section now costs the WHOLE
+// summary, not just that line. The prompt forbids exactly that ("Do not add any other section,
+// preamble, or closing remark"), so it should be rare -- but "rare" is not "never", and when it
+// happens Mark gets `.unparseable` and no notes rather than notes with one bogus trailing item.
+// That is the deliberate choice: the alternative rules are (a) absorb it, which puts words
+// nobody said into an action item the downstream indexer will attribute to an owner, or (b) drop
+// it, which is indistinguishable from dropping a real final action item -- defeat #2 above. Only
+// refusal is honest about the fact that this parser cannot tell those apart. `.unparseable`
+// carries `rawText`, so nothing the model said is destroyed by refusing; a caller can show it or
+// ask again.
+//
+// STILL LENIENT, deliberately, about formatting noise that does NOT create ambiguity: a wrapping
+// code fence, blank lines, inconsistent header casing, a section written as one un-bulleted
+// sentence, and bullet markers the prompt did not ask for (`*`, `•`, `1.`). Widening what counts
+// as a confident signal is the opposite of guessing -- every marker recognized here is one more
+// response shape that parses exactly rather than refusing.
 import Foundation
 
 /// The raw, unattributed parse of a model response: four sections, matching
@@ -40,28 +90,28 @@ enum MeetingSummaryResponseParser {
     /// this parser's own mitigation to keep the common false-positive case (a clause, not a
     /// name, before a stray colon) from being misread as an owner. A genuine long name would
     /// still be misparsed as text-only past this length -- documented, not silently assumed
-    /// impossible.
+    /// impossible. Note this never loses content either way: the full line is kept, only the
+    /// owner/text split differs.
     private static let maxOwnerCandidateLength = 40
 
-    /// Returns `nil` unless ALL FOUR required headers are present -- **not** "at least one", the
-    /// original (blocking-review-finding) behavior. That original leniency meant a response
-    /// carrying a single recognized header, with the other three sections silently defaulting to
-    /// empty, produced a `.summary` outcome INDISTINGUISHABLE from a genuine four-section parse:
-    /// nothing on `MeetingSummary` recorded that three quarters of the requested structure was
-    /// never actually seen. Requiring every header closes that gap at the one point that can
-    /// close it for every caller at once, rather than pushing a completeness check onto each
-    /// future consumer of `MeetingSummary` and trusting all of them to remember it.
+    /// Returns `nil` -- `.unparseable(rawText:)` at the service level -- in exactly two cases:
     ///
-    /// This is a real behavior change from "lenient": a response missing even one header --
-    /// including a well-formed three-header response -- is now `nil`, mapped by
-    /// `MeetingSummaryService` to `.unparseable(rawText:)`. That is the deliberately chosen
-    /// trade: `MeetingSummary` from `.summary` now carries a real, load-bearing invariant --
-    /// every section was genuinely found in the response, even when its content is legitimately
-    /// empty (the model wrote nothing, or literally "None", between a header and the next one) --
-    /// rather than a struct that looks the same whether the model followed the format or not.
-    /// Once all four headers are present, an EMPTY section (no content between it and the next
-    /// header) is still accepted as a real, honest empty answer -- it is a structural
-    /// completeness check, not a content-non-emptiness check.
+    /// 1. **Not all four headers are present.** Not "at least one", the original (first blocking
+    ///    finding) behavior, under which a response carrying a single recognized header produced
+    ///    a `.summary` indistinguishable from a genuine four-section parse. Requiring every
+    ///    header makes `.summary` ITSELF the completeness signal: reaching it means every section
+    ///    was genuinely found, even when a section's content is legitimately empty (the model
+    ///    wrote nothing, or literally "None", between one header and the next). It is a
+    ///    structural completeness check, not a content-non-emptiness check.
+    /// 2. **Some line inside a list section cannot be confidently attributed** -- see
+    ///    `parseList`. This is the second blocking finding's fix, and it replaces a rule that
+    ///    silently stopped collecting instead.
+    ///
+    /// Text BEFORE the first recognized header (a "Sure! Here's the summary:" preamble) is the
+    /// one thing dropped without refusing, and it is dropped by a stated rule rather than by
+    /// accident: it precedes every section, so it cannot be part of any of them -- that is a
+    /// confident attribution ("belongs to no section"), not a guess between two readings. The
+    /// four sections it precedes are still parsed in full.
     static func parse(_ raw: String) -> ParsedMeetingSummarySections? {
         let unfenced = stripWrappingCodeFence(raw)
         let lines = unfenced.components(separatedBy: "\n")
@@ -81,11 +131,18 @@ enum MeetingSummaryResponseParser {
 
         guard Section.allCases.allSatisfy({ buffers[$0] != nil }) else { return nil }
 
+        guard let questions = parseList(buffers[.questions] ?? []),
+            let conclusions = parseList(buffers[.conclusions] ?? []),
+            let actionItemLines = parseList(buffers[.actionItems] ?? [])
+        else {
+            return nil
+        }
+
         return ParsedMeetingSummarySections(
             purpose: parseProse(buffers[.purpose] ?? []),
-            questions: parseList(buffers[.questions] ?? []),
-            conclusions: parseList(buffers[.conclusions] ?? []),
-            actionItems: parseActionItems(buffers[.actionItems] ?? [])
+            questions: questions,
+            conclusions: conclusions,
+            actionItems: actionItemLines.map(makeActionItem)
         )
     }
 
@@ -122,58 +179,201 @@ enum MeetingSummaryResponseParser {
     /// is prose, not a bulleted list) will plausibly punctuate it as "None." anyway. Tolerating
     /// that is a parsing leniency, not a prompt ambiguity: nothing about accepting "None." here
     /// risks treating REAL content as empty, since both spellings mean the same thing.
+    ///
+    /// Only ever consulted for a section whose ENTIRE content is that one word (see `parseProse`
+    /// and `parseList`): a "None" appearing ALONGSIDE real items is not a section-is-empty
+    /// marker, it is an unattributable line, and is handled as one rather than quietly skipped.
     private static func isNone(_ text: String) -> Bool {
         var trimmed = text.trimmingCharacters(in: .whitespaces)
         if trimmed.hasSuffix(".") { trimmed.removeLast() }
         return trimmed.caseInsensitiveCompare("None") == .orderedSame
     }
 
+    /// PURPOSE, the one PROSE section: every line under the header is part of the purpose, and
+    /// none of it is ever dropped. Blank lines separate paragraphs and are preserved as paragraph
+    /// breaks; lines within a paragraph are joined with a space, which is how a hard-wrapped
+    /// paragraph reads back correctly.
+    ///
+    /// There is deliberately no foreign-text detection here, unlike `parseList`. A prose section
+    /// has no item boundaries to be ambiguous about: a stray sentence under PURPOSE is simply
+    /// part of the prose the model put under PURPOSE, and including it is both the honest reading
+    /// and the only one that cannot lose real content. (The accepted consequence, since the
+    /// alternative is guessing: if a model ignored the required section order and ended its
+    /// response with PURPOSE, a trailing sign-off would read as part of the purpose text. It is
+    /// visible there, not silently discarded, and it cannot become a fake action item.)
     private static func parseProse(_ lines: [String]) -> String {
-        let nonEmpty = lines.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-        guard !nonEmpty.isEmpty, !(nonEmpty.count == 1 && isNone(nonEmpty[0])) else { return "" }
-        return nonEmpty.joined(separator: " ")
+        var paragraphs: [String] = []
+        var currentParagraph: [String] = []
+
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty {
+                if !currentParagraph.isEmpty {
+                    paragraphs.append(currentParagraph.joined(separator: " "))
+                    currentParagraph = []
+                }
+                continue
+            }
+            currentParagraph.append(trimmed)
+        }
+        if !currentParagraph.isEmpty {
+            paragraphs.append(currentParagraph.joined(separator: " "))
+        }
+
+        guard !paragraphs.isEmpty else { return "" }
+        if paragraphs.count == 1, isNone(paragraphs[0]) { return "" }
+        return paragraphs.joined(separator: "\n\n")
     }
 
-    /// Collects real list items out of one section's raw lines, tolerating a missing leading
-    /// "- " on the FIRST real content line only (`missingBulletIsStillAccepted`'s case: a whole
-    /// section that is just one un-bulleted sentence). Every line AFTER that first one must be
-    /// bulleted to be accepted as another item -- a later non-bulleted, non-empty line is not a
-    /// second missing-bullet item, it is trailing free-text noise (a model sign-off like "Let me
-    /// know if you have questions!" appended after real content, despite the prompt's explicit
-    /// "Do not add any other section, preamble, or closing remark"). Rather than silently
-    /// absorbing that noise as if it were one more real item -- corrupting the last genuine item
-    /// list with content nobody asked for and nothing downstream could tell apart from a real
-    /// entry -- collection stops at that line: nothing from it onward is added, but every item
-    /// already collected is kept.
-    private static func parseList(_ lines: [String]) -> [String] {
+    /// The three LIST sections (QUESTIONS, CONCLUSIONS, ACTION_ITEMS). Returns `nil` -- refusing
+    /// the whole response -- rather than ever returning a list that is missing, truncated, or
+    /// silently padded with content from one of the model's lines.
+    ///
+    /// Item boundaries come from exactly two unambiguous signals, and nothing else:
+    ///   * A BULLET MARKER starts a new item (`-`, `*`, `•`, or `1.`/`1)`; see `bulletBody`).
+    ///   * A BLANK LINE starts a new block, which in a section with no bullets starts a new item.
+    ///
+    /// Every non-blank line is then one of three things:
+    ///   1. **Bulleted** -- a new item. Unambiguous.
+    ///   2. **Indented, with an item already open** -- a continuation of that item, joined onto
+    ///      it with a space. Indentation is the signal because it is the one a hard-wrapped
+    ///      continuation actually carries and a model's closing remark never does; requiring it
+    ///      is what lets a wrapped bullet parse exactly instead of costing the whole summary.
+    ///      A blank line does not break this: an indented block below a bullet is nested under
+    ///      that bullet in the model's own formatting, so attributing it there follows the
+    ///      model's structure rather than guessing past it.
+    ///   3. **Un-bulleted and un-indented.** This is the ambiguous case, and it splits on whether
+    ///      the section uses bullets at all:
+    ///      - If the section contains NO bullet anywhere, the model wrote this section as plain
+    ///        blocks rather than a bulleted list. Each blank-line-separated block is one item.
+    ///        That covers both a section that is one un-bulleted sentence and a genuinely
+    ///        multi-paragraph one, with nothing dropped. But a SECOND un-indented line inside the
+    ///        same block is ambiguous -- a wrapped continuation of the line above, or a second
+    ///        item whose bullet the model omitted -- and the two readings differ materially
+    ///        (an ACTION_ITEMS block reading "Alice: send report" / "Bob: book the room" is
+    ///        either two owned actions or one action absurdly attributed to Alice), so this
+    ///        REFUSES rather than picking one.
+    ///      - If the section DOES use bullets, the model is following the required format, and an
+    ///        un-bulleted, un-indented line is foreign to it: a sign-off, a lead-in sentence, a
+    ///        fifth section's header, a stray interjection between two items. There is no way to
+    ///        tell those from a real item whose bullet was dropped, so this REFUSES too -- rather
+    ///        than absorbing it (defeat #1: words nobody said become an action item with an
+    ///        owner) or stopping collection at it (defeat #2: every real item after it silently
+    ///        disappears).
+    private static func parseList(_ lines: [String]) -> [String]? {
+        let nonBlank = lines.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        guard !nonBlank.isEmpty else { return [] }
+        // A section whose entire content is the single word "None" is the prompt's own
+        // there-is-nothing-here answer, and is a real, honest empty list -- not a dropped line.
+        if nonBlank.count == 1, isNone(nonBlank[0]) { return [] }
+
+        let usesBullets = nonBlank.contains { bulletBody($0) != nil }
+
         var items: [String] = []
-        var sawFirstContentLine = false
+        /// Index of the item an indented continuation line attaches to, or `nil` when no item has
+        /// been opened yet (the start of the section, or a bare marker that carried no text).
+        var openItem: Int?
+        var atBlockStart = true
+
         for rawLine in lines {
             let trimmed = rawLine.trimmingCharacters(in: .whitespaces)
-            guard !trimmed.isEmpty, !isNone(trimmed) else { continue }
 
-            let isBulleted = trimmed.hasPrefix("-")
-            guard isBulleted || !sawFirstContentLine else { break }
-            sawFirstContentLine = true
+            if trimmed.isEmpty {
+                atBlockStart = true
+                continue
+            }
 
-            let withoutBullet = isBulleted ? String(trimmed.dropFirst()).trimmingCharacters(in: .whitespaces) : trimmed
-            guard !withoutBullet.isEmpty else { continue }
-            items.append(withoutBullet)
+            if let body = bulletBody(trimmed) {
+                atBlockStart = false
+                guard !body.isEmpty else {
+                    // A bare marker with no text carries no content to lose, but it also leaves
+                    // nothing for a following indented line to continue -- so no item is opened,
+                    // and such a line refuses below rather than attaching to the wrong item.
+                    openItem = nil
+                    continue
+                }
+                items.append(body)
+                openItem = items.count - 1
+                continue
+            }
+
+            if isIndented(rawLine), let target = openItem {
+                items[target] += " " + trimmed
+                atBlockStart = false
+                continue
+            }
+
+            if !usesBullets, atBlockStart {
+                items.append(trimmed)
+                openItem = items.count - 1
+                atBlockStart = false
+                continue
+            }
+
+            return nil
         }
+
         return items
     }
 
-    private static func parseActionItems(_ lines: [String]) -> [MeetingActionItem] {
-        parseList(lines).map { line in
-            guard let colonIndex = line.firstIndex(of: ":") else {
-                return MeetingActionItem(owner: nil, text: line)
-            }
-            let candidateOwner = line[line.startIndex..<colonIndex].trimmingCharacters(in: .whitespaces)
-            let remainder = line[line.index(after: colonIndex)...].trimmingCharacters(in: .whitespaces)
-            guard !candidateOwner.isEmpty, candidateOwner.count <= maxOwnerCandidateLength, !remainder.isEmpty else {
-                return MeetingActionItem(owner: nil, text: line)
-            }
-            return MeetingActionItem(owner: candidateOwner, text: remainder)
+    /// True when the raw (untrimmed) line begins with whitespace -- the wrapped-continuation
+    /// signal `parseList` keys on. Read off the raw line deliberately: every other check in this
+    /// parser works on the trimmed line, and this is the one place the leading whitespace itself
+    /// is the information.
+    private static func isIndented(_ rawLine: String) -> Bool {
+        guard let first = rawLine.first else { return false }
+        return first.isWhitespace
+    }
+
+    /// The text after a leading list marker, or `nil` if the (already trimmed) line does not
+    /// start with one.
+    ///
+    /// The prompt asks for `- `, so that is accepted in the loosest form the previous version of
+    /// this parser accepted it (a leading `-`, space or not). `*`, `•` and `1.`/`1)` are accepted
+    /// too, because a model that formats one section as `* item` should parse exactly rather than
+    /// refuse -- recognizing a marker is a CONFIDENT attribution, so widening this set strictly
+    /// reduces how often the ambiguous branch is reached. `*` and `•` require a following space
+    /// specifically so a `**bold**` line is not mistaken for a bullet and mangled.
+    private static func bulletBody(_ trimmed: String) -> String? {
+        if trimmed.hasPrefix("-") {
+            return String(trimmed.dropFirst()).trimmingCharacters(in: .whitespaces)
         }
+        for marker in ["*", "•"] where trimmed.hasPrefix(marker) {
+            let rest = String(trimmed.dropFirst(marker.count))
+            guard rest.isEmpty || rest.first?.isWhitespace == true else { return nil }
+            return rest.trimmingCharacters(in: .whitespaces)
+        }
+        return numberedBulletBody(trimmed)
+    }
+
+    /// `1. text` / `12) text` -- the other list shape a model reaches for unprompted. Requires
+    /// digits, then `.` or `)`, then whitespace, so ordinary prose starting with a number
+    /// ("2026 was the year we...") is not read as a list marker.
+    private static func numberedBulletBody(_ trimmed: String) -> String? {
+        var index = trimmed.startIndex
+        while index < trimmed.endIndex, trimmed[index].isNumber {
+            index = trimmed.index(after: index)
+        }
+        guard index != trimmed.startIndex, index < trimmed.endIndex else { return nil }
+        guard trimmed[index] == "." || trimmed[index] == ")" else { return nil }
+
+        let afterMarker = trimmed.index(after: index)
+        guard afterMarker < trimmed.endIndex, trimmed[afterMarker].isWhitespace else { return nil }
+        return String(trimmed[afterMarker...]).trimmingCharacters(in: .whitespaces)
+    }
+
+    /// Splits one already-extracted action-item line into `owner` + `text` on its first colon,
+    /// subject to `maxOwnerCandidateLength`. Never drops any of the line: when the split is not
+    /// taken, the whole line becomes `text` with a `nil` owner.
+    private static func makeActionItem(_ line: String) -> MeetingActionItem {
+        guard let colonIndex = line.firstIndex(of: ":") else {
+            return MeetingActionItem(owner: nil, text: line)
+        }
+        let candidateOwner = line[line.startIndex..<colonIndex].trimmingCharacters(in: .whitespaces)
+        let remainder = line[line.index(after: colonIndex)...].trimmingCharacters(in: .whitespaces)
+        guard !candidateOwner.isEmpty, candidateOwner.count <= maxOwnerCandidateLength, !remainder.isEmpty else {
+            return MeetingActionItem(owner: nil, text: line)
+        }
+        return MeetingActionItem(owner: candidateOwner, text: remainder)
     }
 }

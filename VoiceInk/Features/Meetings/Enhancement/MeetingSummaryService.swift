@@ -103,6 +103,12 @@ final class MeetingSummaryService {
         // upstream, so an imported or pathological title is bounded too rather than appended
         // verbatim and unbounded (a review finding: it used to bypass the whole budget with
         // `wasTruncated` staying `false` regardless of the title's actual size).
+        //
+        // `truncateTitle` also flattens and sanitizes the title (see `MeetingTranscriptBudget
+        // .sanitizeTitle`), so a title holding only whitespace or only control characters comes
+        // back empty and the "Meeting title:" line below is omitted ENTIRELY rather than sent as
+        // an empty or garbage label -- deliberate, and the same standard `hasRealContent` above
+        // already applies to segment text. A title with real words in it is always sent.
         let titleResult = MeetingTranscriptBudget.truncateTitle(meeting.title)
         let promptText = titleResult.text.isEmpty
             ? budgetResult.transcript

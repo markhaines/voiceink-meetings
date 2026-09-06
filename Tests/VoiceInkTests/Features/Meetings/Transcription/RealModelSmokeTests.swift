@@ -17,13 +17,27 @@
 // models nor real audio hardware and would hang or fail trying to use either.
 //
 // ON TOP OF THAT CI GATE, every test here also checks its OWN real-world prerequisite (a
-// downloaded Parakeet v3 model, one of Mark's own dictation recordings, network reachability for
-// the diarizer's model download) and disables itself with a specific message when that
-// prerequisite is absent. That second layer is what keeps this file from becoming the "guard
-// that skips everywhere" bug FOLLOWUPS.md already records this repo shipping twice: a machine
-// with `VOICEINK_CI` unset but no models/audio present (a fresh clone, a CI runner someone points
-// a debugger at) skips cleanly with a reason, instead of either hanging on a missing model file
-// or silently reporting green with nothing exercised.
+// downloaded Parakeet v3 model, one of Mark's own dictation recordings, a cached or
+// network-downloadable diarizer model) and disables itself with a specific message when that
+// prerequisite is absent. This is a CONVENIENCE for ordinary developer/CI runs, stated exactly
+// rather than oversold: a machine with `VOICEINK_CI` unset but no models/audio present (a fresh
+// clone, a CI runner someone points a debugger at) skips cleanly with a reason instead of hanging
+// on a missing model file -- but skipping still produces a GREEN, PASSING suite with nothing
+// exercised, same as any other disabled test. That is correct and desired for those ordinary
+// runs. It is NOT, by itself, a guarantee that the gate has actually run.
+//
+// GATE-RUNNING MODE closes that gap. Set `REALMODEL_SMOKE_GATE_MODE` (any non-empty value) to
+// turn every prerequisite check in this file from "skip" into "do not skip": the test then runs
+// for real and, if the prerequisite genuinely is not met, fails loudly (a thrown error from a
+// missing model/recording, or a real network/timeout failure from the diarizer) instead of
+// reporting a quiet pass. What this DOES guarantee: with `REALMODEL_SMOKE_GATE_MODE` set, this
+// suite passing means both tests actually executed their real model-load/inference path end to
+// end. What it does NOT guarantee: it does not change the `VOICEINK_CI` check, which always
+// disables both tests on CI regardless of gate mode -- CI has no models and no audio hardware, so
+// forcing these tests to run there would fail for an unrelated, uninteresting reason (no
+// environment), not prove anything about the gate. Gate mode is for a real Mac with the real
+// prerequisites available; run it there when the point is to prove nothing was skipped, not on
+// CI.
 //
 // AUDIO PROVENANCE, stated plainly:
 //   - The transcription test uses ONE of Mark's own real dictation recordings, found under
@@ -49,6 +63,7 @@
 // that in production yet.
 
 import AVFoundation
+import Darwin
 import FluidAudio
 import Foundation
 import Testing
@@ -61,6 +76,13 @@ private var isRunningInCI: Bool {
     ProcessInfo.processInfo.environment["VOICEINK_CI"] != nil
 }
 
+/// See this file's header, "GATE-RUNNING MODE". When set, a missing prerequisite is no longer
+/// grounds to skip -- the test runs anyway and fails for real if the prerequisite truly is not
+/// met. Does NOT affect `isRunningInCI`: CI is disabled unconditionally, gate mode or not.
+private var isGateRunningMode: Bool {
+    ProcessInfo.processInfo.environment["REALMODEL_SMOKE_GATE_MODE"] != nil
+}
+
 private struct UnexpectedFallbackInvoked: Error {}
 
 /// Swift Testing's `print()` output from a real `xcodebuild test` invocation is not reliably
@@ -69,23 +91,35 @@ private struct UnexpectedFallbackInvoked: Error {}
 /// Every real measurement this file produces is therefore ALSO appended to a plain file, so the
 /// numbers can be read back directly rather than screen-scraped from a log format that dropped
 /// them once already. `print()` is kept too, for anyone reading Xcode's own test log.
+///
+/// Every line carries a per-process `runID` so a number can always be traced to the run that
+/// produced it, even when two parallel test workers (Swift Testing's default) or two separate
+/// `xcodebuild test` invocations append to the same path -- this file was previously reviewed for
+/// exactly that hazard: a fixed path with no run identifier lets stale or concurrent-worker
+/// measurements mix silently. Appends via a raw `open(..., O_APPEND)` file descriptor rather than
+/// `FileHandle.seekToEndOfFile()` + `write()`, because the latter is two syscalls with a race
+/// window between them across processes; `O_APPEND` makes each `write()` atomic at the point the
+/// kernel assigns it a file offset, which is what actually prevents interleaved/torn lines from
+/// two workers writing at once.
 private enum MetricsSink {
     static let path =
         ProcessInfo.processInfo.environment["REALMODEL_SMOKE_METRICS_PATH"]
         ?? "/tmp/voiceink-meetings-realmodel-smoke-metrics.log"
 
+    /// Process id + a short random suffix: unique per test-worker process, stable for every line
+    /// that process writes, so grepping one run's lines out of a shared file is a one-line filter.
+    private static let runID = "\(ProcessInfo.processInfo.processIdentifier)-\(UUID().uuidString.prefix(8))"
+
     static func record(_ line: String) {
-        print(line)
-        guard let data = (line + "\n").data(using: .utf8) else { return }
-        if FileManager.default.fileExists(atPath: path) {
-            if let handle = FileHandle(forWritingAtPath: path) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                handle.closeFile()
-            }
-        } else {
-            FileManager.default.createFile(atPath: path, contents: data)
+        let full = "[run=\(runID)] \(line)"
+        print(full)
+        guard let data = (full + "\n").data(using: .utf8) else { return }
+        let fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+        guard fd >= 0 else { return }
+        data.withUnsafeBytes { raw in
+            _ = write(fd, raw.baseAddress, raw.count)
         }
+        close(fd)
     }
 }
 
@@ -102,6 +136,23 @@ private extension Duration {
 private enum RealModelAvailability {
     static var parakeetV3Present: Bool {
         AsrModels.modelsExist(at: AsrModels.defaultCacheDirectory(for: .v3), version: .v3)
+    }
+
+    /// Whether the diarizer's own required model files (`ModelNames.Diarizer.requiredModels`:
+    /// `pyannote_segmentation.mlmodelc`, `wespeaker_v2.mlmodelc`) are already present under
+    /// FluidAudio's own cache directory for the diarizer repo. FluidAudio has no
+    /// `AsrModels.modelsExist`-equivalent helper for the diarizer, so this checks the same files
+    /// `DiarizerModels.download` itself looks for, at the same path
+    /// (`DiarizerModels.defaultModelsDirectory()`), rather than inventing a different notion of
+    /// "present". When true, `FluidAudioMeetingDiarizer()`'s production init loads from disk and
+    /// needs no network at all -- see the diarizer test's gating below, which only requires
+    /// network reachability when a download would actually be necessary.
+    static var diarizerModelsPresent: Bool {
+        let directory = DiarizerModels.defaultModelsDirectory()
+        let fm = FileManager.default
+        return ModelNames.Diarizer.requiredModels.allSatisfy { modelFileName in
+            fm.fileExists(atPath: directory.appendingPathComponent(modelFileName).path)
+        }
     }
 }
 
@@ -246,9 +297,12 @@ private enum SyntheticMultiSpeakerAudio {
 }
 
 /// Whether `huggingface.co` is reachable, checked with a short, bounded HEAD request rather than
-/// assumed -- the diarizer's real model (`FluidInference/speaker-diarization-coreml`) is not
-/// present on disk (see this task's report), so `FluidAudioMeetingDiarizer`'s production
-/// `DiarizerModels.load()` path downloads it on first use.
+/// assumed. Only consulted by the diarizer test's gate when
+/// `RealModelAvailability.diarizerModelsPresent` is false: if the diarizer's real model
+/// (`FluidInference/speaker-diarization-coreml`) is ALREADY cached under FluidAudio's own
+/// Application-Support directory, `FluidAudioMeetingDiarizer`'s production `DiarizerModels.load()`
+/// path loads it from disk and needs no network at all, so this test must not demand
+/// reachability in that case. Network is required only when a download would actually happen.
 private enum NetworkProbe {
     static var huggingFaceReachable: Bool {
         var reachable = false
@@ -329,11 +383,11 @@ struct RealModelSmokeTests {
             "hardware/model test -- see AudioGraphExceptionBridgeTests.swift for the same VOICEINK_CI idiom"
         ),
         .disabled(
-            if: !RealModelAvailability.parakeetV3Present,
+            if: !RealModelAvailability.parakeetV3Present && !isGateRunningMode,
             "no local Parakeet v3 model at \(AsrModels.defaultCacheDirectory(for: .v3).path)"
         ),
         .disabled(
-            if: !RealAudioFixture.isAvailable,
+            if: !RealAudioFixture.isAvailable && !isGateRunningMode,
             "no usable 8-20s recording found under \(RealAudioFixture.recordingsDirectory.path)"
         )
     )
@@ -359,13 +413,18 @@ struct RealModelSmokeTests {
             supportedLanguages: ["en": "English"]
         )
 
-        // Deliverable 2: real cold model-load time. "Cold" here means the first load THIS
-        // PROCESS performs -- the model files are already downloaded on disk (premise (a)), so
-        // this is real CoreML compile-cache load time, not a network download timing.
+        // Deliverable 2: real model-load time for the first load in THIS TEST PROCESS. Named
+        // `first-load-in-process-seconds`, not `cold-...`: this test does not verify or control
+        // the state of macOS's own CoreML/ANE compilation cache, which persists across process
+        // launches and can make a "first load in this process" dramatically faster than a
+        // genuinely never-before-loaded state on this Mac would be (see FOLLOWUPS.md's GATE ITEM
+        // 1 section for the measured difference and why no ratio is claimed between them). The
+        // model files are already downloaded on disk (premise (a)), so this never includes a
+        // network download either way.
         let loadStart = ContinuousClock.now
         try await service.loadModel(for: model)
         let loadElapsed = loadStart.duration(to: .now)
-        MetricsSink.record("REALMODEL-SMOKE cold-model-load-seconds=\(loadElapsed.secondsDouble)")
+        MetricsSink.record("REALMODEL-SMOKE first-load-in-process-seconds=\(loadElapsed.secondsDouble)")
 
         let transcriber = await MainActor.run {
             FluidAudioMeetingSegmentTranscriber(
@@ -434,8 +493,9 @@ struct RealModelSmokeTests {
             "hardware/model test -- see AudioGraphExceptionBridgeTests.swift for the same VOICEINK_CI idiom"
         ),
         .disabled(
-            if: !NetworkProbe.huggingFaceReachable,
-            "no network reachability to huggingface.co -- the diarizer model is not present locally and must download to run this test for real"
+            if: !RealModelAvailability.diarizerModelsPresent && !NetworkProbe.huggingFaceReachable
+                && !isGateRunningMode,
+            "diarizer model not already cached locally and huggingface.co is unreachable -- cannot run this test for real"
         )
     )
     func realDiarizerLoadsAndRuns() async throws {
@@ -456,15 +516,23 @@ struct RealModelSmokeTests {
                     + "outcome=succeeded segments=\(result?.segments.count ?? -1)"
             )
             #expect(result != nil)
-        } catch FluidAudioMeetingDiarizerError.loadTimedOut {
+        } catch {
+            // FAILS THE TEST -- deliberately, including `FluidAudioMeetingDiarizerError.loadTimedOut`.
+            // A prior version of this test caught `loadTimedOut` specially and reported it as a
+            // passing outcome, on the reasoning that "a real result either way is data gate item
+            // 5 needs". That reasoning was wrong: it let this test PASS having loaded no model,
+            // run no diarization, and produced no `DiarizationResult` -- the test's own name
+            // claims the diarizer "loads and diarizes", and a future regression past the 30s
+            // ceiling would leave this suite green while claiming exactly that. The elapsed time
+            // and outcome are still recorded here as a diagnostic (see FOLLOWUPS.md gate item 5
+            // for how that number is used), but recording it is no longer what decides pass/fail
+            // -- rethrowing is.
             let elapsed = started.duration(to: .now)
-            // NOT a test failure. A real result either way is the data gate item 5 needs, and
-            // hitting the ceiling on real hardware against a real download is itself the
-            // finding -- see this task's report and FOLLOWUPS.md.
             MetricsSink.record(
                 "REALMODEL-SMOKE diarizer-load-and-run-seconds=\(elapsed.secondsDouble) "
-                    + "outcome=loadTimedOut (30s default ceiling WAS HIT for a real cold load)"
+                    + "outcome=failed error=\(error)"
             )
+            throw error
         }
     }
 }

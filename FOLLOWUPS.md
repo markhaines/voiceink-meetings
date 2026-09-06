@@ -4,6 +4,45 @@ Known gaps and limitations deliberately left open, with the reasoning, so they a
 decisions rather than accidents. Not a task tracker: a record so they are not
 rediscovered from scratch later. See each entry for the evidence.
 
+## Gate-running modes: the central list
+
+This project's real-model/real-audio smoke tests skip cleanly when their prerequisites (a
+downloaded model, real audio, network reachability) are absent -- correct, desired convenience
+for ordinary developer and CI runs. Each such test also has a GATE-RUNNING MODE: an opt-in that
+turns a missing prerequisite from "skip" into "fail loudly", so a passing run can only mean the
+real path actually executed. **This is the one place that lists every one of those flags, in the
+external form a caller actually sets, so the next one doesn't need rediscovering (or get its
+prefix wrong the way `RealModelSmokeTests.swift`'s own header comment once did -- see that file's
+GATE ITEM 1 entry below for the full story of that mistake).**
+
+Every flag here follows the SAME two-name shape, and the distinction is load-bearing, not
+cosmetic: the EXTERNAL name, `TEST_RUNNER_<GATE>_GATE_MODE`, is what you set as an environment
+variable on the `xcodebuild` command itself; `xcodebuild test` launches the actual test host
+through a LaunchServices-mediated path that does not inherit that shell's environment at all,
+except for `TEST_RUNNER_`-prefixed variables, which it forwards into the test host WITH THE
+PREFIX STRIPPED. The UNPREFIXED name, `<GATE>_GATE_MODE`, is what the already-launched test
+process reads back via `ProcessInfo.processInfo.environment` -- it is never something an external
+caller sets directly. Setting the unprefixed form on the outer `xcodebuild` invocation does
+nothing: it never crosses that boundary, the test process reads it as absent, and a missing
+prerequisite quietly skips and reports green.
+
+| Flag (external, `TEST_RUNNER_`-prefixed) | Test file | Status |
+|---|---|---|
+| `TEST_RUNNER_REALMODEL_SMOKE_GATE_MODE` | `Tests/VoiceInkTests/Features/Meetings/Transcription/RealModelSmokeTests.swift` | Live (2026-09-06) |
+| *(Transcripted real-indexer acceptance gate)* | in progress on PR #18 | Not yet landed -- add its row here, in this same `TEST_RUNNER_<GATE>_GATE_MODE` external form, once it does. Do not let a second one invent its own convention or rediscover this list from scratch. |
+
+**Canonical command, run every gate-running mode this repo has together** (harmless for any not
+yet defined -- an env var nothing reads is simply ignored):
+
+```
+TEST_RUNNER_REALMODEL_SMOKE_GATE_MODE=1 \
+  xcodebuild test -project VoiceInk.xcodeproj -scheme VoiceInk -destination 'platform=macOS' \
+  -only-testing:VoiceInkTests/RealModelSmokeTests
+```
+
+Add each new gate's `TEST_RUNNER_<GATE>_GATE_MODE=1` on its own line above as it lands, and widen
+`-only-testing:` (or drop it to run the whole suite) to cover it.
+
 ## `retainRecording` stays `false` on `meetings-ui-shell` -- turning it on today would be worse, not better
 
 Source: `VoiceInk/Features/Meetings/Views/MeetingRecordingController.swift`,
@@ -351,11 +390,11 @@ admission is FluidAudio-only"); items 3 and 5 are covered in the per-file entrie
 
 | # | Prerequisite | Status | Why it blocks wiring |
 |---|---|---|---|
-| 1 | Real-audio / real-model smoke testing of all three adapters | **OPEN** | No adapter has ever executed a real model load or a real inference. Compilation and fake-driven tests are the only evidence that exists. |
+| 1 | Real-audio / real-model smoke testing of all three adapters | **PARTIALLY CLOSED** (FluidAudio path) by `RealModelSmokeTests.swift`, 2026-09-06; **OPEN** for transcribe-cpp | FluidAudio transcription and diarization now have real model-load and real-inference evidence with measured numbers (see GATE ITEM 1 below). transcribe-cpp's `.segment` timestamp support and resource use are still untested — no transcribe-cpp model was available on the machine that closed the FluidAudio half. |
 | 2 | B2 residual: the admission-to-inference window (below) | **OPEN** | A dictation Mark starts in that window still queues behind a meeting chunk. Closing it needs shared admission with the dictation path, which is an upstream change nobody has authorised. |
 | 3 | A dictation-priority closure that is actually correct | **OPEN** | `MeetingAsrRuntimeAccess.isDictationActiveOrPending` has no default by design. Admission is only as good as what the composition root passes; passing `{ false }` silently disables item 2's mitigation entirely. |
 | 4 | transcribe.cpp concurrent-session safety | **OPEN** | Unlike FluidAudio, that path runs meeting and dictation inference concurrently rather than serialised, and whether that is safe or affordable on a 16GB M2 Pro is unmeasured. |
-| 5 | A diarizer `loadOperationTimeout` chosen from data | **OPEN** | The 30s default was picked without a single real-hardware measurement of how long `DiarizerModels.load` actually takes. |
+| 5 | A diarizer `loadOperationTimeout` chosen from data | **OPEN, now DATA-INFORMED (not validated)** | The 30s default was picked without measurement; `RealModelSmokeTests.swift` (2026-09-06) took the first real-hardware measurement -- a genuine cold network download + CoreML load + diarize completed in ~17.5s, TWO PARALLEL workers contending for the same download and disk cache, on Mark's Mac mini's connection. It did not blow the ceiling on that one occasion. That is one uncontrolled data point about this Mac's broadband and disk contention, not proof the constant is correctly chosen -- it does not test a slow or metered connection, a single-worker load, or a worst-case contention scenario, so the constant itself is left unchanged and this row stays OPEN. Do not read "did not time out once" as "30s is validated". |
 | 6 | The capability must not expose an eviction-capable `AsrManager` | **CLOSED** by `MeetingAsrSharing.swift` in round 6 | Kept as a row rather than deleted, because the history is the point. Round 5's capability returned the live shared `AsrManager`, and `AsrManager.cleanup()` is ordinary public FluidAudio API that nils every loaded model: `access.borrowLoadedManager()?.manager.cleanup()` compiled from any meeting-side file with zero diagnostics. Closed by inversion — the capability now performs the transcription on the owning side and returns a fork-owned value receipt, so the meeting side never holds a manager. Enforced by `MeetingCapabilityReturnValueEvictionAttack.swift`, `MeetingReceiptMutatingApiAttack.swift` and `MeetingSeamCannotNameAsrManagerAttack.swift`. |
 | 7 | A computed manager-returning member on the seam's types would FAIL OPEN | **OPEN** | The guards enforce the STORED surface only: a new stored property or outcome case stops the build, but `extension MeetingAsrRuntimeAccess { var liveManager: AsrManager { ... } }` compiles and nothing catches it. `Mirror` does not see computed properties, the memberwise initializer gains no parameter, and Swift has no exhaustiveness rule over a method list. An AST/source-signature guard would close it and was deliberately NOT built (see below). **Re-read the seam's types for computed members before wiring.** |
 
@@ -406,34 +445,163 @@ a gate and not a checklist.
 
 ## GATE ITEM 1 -- Real-audio / real-model smoke testing
 
-`FluidAudioMeetingSegmentTranscriber`, `TranscribeCppMeetingSegmentTranscriber`, and
-`FluidAudioMeetingDiarizer` (`Features/Meetings/Transcription/`) compile against the real
-FluidAudio/TranscribeCpp package APIs and pass `xcodebuild build-for-testing`, but NONE of their
-real model-loading/inference paths have ever run against real audio or real downloaded models —
-no Parakeet, transcribe-cpp, or diarizer models are present in the environment these were built
-in. Before any composition root constructs a real `MeetingTranscriptionCoordinator` and wires it
-into `MeetingEngine` (currently nothing does — see `FORK-PATCHES.md`'s
-`meeting-transcription-coordinator` section), the following must be run for real, on a Mac with
-the actual models downloaded:
+**PARTIALLY CLOSED for the FluidAudio path (2026-09-06), OPEN for transcribe-cpp.** See
+`Tests/VoiceInkTests/Features/Meetings/Transcription/RealModelSmokeTests.swift` — the one file in
+this tree that constructs a real `FluidAudioTranscriptionService` (real Parakeet v3 CoreML model)
+and a real `FluidAudioMeetingDiarizer` (real `DiarizerManager`) and drives them through this
+fork's own `MeetingTranscriptionCoordinator` / `FluidAudioMeetingSegmentTranscriber`, never
+FluidAudio called directly, against real audio. Gated on the existing `VOICEINK_CI` idiom
+(`AudioGraphExceptionBridgeTests.swift`'s mechanism, reused verbatim) plus its own
+model/audio/network availability checks, so it skips cleanly everywhere those aren't present —
+proved both ways: skipped under `TEST_RUNNER_VOICEINK_CI=1`, executed and green without it.
 
-- **`.segment` timestamp support, per transcribe-cpp catalog model.** `segment-timing-design.md`
-  §B and `FORK-PATCHES.md` both flag this as unresolved: whether `cohereTranscribe` or
-  `senseVoiceSmall` (or both, or neither) actually populates `Transcript.segments` when asked for
-  `timestamps: .segment`, versus silently resolving to a coarser kind. Requesting `.segment` and
-  getting back an empty `segments` array is NOT a crash — it silently degrades to
-  `TranscribeCppMeetingSegmentTranscriber`'s own empty-segments fallback (one flat, zero-duration
-  segment) — so this needs an explicit real-audio check, not just "it didn't throw."
-- **Actual resource measurement**, now that B1's fix round shares the loaded model with
-  dictation instead of duplicating it: confirm on real hardware (ideally Mark's own 16GB M2 Pro)
-  that memory stays within an acceptable envelope for the actual model(s) wired in. (The
-  version-switch eviction race this bullet used to also ask about is CLOSED as of fix round 3 --
-  the meeting seam has no API that can request a version, so it cannot evict. See the
-  `borrowedAsrManager()` entries below and in `FORK-PATCHES.md` touchpoint 4.)
-- **`FluidAudioMeetingDiarizer`'s real `DiarizerModels.load`/`performCompleteDiarization` path**,
-  including a real timing measurement against the `loadOperationTimeout` default (30s) chosen
-  without any real-hardware data point for how long a genuine model load takes on Mark's
-  machine — the ceiling exists and is proven to bite (`FluidAudioMeetingDiarizerTests`), but
-  whether 30s is the RIGHT number, as opposed to just A number, is unverified.
+What that file's two tests actually establish, with real numbers from Mark's own Mac mini
+(Mac14,12, M2 Pro, 16GB) on 2026-09-06:
+
+- **`FluidAudioMeetingSegmentTranscriber` transcribes real speech through the coordinator.**
+  Source audio: one of Mark's own real dictation recordings from
+  `~/Library/Application Support/com.prakashjoshipax.VoiceInk/Recordings/` (16kHz mono, ~15s),
+  copied read-only, never moved or modified. Produced a real 24-word, 47-segment transcript (one
+  segment per sub-word token, matching this adapter's documented mapping) via
+  `MeetingTranscriptionCoordinator.transcribeMeetingChunk`, not FluidAudio directly.
+- **Actual resource measurement**, first data point ever taken: peak RSS during model load +
+  transcription measured at ~202-253MB across two runs (well within a 16GB M2 Pro's headroom).
+  Not yet measured for transcribe-cpp (no transcribe-cpp model was available to test with).
+- **Model load and per-chunk latency.** Reported here as two SEPARATE, non-comparable
+  observations, per the fix round below (2026-09-06) that corrected an earlier draft of this
+  entry which wrongly combined them into a "cold vs. warm" ratio:
+  - The FIRST time these exact models were loaded via this pinned FluidAudio version on this Mac,
+    the whole test (model load + a full ~15s-recording transcript + two 4s-chunk transcriptions,
+    across TWO PARALLEL test workers, plus Swift Testing's own per-test overhead and whatever
+    inter-worker contention two workers touching the same CoreML/disk state at once costs)
+    took **21.8s / 36.4s in aggregate**. That number bundles at least five confounded costs and
+    has no per-step breakdown — it is reported only as "first run, aggregate wall time", not as a
+    measurement of model load in isolation.
+  - A later, separately-instrumented run — same models, but no longer verifiably the first load
+    on this Mac, since prior runs (including the one above) had already primed whatever
+    persistent state macOS's CoreML/ANE stack keeps between process launches — measured
+    `first-load-in-process-seconds` (named for exactly what it is, not `cold-model-load-seconds`)
+    at 0.13-0.58s, a full ~15s recording transcript at 0.14-0.23s, and a representative 4s chunk
+    at 0.10-0.16s per call.
+  - **No ratio is claimed between these two numbers.** They measure different things (a bundled
+    aggregate vs. an isolated component) under different, unverified cache states. An earlier
+    draft of this entry said "the cold/warm gap is roughly two orders of magnitude" and that claim
+    was WRONG and has been deleted, not softened — it was flagged in review before being repeated
+    to Mark as a finding. If a real cold/warm ratio is wanted later, it needs controlled SERIAL
+    measurements of the same isolated interval with a stated, verified cache state (e.g. confirm
+    no prior process on this Mac has ever loaded this model version, or deliberately clear
+    whatever cache backs the speedup first) — not two numbers this task already had lying around.
+- **`FluidAudioMeetingDiarizer`'s real `DiarizerModels.load`/`performCompleteDiarization` path
+  runs to completion within the 30s `loadOperationTimeout` default, measured but NOT validated
+  against it.** No real multi-speaker system-audio recording exists on this machine, so the audio
+  here is SYNTHESIZED (disclosed in the test file): two distinct macOS `say` voices reading
+  different sentences back to back — proves the real load/run path executes and returns a real
+  `DiarizationResult`, not that diarization accuracy has been validated. The diarizer's actual
+  model (`FluidInference/speaker-diarization-coreml`) was NOT present on this Mac before this test
+  first ran (see the premise-verification note below) and had to download over the network for
+  real. That real cold download + load + diarize completed in ~17.5s / 2.7s across two parallel
+  test workers **contending with each other for the same network download and disk cache at the
+  same time** — an uncontrolled measurement of Mark's broadband and disk contention as much as of
+  CoreML, not a clean single-worker timing. It stayed under the 30s ceiling on this run, on this
+  Mac, on this network, with two workers competing for the same download. **That is evidence the
+  ceiling did not bite here, not evidence the constant is correctly chosen.** Gate item 5 stays
+  OPEN precisely because of this — see that row's own wording, corrected in the same fix round to
+  stop implying the 30s default is validated. The warm reload (files already on disk from the
+  download above) took ~0.46-0.53s across several later runs. Once the diarizer test's fix-round
+  correction (below) made a `loadTimedOut` a hard test failure rather than a silently-recorded
+  pass, this same 30s default was verified to still pass on this Mac (see "Fix round" section).
+
+**Premise check that surfaced a real correction to how this project's own Application-Support
+model cache was understood.** A pre-existing `~/.cache/huggingface/hub/models--aufklarer--Pyannote-Community-1-CoreML`
+directory on this Mac looked at first glance like it might already satisfy the diarizer's model
+dependency. It does not: `FluidAudioMeetingDiarizer`'s production init resolves
+`DiarizerModels.defaultModelsDirectory()` → `~/Library/Application Support/FluidAudio/Models/<Repo.diarizer.folderName>`,
+and `Repo.diarizer` is `FluidInference/speaker-diarization-coreml` — a different HuggingFace repo
+from a different org than the cached `aufklarer/Pyannote-Community-1-CoreML` (itself a mirror of
+`pyannote/speaker-diarization-community-1`). FluidAudio never reads the `huggingface.co/hub` cache
+convention at all; it has its own cache layout under Application Support. The `aufklarer` cache
+was and remains unused by this codebase's pinned FluidAudio version — this test's real diarizer
+run downloaded `FluidInference/speaker-diarization-coreml` fresh into
+`~/Library/Application Support/FluidAudio/Models/speaker-diarization/`, confirmed present after
+the run.
+
+**Still OPEN: `.segment` timestamp support, per transcribe-cpp catalog model.**
+`segment-timing-design.md` §B and `FORK-PATCHES.md` both flag this as unresolved: whether
+`cohereTranscribe` or `senseVoiceSmall` (or both, or neither) actually populates
+`Transcript.segments` when asked for `timestamps: .segment`, versus silently resolving to a
+coarser kind. Requesting `.segment` and getting back an empty `segments` array is NOT a crash —
+it silently degrades to `TranscribeCppMeetingSegmentTranscriber`'s own empty-segments fallback
+(one flat, zero-duration segment) — so this needs an explicit real-audio check, not just "it
+didn't throw." NOT addressed by `RealModelSmokeTests.swift`: no transcribe-cpp model was
+downloaded or available to test against on this Mac, and it was out of scope for the task that
+produced that file. This sub-item, and transcribe-cpp's own resource measurement, are why gate
+item 1 is PARTIALLY closed rather than fully closed — whoever picks this up next should extend
+`RealModelSmokeTests.swift` (or add a sibling file) with a real transcribe-cpp model rather than
+re-verify the FluidAudio path again.
+
+**Fix round (2026-09-06), after independent review returned CHANGES REQUESTED with three blocking
+findings against the first version of `RealModelSmokeTests.swift`.** What the review correctly
+kept (not regressed): Parakeet inference genuinely routes through
+`MeetingTranscriptionCoordinator`/`FluidAudioMeetingSegmentTranscriber`, not FluidAudio directly;
+the FOLLOWUPS.md edits above are replacements of superseded text, not quiet discards; "PARTIALLY
+CLOSED" stays correctly bounded to the FluidAudio path; scope stays clean (zero production,
+`VoiceInk/App/`, or upstream changes). Three things were wrong and are now fixed:
+
+1. **A missing prerequisite produced a green suite with nothing exercised, and a comment claimed
+   otherwise.** Both tests used `.disabled(if:)` for their prerequisites, so a machine with no
+   Parakeet model, no usable recording, or no diarizer model/network produced SKIPPED tests and a
+   passing build — correct behavior for an ordinary run, but the file's own comment claimed this
+   avoided "silently reporting green with nothing exercised", which is false: it is exactly that,
+   by design, for convenience. Fixed by adding an explicit GATE-RUNNING MODE, engaged with
+   ```
+   TEST_RUNNER_REALMODEL_SMOKE_GATE_MODE=1 xcodebuild test -project VoiceInk.xcodeproj \
+     -scheme VoiceInk -destination 'platform=macOS' -only-testing:VoiceInkTests/RealModelSmokeTests
+   ```
+   (see the "Gate-running modes" section at the top of this file for the repo-wide canonical
+   list): with that set, a missing prerequisite is no longer grounds to skip, and the test runs
+   for real and fails loudly instead. **A ROUND-3 REVIEW FINDING, since fixed:** the file's header
+   comment and this very paragraph originally told the reader to "Set `REALMODEL_SMOKE_GATE_MODE`"
+   -- the UNPREFIXED name, which only the already-launched test process itself reads via
+   `ProcessInfo`. Setting that unprefixed form on the outer `xcodebuild` invocation does nothing:
+   `xcodebuild test` launches the test host through a LaunchServices-mediated path that does not
+   inherit the invoking shell's environment except for `TEST_RUNNER_`-prefixed variables (which it
+   forwards with the prefix stripped), so a caller who followed the original wording ran ordinary
+   skip-mode by another name, watched everything skip, and would have read the resulting green run
+   as proof the gate had executed -- the exact false assurance this mechanism exists to prevent,
+   reintroduced through its own documentation. Both the file's header and this paragraph now give
+   the correct `TEST_RUNNER_`-prefixed external command above, and the point where
+   `isGateRunningMode` is defined in the source carries its own one-sentence warning against the
+   unprefixed name, so a reader who only looks at the `ProcessInfo` line still cannot miss it.
+   Proof both ways (correct prefixed form fails on a genuinely missing prerequisite; the wrong
+   unprefixed form skips and reports green on the SAME missing prerequisite) is in this task's
+   report, "Round 3" section. Separately, the diarizer test previously required network
+   reachability unconditionally; it now only requires it when the diarizer's model is not already
+   cached under FluidAudio's own Application Support directory
+   (`RealModelAvailability.diarizerModelsPresent`), so a machine with the model already downloaded
+   runs offline.
+2. **The diarizer test PASSED when the production path timed out.** `loadTimedOut` was caught,
+   recorded as a diagnostic, and swallowed — the test could pass having loaded no model, run no
+   diarization, and produced no `DiarizationResult`, while its own name claimed otherwise. Fixed:
+   any error, `loadTimedOut` included, is now recorded for diagnostics and then RETHROWN, failing
+   the test. Proved both directions on this Mac, verbatim in this PR's report: forcing
+   `FluidAudioMeetingDiarizer(loadOperationTimeout: 0.0)` made the test FAIL
+   (`outcome=failed error=loadTimedOut`, ~0.08-0.1ms elapsed); reverting to the real
+   `FluidAudioMeetingDiarizer()` (30s default) made it PASS again (`outcome=succeeded segments=2`,
+   ~0.46-0.53s elapsed, model already cached from the prior run).
+3. **The "cold vs. warm" ratio was not a real ratio.** See the "Model load and per-chunk latency"
+   bullet above, rewritten in this fix round. The "roughly two orders of magnitude" claim compared
+   a whole-test aggregate (two parallel workers, four operations, test overhead, and
+   inter-worker contention all bundled together) against separately-instrumented per-step timings
+   from a later run, and was deleted rather than hedged. `cold-model-load-seconds` was renamed to
+   `first-load-in-process-seconds`, which is what it actually measures — the first load in that
+   test process, not a verified cold CoreML/ANE cache state.
+
+Also fixed, cheap and non-blocking: `MetricsSink` (the file this suite's real numbers are read
+back from) now prefixes every line with a per-process run identifier
+(`[run=<pid>-<short-uuid>]`) and appends via a raw `open(..., O_APPEND)` file descriptor instead of
+`FileHandle.seekToEndOfFile()` + `write()`, so concurrent test workers writing to the same path
+cannot produce a torn or silently-mixed line, and any number can be traced to the exact run that
+produced it.
 
 None of this can be substituted with more unit tests against injected fakes — the whole point is
 verifying the REAL backend/model behavior the fakes stand in for.

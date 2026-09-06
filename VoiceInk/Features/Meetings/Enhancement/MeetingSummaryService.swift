@@ -15,6 +15,8 @@
 // to that class -- it is declared entirely in this new file, in this fork-owned tree, and
 // touches nothing upstream. Tests substitute a fake conforming to the same protocol; see
 // `Tests/VoiceInkTests/Features/Meetings/Enhancement/MeetingSummaryServiceTests.swift`.
+import OSLog
+
 protocol MeetingEnhancementProviding {
     func enhance(
         _ text: String,
@@ -47,6 +49,15 @@ struct MeetingSummaryProviderConfiguration {
 }
 
 final class MeetingSummaryService {
+    /// Same `Logger(subsystem: "com.hainesy.voiceinkmeetings", category:)` convention as
+    /// `MeetingEngine` and the rest of this fork's Meetings tree. Used for exactly one thing:
+    /// naming WHICH parser rule refused a response. `MeetingSummaryOutcome.unparseable(rawText:)`
+    /// deliberately keeps its existing shape (every caller and test of it is unchanged), so
+    /// without this line a refusal is indistinguishable at runtime from any other -- and
+    /// "the model mixed tabs and spaces" is not something anyone should have to re-derive by
+    /// eye from the raw text.
+    private static let logger = Logger(subsystem: "com.hainesy.voiceinkmeetings", category: "MeetingSummaryService")
+
     private let enhancementProvider: MeetingEnhancementProviding
 
     init(enhancementProvider: MeetingEnhancementProviding) {
@@ -127,7 +138,17 @@ final class MeetingSummaryService {
             return .providerFailure(description: EnhancementFailureFormatter.description(for: error))
         }
 
-        guard let parsed = MeetingSummaryResponseParser.parse(result.text) else {
+        let parsed: ParsedMeetingSummarySections
+        switch MeetingSummaryResponseParser.parseDetailed(result.text) {
+        case .parsed(let sections):
+            parsed = sections
+        case .refused(let reason):
+            // The raw text goes to the caller (unchanged); the RULE that fired goes to the log,
+            // so a refusal is attributable without re-reading the response by eye. Only the
+            // reason is logged, never the model's text: the transcript it summarizes is Mark's
+            // meeting content and has no business in a system log.
+            Self.logger.warning(
+                "Meeting summary response refused by the parser: \(reason.rawValue, privacy: .public)")
             return .unparseable(rawText: result.text)
         }
 

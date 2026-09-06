@@ -623,6 +623,152 @@ struct MeetingSummaryResponseParserTests {
         #expect(result.conclusions == ["Ship on Friday - after the security review - which Bob is running"])
     }
 
+    // ROUND 5. `indentWidth` counts CHARACTERS, so a tab is one level and two spaces are two.
+    // Mixing the styles inside one list can therefore compare a visually OUTDENTED line as deeper
+    // than the item above it, silently changing which item a line belongs to -- and in
+    // ACTION_ITEMS that means changing who owns the action. Both directions are pinned below with
+    // NAMED owners, so the ownership consequence is in the assertion rather than implied, and both
+    // now refuse with the specific `.mixedIndentation` reason rather than a generic failure.
+    @Test("a tab-indented item followed by a space-indented bullet refuses: Bob's action would be absorbed into Alice's")
+    func tabParentThenSpaceBulletRefuses() {
+        // "\t- Alice: ..." has indent width 1; "  - Bob: ..." has width 2, so the space-indented
+        // Bob line compares as DEEPER and is joined onto Alice's item -- Bob's action becomes part
+        // of Alice's text and Bob stops owning anything -- even though it renders further left.
+        let raw = """
+            PURPOSE:
+            Launch prep.
+
+            QUESTIONS:
+            None
+
+            CONCLUSIONS:
+            None
+
+            ACTION_ITEMS:
+            \t- Alice: Prepare the launch plan
+              - Bob: Book the review room
+            """
+        #expect(MeetingSummaryResponseParser.parse(raw) == nil)
+        #expect(MeetingSummaryResponseParser.parseDetailed(raw) == .refused(.mixedIndentation))
+    }
+
+    @Test("a space-indented item followed by a tab-indented bullet refuses: Alice's sub-item would become ownerless")
+    func spaceParentThenTabBulletRefuses() {
+        // The mirror case. "  - Alice: ..." has width 2; the tab-indented line below it has width
+        // 1, so a bullet that renders as NESTED under Alice compares as shallower and is promoted
+        // to a peer item owned by nobody.
+        let raw = """
+            PURPOSE:
+            Launch prep.
+
+            QUESTIONS:
+            None
+
+            CONCLUSIONS:
+            None
+
+            ACTION_ITEMS:
+              - Alice: Prepare the launch plan
+            \t- include the rollback owners
+            """
+        #expect(MeetingSummaryResponseParser.parse(raw) == nil)
+        #expect(MeetingSummaryResponseParser.parseDetailed(raw) == .refused(.mixedIndentation))
+    }
+
+    @Test("mixed indentation refuses even when it appears in a section other than ACTION_ITEMS")
+    func mixedIndentationInAnySectionRefuses() {
+        let raw = """
+            PURPOSE:
+            Launch prep.
+
+            QUESTIONS:
+            \t- Do we have budget for the extra hire?
+              - Is the Q2 deadline still realistic?
+
+            CONCLUSIONS:
+            None
+
+            ACTION_ITEMS:
+            None
+            """
+        #expect(MeetingSummaryResponseParser.parseDetailed(raw) == .refused(.mixedIndentation))
+    }
+
+    // NEGATIVE CONTROL, and a guard rather than a proof: it passes both before and after the
+    // mixed-indentation rule. It exists so the rule cannot be "fixed" by refusing all tab
+    // indentation, or all nesting, which would be a much bigger behaviour change wearing the same
+    // name. A single consistent style -- here tabs only, the style no existing test used --
+    // still nests and still keeps its owner.
+    @Test("a single-style (tab-only) nested list still parses, with the sub-item kept inside its owner's action")
+    func tabOnlyNestingStillParses() {
+        let raw = """
+            PURPOSE:
+            Launch prep.
+
+            QUESTIONS:
+            None
+
+            CONCLUSIONS:
+            - Ship on Friday
+            \t- subject to the security review passing
+
+            ACTION_ITEMS:
+            - Alice: Prepare the launch plan
+            \t- include the rollback owners
+            - Bob: Book the review room
+            """
+        let result = try! #require(MeetingSummaryResponseParser.parse(raw))
+        #expect(result.conclusions == ["Ship on Friday - subject to the security review passing"])
+        #expect(
+            result.actionItems == [
+                MeetingActionItem(owner: "Alice", text: "Prepare the launch plan - include the rollback owners"),
+                MeetingActionItem(owner: "Bob", text: "Book the review room"),
+            ])
+    }
+
+    @Test("the refusal reason names the rule that fired, so a refusal is not generic")
+    func refusalReasonsAreSpecific() {
+        // `parse` collapses every refusal to nil; `parseDetailed` keeps the reason, which is what
+        // makes a mixed-indentation refusal distinguishable from a missing header at runtime (see
+        // `MeetingSummaryService`, which logs it).
+        let missingHeader = """
+            PURPOSE:
+            Weekly status check-in.
+            """
+        let preamble = """
+            Sure! Here's the summary:
+
+            PURPOSE:
+            None
+
+            QUESTIONS:
+            None
+
+            CONCLUSIONS:
+            None
+
+            ACTION_ITEMS:
+            None
+            """
+        let strayLine = """
+            PURPOSE:
+            None
+
+            QUESTIONS:
+            - Do we have budget?
+            A stray note nobody asked.
+
+            CONCLUSIONS:
+            None
+
+            ACTION_ITEMS:
+            None
+            """
+        #expect(MeetingSummaryResponseParser.parseDetailed(missingHeader) == .refused(.missingRequiredSection))
+        #expect(MeetingSummaryResponseParser.parseDetailed(preamble) == .refused(.textBeforeFirstSection))
+        #expect(MeetingSummaryResponseParser.parseDetailed(strayLine) == .refused(.unattributableLine))
+    }
+
     @Test("punctuated spellings of None are the same empty answer, not literal content")
     func punctuatedNoneSpellingsAreEmpty() {
         let raw = """

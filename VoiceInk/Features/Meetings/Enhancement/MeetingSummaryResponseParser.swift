@@ -44,6 +44,10 @@
 //       line can be ambiguous about. Item boundaries come from exactly two unambiguous signals:
 //       a bullet marker, and a blank line. See `parseList` for the three cases and which one
 //       refuses.
+//   * INDENTATION STYLE MUST BE CONSISTENT WITHIN A LIST SECTION. Depth is compared in
+//     characters, so a section mixing tabs and spaces can compare a visually outdented line as
+//     deeper than the item above it -- silently changing which item a line belongs to, and with
+//     it who owns an action. Such a section is refused rather than measured.
 //   * WHEN A LINE'S ATTRIBUTION IS GENUINELY AMBIGUOUS, THIS PARSER REFUSES: `parse` returns
 //     `nil`, which `MeetingSummaryService` maps to `.unparseable(rawText:)`, keeping the model's
 //     full response for diagnostics. It does not guess, and it does not return a shortened
@@ -77,6 +81,35 @@ struct ParsedMeetingSummarySections: Equatable {
     let questions: [String]
     let conclusions: [String]
     let actionItems: [MeetingActionItem]
+}
+
+/// Why `MeetingSummaryResponseParser` refused a response. `parse` collapses all of these to `nil`
+/// (and `MeetingSummaryService` to `.unparseable(rawText:)`, whose shape is unchanged), but the
+/// reason is kept as a real value so a refusal is ATTRIBUTABLE rather than generic: tests assert
+/// which rule fired, and `MeetingSummaryService` logs it, so "the model indented with a tab and a
+/// space" is distinguishable from "the model omitted a header" without re-reading the raw text by
+/// eye.
+enum MeetingSummaryParseRefusal: String, Equatable, Sendable {
+    /// At least one of the four required headers was absent.
+    case missingRequiredSection
+
+    /// Non-whitespace text appeared before the first recognized header.
+    case textBeforeFirstSection
+
+    /// A line inside a list section could not be attributed to an item -- un-bulleted and not
+    /// indented deeper than the open item, so neither a new item nor a continuation of one.
+    case unattributableLine
+
+    /// One list section mixed tab and space indentation. See `parseList`.
+    case mixedIndentation
+}
+
+/// `parse`'s outcome with its reason attached. `parse` itself keeps its original
+/// `ParsedMeetingSummarySections?` shape (every existing caller and test uses it unchanged); this
+/// is the same computation with the refusal reason preserved.
+enum MeetingSummaryParseResult: Equatable {
+    case parsed(ParsedMeetingSummarySections)
+    case refused(MeetingSummaryParseRefusal)
 }
 
 enum MeetingSummaryResponseParser {
@@ -127,6 +160,13 @@ enum MeetingSummaryResponseParser {
     ///    is paid on the INPUT side instead -- `MeetingSummaryPrompt` now states "no text before
     ///    the first header" as a rule rather than a preference.
     static func parse(_ raw: String) -> ParsedMeetingSummarySections? {
+        guard case .parsed(let sections) = parseDetailed(raw) else { return nil }
+        return sections
+    }
+
+    /// `parse` with the refusal reason preserved -- see `MeetingSummaryParseRefusal`. Same
+    /// computation; `parse` is a thin wrapper over this so no existing caller or test changes.
+    static func parseDetailed(_ raw: String) -> MeetingSummaryParseResult {
         let unfenced = stripWrappingCodeFence(raw)
         let lines = unfenced.components(separatedBy: "\n")
 
@@ -145,26 +185,30 @@ enum MeetingSummaryResponseParser {
                 // silently lose a real PURPOSE the model wrote above its own header. See (3) in
                 // this function's doc comment.
                 if line.trimmingCharacters(in: .whitespaces).isEmpty { continue }
-                return nil
+                return .refused(.textBeforeFirstSection)
             }
             buffers[current, default: []].append(line)
         }
 
-        guard Section.allCases.allSatisfy({ buffers[$0] != nil }) else { return nil }
-
-        guard let questions = parseList(buffers[.questions] ?? []),
-            let conclusions = parseList(buffers[.conclusions] ?? []),
-            let actionItemLines = parseList(buffers[.actionItems] ?? [])
-        else {
-            return nil
+        guard Section.allCases.allSatisfy({ buffers[$0] != nil }) else {
+            return .refused(.missingRequiredSection)
         }
 
-        return ParsedMeetingSummarySections(
-            purpose: parseProse(buffers[.purpose] ?? []),
-            questions: questions,
-            conclusions: conclusions,
-            actionItems: actionItemLines.map(makeActionItem)
-        )
+        var parsedLists: [Section: [String]] = [:]
+        for section in [Section.questions, .conclusions, .actionItems] {
+            switch parseList(buffers[section] ?? []) {
+            case .items(let items): parsedLists[section] = items
+            case .refused(let reason): return .refused(reason)
+            }
+        }
+
+        return .parsed(
+            ParsedMeetingSummarySections(
+                purpose: parseProse(buffers[.purpose] ?? []),
+                questions: parsedLists[.questions] ?? [],
+                conclusions: parsedLists[.conclusions] ?? [],
+                actionItems: (parsedLists[.actionItems] ?? []).map(makeActionItem)
+            ))
     }
 
     /// Matches a line that is (after trimming whitespace) exactly one of the four header words
@@ -260,6 +304,11 @@ enum MeetingSummaryResponseParser {
     /// the whole response -- rather than ever returning a list that is missing, truncated, or
     /// silently padded with content from one of the model's lines.
     ///
+    /// Before any of that, a section that mixes tab and space indentation is refused outright
+    /// (`.mixedIndentation`): depth is compared in characters, and mixing the two styles can
+    /// reverse it, which here means reversing ownership. See the guard in the body for why
+    /// converting tabs to columns is not an option.
+    ///
     /// Item boundaries come from exactly two unambiguous signals, and nothing else:
     ///   * A BULLET MARKER starts a new item (`-`, `*`, `•`, or `1.`/`1)`; see `bulletBody`).
     ///   * A BLANK LINE starts a new block, which in a section with no bullets starts a new item.
@@ -295,12 +344,38 @@ enum MeetingSummaryResponseParser {
     ///        than absorbing it (defeat #1: words nobody said become an action item with an
     ///        owner) or stopping collection at it (defeat #2: every real item after it silently
     ///        disappears).
-    private static func parseList(_ lines: [String]) -> [String]? {
-        let nonBlank = lines.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-        guard !nonBlank.isEmpty else { return [] }
+    private static func parseList(_ lines: [String]) -> ListParse {
+        let contentLines = lines.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        let nonBlank = contentLines.map { $0.trimmingCharacters(in: .whitespaces) }
+        guard !nonBlank.isEmpty else { return .items([]) }
         // A section whose entire content is the single word "None" is the prompt's own
         // there-is-nothing-here answer, and is a real, honest empty list -- not a dropped line.
-        if nonBlank.count == 1, isNone(nonBlank[0]) { return [] }
+        if nonBlank.count == 1, isNone(nonBlank[0]) { return .items([]) }
+
+        // MIXED TAB/SPACE INDENTATION REFUSES, before any depth is compared. `indentWidth` counts
+        // CHARACTERS, so a tab counts as one -- which means a tab-indented line (width 1) is
+        // "shallower" than a two-space-indented one (width 2) even when it renders further left in
+        // every editor. That silently REVERSES relative depth, and depth here decides attribution:
+        // a visually outdented `- Bob: ...` bullet gets absorbed into a tab-indented Alice item
+        // (Bob's action becomes part of Alice's text, and Bob's ownership disappears), and the
+        // mirror case promotes a visually nested sub-bullet to a peer item owned by nobody. Either
+        // direction silently restructures who owns what.
+        //
+        // The alternative -- converting tabs to "visual columns" -- requires assuming a tab width,
+        // and there is no correct answer: 4 and 8 are both conventional, and the model that
+        // produced the text had no rendering context at all. Picking one is exactly the kind of
+        // guess that has lost on this property four times. So this refuses, like every other
+        // ambiguity here, and the reason is reported as `.mixedIndentation` rather than folded
+        // into a generic failure.
+        //
+        // The test is a union over the section's non-blank lines: if any indent run anywhere in
+        // the section contains a tab, and any contains a space, the section is mixed. Whitespace
+        // that is neither (a non-breaking space, say) counts as space-like, matching
+        // `indentWidth`'s own per-character counting. Blank lines are excluded, so a stray
+        // tab on an otherwise empty line cannot trigger this.
+        var stylesSeen: Set<IndentStyle> = []
+        for line in contentLines { stylesSeen.formUnion(indentStyles(line)) }
+        guard stylesSeen.count <= 1 else { return .refused(.mixedIndentation) }
 
         let usesBullets = nonBlank.contains { bulletBody($0) != nil }
 
@@ -361,19 +436,45 @@ enum MeetingSummaryResponseParser {
                 continue
             }
 
-            return nil
+            return .refused(.unattributableLine)
         }
 
-        return items
+        return .items(items)
+    }
+
+    /// `parseList`'s outcome: either the section's items, or the rule that refused the response.
+    private enum ListParse {
+        case items([String])
+        case refused(MeetingSummaryParseRefusal)
+    }
+
+    /// Which kinds of whitespace a line's leading indent run is built from. Only tabs are
+    /// distinguished; every other whitespace character counts as space-like, because `indentWidth`
+    /// counts them all as one character each and they therefore compare consistently with one
+    /// another. A line with no indentation contributes no style.
+    private enum IndentStyle { case tab, space }
+
+    private static func indentStyles(_ rawLine: String) -> Set<IndentStyle> {
+        var styles: Set<IndentStyle> = []
+        for character in rawLine.prefix(while: { $0.isWhitespace }) {
+            styles.insert(character == "\t" ? .tab : .space)
+        }
+        return styles
     }
 
     /// The number of leading whitespace characters on the raw (untrimmed) line -- the
     /// continuation signal `parseList` keys on. Read off the raw line deliberately: every other
     /// check in this parser works on the trimmed line, and this is the one place the leading
-    /// whitespace itself is the information. Counted in characters, so one tab counts as one
-    /// level: mixing tabs and spaces within a single list would make depths incomparable, but a
-    /// model emits one or the other consistently, and the failure mode of a mixed list is a
-    /// refusal, not a silent misattribution.
+    /// whitespace itself is the information.
+    ///
+    /// Counted in CHARACTERS, so one tab counts as one level. That is only sound within a single
+    /// indentation style, which is why `parseList` refuses a section that mixes tabs and spaces
+    /// BEFORE any depth is compared -- see the `.mixedIndentation` guard there. An earlier version
+    /// of this comment claimed a mixed list "fails as a refusal, not a silent misattribution".
+    /// That was WRONG: nothing checked for mixing, so a tab-indented line (width 1) compared as
+    /// shallower than a two-space-indented one (width 2), reversing relative depth and therefore
+    /// attribution, with no refusal anywhere. The guard is what makes the claim true; the claim
+    /// was not true on its own.
     private static func indentWidth(_ rawLine: String) -> Int {
         rawLine.prefix { $0.isWhitespace }.count
     }

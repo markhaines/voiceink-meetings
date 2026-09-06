@@ -1017,3 +1017,44 @@ whose `RENAME_SWAP` support cannot be verified from this fork's test environment
 unsupported filesystem returns `ENOTSUP`. Shipping it would mean shipping it AND the two-rename
 fallback, leaving the window in place on precisely the volume that matters, in exchange for a
 second untested code path. Worth revisiting only with a real measurement on that volume.
+
+## `FaultInjection`'s data-only invariant rests on synthesised `Equatable`, and a hand-written `==` would lift it
+
+`TranscriptedAudioExporter.FaultInjection` is the value `export` accepts to force the recovery
+branches in `commit` to fail. It carries NO CODE on purpose: an earlier design was a struct of
+`@Sendable` closures, and review defeated it in one line three ways, each letting `export` report
+SUCCESS with the previous export destroyed. `scripts/negative-controls/TranscriptedAudioExportSeamAttacks.swift`
+pins six exact expressions that must not compile.
+
+**Six expressions are not the invariant, and review said so.** Someone adding a differently-named
+closure-bearing field -- `operationOverride`, say -- leaves all six diagnostics intact and the
+control runner passes. That gap was investigated rather than accepted, and the investigation found
+the invariant is already enforced for free:
+
+- `FaultInjection` declares `Equatable`, and Swift only SYNTHESISES `Equatable` when every stored
+  property is itself `Equatable`. A closure is not.
+- Verified empirically, not reasoned about: planting `var operationOverride: (() -> Void)?` on the
+  type and running a full `xcodebuild` (not `-typecheck`) gives
+  `error: type 'TranscriptedAudioExporter.FaultInjection' does not conform to protocol 'Equatable'`,
+  plus a `Sendable` warning on the same field that is an error in the Swift 6 language mode.
+- So a closure-bearing stored field fails to build today under ANY name. Two controls now pin the
+  conformances that barrier rests on: `TranscriptedAudioExportSeamEquatableBarrierAttack.swift`
+  (must-not-compile) and `TranscriptedAudioExportSeamSendableBarrierAttack.swift` (must-warn).
+
+**THE GAP THAT REMAINS.** Synthesis is suppressed the moment anyone hand-writes a
+`static func ==` on the type. After that a closure-bearing field compiles again, the conformance is
+still declared, and both barrier controls still fire exactly as before -- so nothing goes red.
+
+**Deliberately NOT closed here, and the reasoning is the ruling made on the summary parser's
+computed-member gap, kept consistent with it:** closing it needs bespoke source-signature or AST
+guard infrastructure to assert "no user-defined `==` on this type", which a negative control cannot
+do from another file, because a user-defined `==` simply replaces synthesis without emitting any
+diagnostic of its own. That is a new verification mechanism built to defend a seam whose worst
+residual is already bounded (a caller can make an export FAIL; it cannot lose audio), and the
+project's rule is that such a guard has to earn its keep rather than be added reflexively.
+
+**What is claimed, precisely**, in the code as well as here: the six controls enforce today's
+declared surface; synthesised `Equatable` enforces the no-closure property under any field name;
+neither enforces that `==` stays synthesised. Anyone adding a custom `==` to `FaultInjection` is
+removing a load-bearing barrier and should read this entry first -- which is why the type's own doc
+comment names `Equatable` as load-bearing rather than leaving it to look like boilerplate.

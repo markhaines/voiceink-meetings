@@ -287,6 +287,14 @@ run_case MeetingSeamCannotNameAsrManagerAttack.swift 9 must-not-compile
 # no code at all, so those three substitutions have nowhere to go. Same lesson as every control
 # above it: a seam defended by convention gets defeated, so the compiler defends this one.
 run_case TranscriptedAudioExportSeamAttacks.swift 6 must-not-compile
+# Round 8: the six controls above fail closed for six exact EXPRESSIONS, but review noted they would
+# not catch a differently-named closure-bearing field -- all six diagnostics stay intact and the
+# runner passes. Testing that empirically turned up a free structural win: synthesised `Equatable`
+# already rejects any closure-bearing stored property, under any name. These two pin the two
+# conformances that barrier rests on, so it cannot be dropped without CI noticing.
+run_case TranscriptedAudioExportSeamEquatableBarrierAttack.swift 1 must-not-compile
+
+run_case TranscriptedAudioExportSeamSendableBarrierAttack.swift 1 must-warn
 
 run_case MeetingCapabilityConditionalDowncastAttack.swift 1 must-warn
 run_case MeetingCapabilityForcedDowncastAttack.swift 1 must-warn

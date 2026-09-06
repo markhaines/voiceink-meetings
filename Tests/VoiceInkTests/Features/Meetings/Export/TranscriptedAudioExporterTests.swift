@@ -865,4 +865,43 @@ final class TranscriptedAudioExporterTests {
         let rootContents = try FileManager.default.contentsOfDirectory(atPath: destinationRoot.path)
         #expect(rootContents == [audioDirectory.lastPathComponent])
     }
+
+    // MARK: - The simulated concurrent writer is create-only — ROUND 3 (BLOCKING)
+
+    /// FAIL-FIRST. `Data.write(to:)` REPLACES an existing file. The simulated concurrent writer
+    /// used it, while the doc on `FaultInjection` claimed the simulation "only ever CREATES" and
+    /// therefore could not lose audio. Those cannot both be true, and the path it writes to is
+    /// inside an AUDIO DIRECTORY, so the file it would have replaced could be somebody's recording.
+    ///
+    /// Asserted against the primitive rather than through `export`, deliberately. Through `export`
+    /// the collision is UNREACHABLE: `commit` renames the destination aside before the simulation
+    /// runs, so that path is always empty by then, and the only way a file of this name is already
+    /// there is the genuine race the simulation stands in for. A test driving `export` could not
+    /// produce the collision at all, and one that claimed to would be asserting nothing. That is
+    /// also why `simulateConcurrentWriterClaiming` is internal rather than private.
+    ///
+    /// Proven fail-first by reverting `options: .withoutOverwriting` on that one line and running
+    /// this test alone; the verbatim failure is quoted in this task's report.
+    @Test("the simulated concurrent writer never overwrites a file already at the destination")
+    func simulatedConcurrentWriterNeverOverwritesAnExistingFile() throws {
+        let directory = makeTemporaryDirectory()
+        let contestedPath = directory.appendingPathComponent(
+            TranscriptedAudioExporter.FaultInjection.concurrentWriterFilename
+        )
+
+        // A REAL concurrent writer got there first, and what it wrote is not ours to replace.
+        let realWritersBytes = Data("a real concurrent writer got here first".utf8)
+        try realWritersBytes.write(to: contestedPath)
+
+        TranscriptedAudioExporter.simulateConcurrentWriterClaiming(directory)
+
+        // THE LOAD-BEARING ASSERTION: their bytes, untouched. Under plain `Data.write(to:)` these
+        // are the simulation's own marker contents instead, and the real file is gone for good.
+        let bytesAfter = try Data(contentsOf: contestedPath)
+        #expect(bytesAfter == realWritersBytes)
+
+        // And the failure is absorbed rather than escalated: nothing threw, because this function's
+        // job is only to make the destination occupied, and it already is.
+        #expect(FileManager.default.fileExists(atPath: directory.path))
+    }
 }

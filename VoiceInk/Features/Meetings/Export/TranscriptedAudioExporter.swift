@@ -344,11 +344,28 @@ enum TranscriptedAudioExporter {
     ///
     /// **The residual capability, stated rather than glossed:** a caller passing a non-`.none`
     /// value can make an export FAIL that would have succeeded, and can cause the simulated
-    /// concurrent writer below to create an empty marker directory at the destination on a path
-    /// that is already failing. Neither can lose audio: nothing here deletes, and a failing export
+    /// concurrent writer below to create a marker directory and a marker file at the destination on
+    /// a path that is already failing. Neither can lose audio: nothing here deletes, the marker
+    /// write is create-only (`.withoutOverwriting`, so it cannot replace a file that is already
+    /// there — an earlier version used plain `Data.write(to:)` and could), and a failing export
     /// leaves the original either at its own path or at the backup path named in the thrown error.
     /// That is a bug a caller could cause, not the data-loss class this guard exists to close, and
     /// it is bounded by the type rather than by a comment.
+    ///
+    /// **WHY A CLOSURE CANNOT BE ADDED BACK, and it is the compiler that says so, not this
+    /// paragraph.** The `Equatable` conformance below is SYNTHESISED, and Swift only synthesises it
+    /// when every stored property is itself `Equatable`. A closure is not. So planting any
+    /// closure-bearing stored field on this type — under any name, not just the six the negative
+    /// controls spell out — fails to build today with `type
+    /// 'TranscriptedAudioExporter.FaultInjection' does not conform to protocol 'Equatable'`.
+    /// Verified empirically by planting `var operationOverride: (() -> Void)?` and running a full
+    /// `xcodebuild`, not by reasoning about it. `Sendable` independently flags the same field
+    /// (a warning today, an error in the Swift 6 language mode). The ONE way around both is for
+    /// someone to hand-write a `static func ==`, which suppresses synthesis; that is not something
+    /// a negative control can detect from another file, and it is recorded as a known gap in
+    /// FOLLOWUPS.md rather than left implied. `Equatable` is therefore load-bearing here and must
+    /// not be removed or hand-implemented: `TranscriptedAudioExportSeamEquatableBarrierAttack.swift`
+    /// fails the build if the conformance is dropped.
     struct FaultInjection: Equatable, Sendable {
         /// Make any directory rename whose SOURCE directory name begins with one of these prefixes
         /// throw `SimulatedRenameFailure` instead of running. It cannot make a rename succeed, and
@@ -358,7 +375,8 @@ enum TranscriptedAudioExporter {
         /// Simulate ANOTHER PROCESS claiming the destination path in the window between a
         /// re-export's two renames. This is the one condition `.destinationOccupied` exists to
         /// handle and the only one a test cannot produce for itself, for the reason above. It only
-        /// ever runs on an already-failing path, and it only ever CREATES: see `commit`.
+        /// ever runs on an already-failing path, and it creates WITHOUT OVERWRITING — enforced by
+        /// `.withoutOverwriting` in `simulateConcurrentWriterClaiming`, not by this sentence.
         var simulateConcurrentWriterAtDestination = false
 
         /// Production. Every caller gets this by default and no caller passes anything else.
@@ -631,12 +649,9 @@ enum TranscriptedAudioExporter {
             // for another process creating something at the destination in the window between the
             // two renames -- the single condition `.destinationOccupied` exists to handle, and the
             // only one a test cannot produce for itself. It runs only on an already-failing path,
-            // and it only ever CREATES: it cannot delete or relocate anything.
+            // and it CREATES WITHOUT EVER OVERWRITING: see `simulateConcurrentWriterClaiming`.
             if faults.simulateConcurrentWriterAtDestination {
-                try? fileManager.createDirectory(at: finalDirectory, withIntermediateDirectories: true)
-                try? Data(FaultInjection.concurrentWriterContents.utf8).write(
-                    to: finalDirectory.appendingPathComponent(FaultInjection.concurrentWriterFilename)
-                )
+                simulateConcurrentWriterClaiming(finalDirectory)
             }
             guard !fileManager.fileExists(atPath: finalDirectory.path) else {
                 throw ExportError.rollbackFailed(RollbackFailure(
@@ -673,6 +688,54 @@ enum TranscriptedAudioExporter {
             throw FaultInjection.SimulatedRenameFailure(source: source)
         }
         try FileManager.default.moveItem(at: source, to: destination)
+    }
+
+    /// The simulated concurrent writer's entire effect on disk. Factored out so its create-only
+    /// guarantee can be tested directly, and INTERNAL rather than private for that reason.
+    ///
+    /// Testing it directly is deliberate, not convenient: through `export` the collision is
+    /// UNREACHABLE. `commit` renames the destination aside before this ever runs, so the path is
+    /// always empty by the time it does, and the only way a file of this name is already there is
+    /// the genuine race this stands in for. A test driving `export` cannot produce the collision at
+    /// all, so one that claimed to would be asserting nothing.
+    ///
+    /// `.withoutOverwriting` is the load-bearing part, and it is the fix for a real overclaim.
+    /// `Data.write(to:)` alone REPLACES an existing file, so a real concurrent writer that had
+    /// already put a file of this name at the destination would have had it silently clobbered —
+    /// while the doc two paragraphs up said this "only ever CREATES" and therefore could not lose
+    /// audio. The destination is an audio directory, so the file destroyed could have been
+    /// somebody's recording. `.withoutOverwriting` makes the existence check and the create one
+    /// syscall (`O_CREAT|O_EXCL`); checking `fileExists` first and then writing is not a fix, it is
+    /// the same race with more steps.
+    ///
+    /// A failure here is deliberately NOT propagated. This function's only purpose is to make the
+    /// destination occupied, and if the write failed because a file was already there then it IS
+    /// occupied and `commit`'s guard reports exactly that. Throwing would replace the
+    /// `rollbackFailed` error — the one thing that tells the user where their audio actually is —
+    /// with a complaint about a test fixture. It is logged instead, and logged WITHOUT the path:
+    /// the destination's name carries the meeting title, and this file never logs that (see
+    /// `discardScratchDirectory`), which is also why the underlying error's own description is not
+    /// logged — a Cocoa file error embeds the path it failed on.
+    static func simulateConcurrentWriterClaiming(_ directory: URL) {
+        do {
+            // Succeeds silently when the directory already exists, and never touches its contents.
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try Data(FaultInjection.concurrentWriterContents.utf8).write(
+                to: directory.appendingPathComponent(FaultInjection.concurrentWriterFilename),
+                options: .withoutOverwriting
+            )
+        } catch {
+            let nsError = error as NSError
+            logger.error(
+                """
+                Simulated concurrent writer did not place \
+                \(FaultInjection.concurrentWriterFilename, privacy: .public): \
+                \(nsError.domain, privacy: .public) \(nsError.code, privacy: .public). Something \
+                was already at that path, which is the condition being simulated anyway, so the \
+                rollback error stands rather than being replaced by this.
+                """
+            )
+        }
     }
 
     /// Best-effort removal of a staging or backup directory this exporter itself created, with

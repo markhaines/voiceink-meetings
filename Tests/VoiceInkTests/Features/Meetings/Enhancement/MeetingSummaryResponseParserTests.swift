@@ -22,6 +22,16 @@
 // from one that drops a real one, and either way it returns a result that presents itself as
 // complete. Every test added in this round asserts the FULL expected content of a section, or an
 // outright refusal -- never merely that parsing succeeded.
+//
+// ROUND 4: two more instances of the same property, both found by review of the round-3 fix.
+// `preambleBeforeFirstHeaderIsDropped` blessed discarding everything before the first header, a
+// rule that cannot tell "Sure, here's the summary:" from a real PURPOSE the model wrote above its
+// own header -- replaced by `preambleBeforeFirstHeaderRefuses`, with
+// `substantivePurposeBeforeItsHeaderRefuses` pinning the case that decided it and
+// `blankLinesBeforeFirstHeaderAreFine` pinning what is still allowed. And nothing covered nested
+// sub-bullets at all, which the parser silently promoted to separate top-level items:
+// `nestedBulletContinuesItsParent`, `multiLevelNestingStaysInOneItem` and
+// `uniformlyIndentedListKeepsItsItems` (the guard on relative-depth continuation) now do.
 
 import Testing
 
@@ -450,13 +460,59 @@ struct MeetingSummaryResponseParserTests {
         #expect(result.actionItems == [MeetingActionItem(owner: "Alice", text: "Send the notes.")])
     }
 
-    @Test("a preamble before the first header is dropped by rule, and every section still parses in full")
-    func preambleBeforeFirstHeaderIsDropped() {
-        // The one thing dropped without refusing, and deliberately: text before the first header
-        // precedes every section, so it belongs to none of them -- a confident attribution, not a
-        // guess between two readings of the same line.
+    // CHANGED IN ROUND 4, from `preambleBeforeFirstHeaderIsDropped`, which asserted this response
+    // parses with the lead-in silently discarded. That blessed a rule that could not tell an
+    // empty pleasantry from real content: see `substantivePurposeBeforeItsHeaderRefuses` below for
+    // the response the old rule quietly gutted while still returning a complete-looking summary.
+    // Text before the first header now refuses, like every other unattributable line.
+    @Test("a preamble before the first header refuses the whole response rather than being dropped")
+    func preambleBeforeFirstHeaderRefuses() {
         let raw = """
             Sure! Here's the summary you asked for:
+
+            PURPOSE:
+            Weekly status check-in.
+
+            QUESTIONS:
+            - Is the Q2 deadline still realistic?
+
+            CONCLUSIONS:
+            - We will ship on Friday.
+
+            ACTION_ITEMS:
+            - Alice: Send the notes.
+            """
+        #expect(MeetingSummaryResponseParser.parse(raw) == nil)
+    }
+
+    @Test("real purpose text written ABOVE its own header refuses, instead of being silently discarded")
+    func substantivePurposeBeforeItsHeaderRefuses() {
+        // The case that decided this rule. Structurally this is identical to a "Sure!" lead-in --
+        // non-blank text before the first recognized header -- but here it is the substance of the
+        // meeting. Under the old drop rule the parse succeeded and returned purpose "None", i.e. a
+        // summary that reads as complete while the real purpose is gone.
+        let raw = """
+            The team met to agree the Q3 migration sequence and who owns the rollback plan.
+
+            PURPOSE:
+            None
+
+            QUESTIONS:
+            - Is the Q2 deadline still realistic?
+
+            CONCLUSIONS:
+            - We will ship on Friday.
+
+            ACTION_ITEMS:
+            - Alice: Send the notes.
+            """
+        #expect(MeetingSummaryResponseParser.parse(raw) == nil)
+    }
+
+    @Test("blank lines before the first header are not a preamble, and do not refuse")
+    func blankLinesBeforeFirstHeaderAreFine() {
+        let raw = """
+
 
             PURPOSE:
             Weekly status check-in.
@@ -475,6 +531,118 @@ struct MeetingSummaryResponseParserTests {
         #expect(result.questions == ["Is the Q2 deadline still realistic?"])
         #expect(result.conclusions == ["We will ship on Friday."])
         #expect(result.actionItems == [MeetingActionItem(owner: "Alice", text: "Send the notes.")])
+    }
+
+    @Test("a nested sub-bullet continues its parent item, keeping its owner, instead of becoming a second ownerless one")
+    func nestedBulletContinuesItsParent() {
+        // ROUND 4 BLOCKING FIX. `bulletBody` used to be tested before indentation, so the nested
+        // line opened a NEW top-level item: Alice's action PLUS a separate, ownerless action that
+        // nobody in the meeting ever agreed to as a standalone item. The nested marker is kept in
+        // the joined text, because the result type is flat and cannot hold a tree -- the sub-item
+        // stays visible AS a sub-item rather than being erased or promoted.
+        let raw = """
+            PURPOSE:
+            Launch prep.
+
+            QUESTIONS:
+            None
+
+            CONCLUSIONS:
+            - Ship on Friday
+              - subject to the security review passing
+
+            ACTION_ITEMS:
+            - Alice: Prepare launch plan
+              - include rollback owners
+              - include the comms draft
+            - Bob: Book the review room
+            """
+        let result = try! #require(MeetingSummaryResponseParser.parse(raw))
+        #expect(result.conclusions == ["Ship on Friday - subject to the security review passing"])
+        #expect(
+            result.actionItems == [
+                MeetingActionItem(
+                    owner: "Alice",
+                    text: "Prepare launch plan - include rollback owners - include the comms draft"),
+                MeetingActionItem(owner: "Bob", text: "Book the review room"),
+            ])
+    }
+
+    @Test("a whole list indented under its header stays separate items, rather than folding into the first")
+    func uniformlyIndentedListKeepsItsItems() {
+        // The reason continuation is decided on RELATIVE depth. An absolute "starts with
+        // whitespace" test, combined with checking indentation first, would fold this entire list
+        // into its first item.
+        let raw = """
+            PURPOSE:
+            Weekly status check-in.
+
+            QUESTIONS:
+              - Do we have budget for the extra hire?
+              - Is the Q2 deadline still realistic?
+
+            CONCLUSIONS:
+              - We will ship on Friday.
+
+            ACTION_ITEMS:
+              - Alice: Send the notes.
+              - Bob: Book the room.
+            """
+        let result = try! #require(MeetingSummaryResponseParser.parse(raw))
+        #expect(
+            result.questions == [
+                "Do we have budget for the extra hire?",
+                "Is the Q2 deadline still realistic?",
+            ])
+        #expect(result.conclusions == ["We will ship on Friday."])
+        #expect(
+            result.actionItems == [
+                MeetingActionItem(owner: "Alice", text: "Send the notes."),
+                MeetingActionItem(owner: "Bob", text: "Book the room."),
+            ])
+    }
+
+    @Test("a deeper sub-bullet under a nested one still lands in the same top-level item")
+    func multiLevelNestingStaysInOneItem() {
+        let raw = """
+            PURPOSE:
+            None
+
+            QUESTIONS:
+            None
+
+            CONCLUSIONS:
+            - Ship on Friday
+              - after the security review
+                - which Bob is running
+
+            ACTION_ITEMS:
+            None
+            """
+        let result = try! #require(MeetingSummaryResponseParser.parse(raw))
+        #expect(result.conclusions == ["Ship on Friday - after the security review - which Bob is running"])
+    }
+
+    @Test("punctuated spellings of None are the same empty answer, not literal content")
+    func punctuatedNoneSpellingsAreEmpty() {
+        let raw = """
+            PURPOSE:
+            None!
+
+            QUESTIONS:
+            (None)
+
+            CONCLUSIONS:
+            none,
+
+            ACTION_ITEMS:
+            "None."
+            """
+        let result = try! #require(MeetingSummaryResponseParser.parse(raw))
+        #expect(result.purpose.isEmpty)
+        #expect(result.questions.isEmpty)
+        #expect(result.conclusions.isEmpty)
+        #expect(result.actionItems.isEmpty)
     }
 
     @Test("a lead-in sentence above a bulleted list refuses rather than becoming a fabricated item")

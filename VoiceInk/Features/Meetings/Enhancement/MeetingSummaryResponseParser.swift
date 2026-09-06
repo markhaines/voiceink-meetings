@@ -12,7 +12,7 @@
 //     into a `.summary`, i.e. a result that presents itself as complete -- while having silently
 //     DROPPED, TRUNCATED or ABSORBED any of that response's content.
 //
-// That property has been defeated twice, both times by a rule that was right for one real
+// That property has been defeated three times, every time by a rule that was right for one real
 // response shape and wrong for another:
 //   1. Accepting a response carrying a single recognized header, with the other three sections
 //      silently defaulting to empty -- a `.summary` indistinguishable from a genuine four-section
@@ -23,8 +23,15 @@
 //      line, all of which it silently discarded while still returning a complete-looking
 //      `.summary`. A silently shortened ACTION_ITEMS list means an action Mark agreed to is
 //      simply absent from a document that reads as finished -- worse than no summary at all.
+//   3. Two more of the same shape, found by review of the fix for (2). Text before the first
+//      header was DROPPED on the argument that it belongs to no section -- but it can just as
+//      easily BE the real purpose, written above its own header, and the rule cannot tell the two
+//      apart. And a nested sub-bullet was RECLASSIFIED as a new top-level item, because the
+//      bullet test ran before the indentation test: one owned action became that action plus a
+//      second, ownerless one, silently flattening the hierarchy the model wrote. Both now follow
+//      the rule below -- refuse, and attribute-by-nesting, respectively.
 //
-// THE RULE THIS FILE NOW FOLLOWS, in place of both:
+// THE RULE THIS FILE NOW FOLLOWS, in place of all of them:
 //
 //   * ATTRIBUTION IS BY HEADER. Every line between one recognized header and the next belongs to
 //     that section. Nothing under a header is ever discarded.
@@ -107,11 +114,18 @@ enum MeetingSummaryResponseParser {
     ///    `parseList`. This is the second blocking finding's fix, and it replaces a rule that
     ///    silently stopped collecting instead.
     ///
-    /// Text BEFORE the first recognized header (a "Sure! Here's the summary:" preamble) is the
-    /// one thing dropped without refusing, and it is dropped by a stated rule rather than by
-    /// accident: it precedes every section, so it cannot be part of any of them -- that is a
-    /// confident attribution ("belongs to no section"), not a guess between two readings. The
-    /// four sections it precedes are still parsed in full.
+    /// 3. **Any non-whitespace text appears BEFORE the first recognized header.** This used to be
+    ///    dropped, on the argument that a preamble precedes every section so it can belong to
+    ///    none of them. That argument was wrong, and it was the same mistake in new clothes: the
+    ///    rule cannot tell "Sure, here's the summary:" from a model that wrote the substantive
+    ///    purpose text and only then emitted `PURPOSE:`. In the second case the parse returned a
+    ///    complete-looking summary with real content silently gone -- exactly the property this
+    ///    file exists to hold. Refusing is the only outcome that does not depend on knowing which
+    ///    of the two it was. A narrow allowlist of known boilerplate lead-ins was considered and
+    ///    rejected: an allowlist is a heuristic, "usually right" is what has lost here three
+    ///    times, and it would still mis-handle the case it does not recognize. The refusal cost
+    ///    is paid on the INPUT side instead -- `MeetingSummaryPrompt` now states "no text before
+    ///    the first header" as a rule rather than a preference.
     static func parse(_ raw: String) -> ParsedMeetingSummarySections? {
         let unfenced = stripWrappingCodeFence(raw)
         let lines = unfenced.components(separatedBy: "\n")
@@ -125,7 +139,14 @@ enum MeetingSummaryResponseParser {
                 buffers[section] = buffers[section] ?? []
                 continue
             }
-            guard let current else { continue }
+            guard let current else {
+                // Before the first header. Blank lines carry nothing and are ignored; anything
+                // else is unattributable content, and refusing is the only reading that cannot
+                // silently lose a real PURPOSE the model wrote above its own header. See (3) in
+                // this function's doc comment.
+                if line.trimmingCharacters(in: .whitespaces).isEmpty { continue }
+                return nil
+            }
             buffers[current, default: []].append(line)
         }
 
@@ -174,19 +195,29 @@ enum MeetingSummaryResponseParser {
         return lines.joined(separator: "\n")
     }
 
-    /// Matches "None", case-insensitively, with or without a trailing period -- the prompt asks
-    /// for exactly "None" but a real model asked to write a short standalone sentence (`PURPOSE`
-    /// is prose, not a bulleted list) will plausibly punctuate it as "None." anyway. Tolerating
-    /// that is a parsing leniency, not a prompt ambiguity: nothing about accepting "None." here
-    /// risks treating REAL content as empty, since both spellings mean the same thing.
+    /// Matches "None", case-insensitively, ignoring an ENUMERATED set of surrounding punctuation:
+    /// the wrappers `(` `)` `[` `]` `"` `'` and the trailing marks `.` `!` `,` `;` `:`. The prompt
+    /// asks for exactly "None", but a real model writing a short standalone answer punctuates it
+    /// ("None.", "None!", "(None)"), and every one of those spellings means the same thing.
     ///
-    /// Only ever consulted for a section whose ENTIRE content is that one word (see `parseProse`
-    /// and `parseList`): a "None" appearing ALONGSIDE real items is not a section-is-empty
-    /// marker, it is an unattributable line, and is handled as one rather than quietly skipped.
+    /// The set is a fixed list, not a "strip anything non-alphanumeric" rule, deliberately: an
+    /// open-ended strip is the kind of heuristic that has cost this file three rounds, whereas an
+    /// enumerated set is exhaustively reviewable. Nothing here can turn REAL content empty --
+    /// `isNone` is only ever consulted for a section whose ENTIRE content is that single token
+    /// (see `parseProse` and `parseList`), so the only strings it can affect are ones that say
+    /// "nothing here" in the first place. A "None" appearing ALONGSIDE real items is not a
+    /// section-is-empty marker; it is an unattributable line, and is handled as one rather than
+    /// quietly skipped.
+    private static let noneTrailingPunctuation: Set<Character> = [".", "!", ",", ";", ":"]
+    private static let noneWrappingPunctuation: Set<Character> = ["(", ")", "[", "]", "\"", "'"]
+
     private static func isNone(_ text: String) -> Bool {
-        var trimmed = text.trimmingCharacters(in: .whitespaces)
-        if trimmed.hasSuffix(".") { trimmed.removeLast() }
-        return trimmed.caseInsensitiveCompare("None") == .orderedSame
+        var trimmed = Substring(text.trimmingCharacters(in: .whitespaces))
+        while let last = trimmed.last, noneTrailingPunctuation.contains(last) { trimmed = trimmed.dropLast() }
+        while let first = trimmed.first, noneWrappingPunctuation.contains(first) { trimmed = trimmed.dropFirst() }
+        while let last = trimmed.last, noneWrappingPunctuation.contains(last) { trimmed = trimmed.dropLast() }
+        while let last = trimmed.last, noneTrailingPunctuation.contains(last) { trimmed = trimmed.dropLast() }
+        return trimmed.trimmingCharacters(in: .whitespaces).caseInsensitiveCompare("None") == .orderedSame
     }
 
     /// PURPOSE, the one PROSE section: every line under the header is part of the purpose, and
@@ -234,14 +265,18 @@ enum MeetingSummaryResponseParser {
     ///   * A BLANK LINE starts a new block, which in a section with no bullets starts a new item.
     ///
     /// Every non-blank line is then one of three things:
-    ///   1. **Bulleted** -- a new item. Unambiguous.
-    ///   2. **Indented, with an item already open** -- a continuation of that item, joined onto
-    ///      it with a space. Indentation is the signal because it is the one a hard-wrapped
-    ///      continuation actually carries and a model's closing remark never does; requiring it
-    ///      is what lets a wrapped bullet parse exactly instead of costing the whole summary.
-    ///      A blank line does not break this: an indented block below a bullet is nested under
-    ///      that bullet in the model's own formatting, so attributing it there follows the
-    ///      model's structure rather than guessing past it.
+    ///   1. **Indented DEEPER than the line that opened the current item** -- a continuation of
+    ///      that item, joined onto it with a space. Checked BEFORE the bullet test, so a nested
+    ///      sub-bullet continues its parent instead of becoming a separate top-level item; its
+    ///      marker is kept verbatim in the joined text, since the result type is flat and cannot
+    ///      hold a tree. Relative depth, not "starts with whitespace": a model that indents a
+    ///      whole list under its header would otherwise have every bullet folded into the first.
+    ///      Indentation is the signal because it is the one a hard-wrapped continuation and a
+    ///      sub-bullet both carry and a model's closing remark never does. A blank line does not
+    ///      break it: an indented block below a bullet is nested under that bullet in the model's
+    ///      own formatting, so attributing it there follows the model's structure rather than
+    ///      guessing past it.
+    ///   2. **Bulleted, at or above the current item's depth** -- a new item. Unambiguous.
     ///   3. **Un-bulleted and un-indented.** This is the ambiguous case, and it splits on whether
     ///      the section uses bullets at all:
     ///      - If the section contains NO bullet anywhere, the model wrote this section as plain
@@ -270,9 +305,14 @@ enum MeetingSummaryResponseParser {
         let usesBullets = nonBlank.contains { bulletBody($0) != nil }
 
         var items: [String] = []
-        /// Index of the item an indented continuation line attaches to, or `nil` when no item has
-        /// been opened yet (the start of the section, or a bare marker that carried no text).
+        /// Index of the item a continuation line attaches to, or `nil` when no item has been
+        /// opened yet (the start of the section, or a bare marker that carried no text).
         var openItem: Int?
+        /// The leading-whitespace width of the line that OPENED `openItem`. Continuation is
+        /// decided relative to this, never against zero: a model that indents a whole list under
+        /// its header writes every bullet at the same depth, and an absolute "is indented" test
+        /// would fold that entire list into its first item.
+        var openItemIndent = 0
         var atBlockStart = true
 
         for rawLine in lines {
@@ -280,6 +320,21 @@ enum MeetingSummaryResponseParser {
 
             if trimmed.isEmpty {
                 atBlockStart = true
+                continue
+            }
+
+            // CONTINUATION IS CHECKED FIRST, INCLUDING FOR A BULLETED LINE. A nested bullet is
+            // indented deeper than the item it sits under, and testing `bulletBody` first made it
+            // open a NEW top-level item instead -- so "- Alice: Prepare launch plan" followed by
+            // "  - include rollback owners" became Alice's action PLUS a second, ownerless one,
+            // inventing an unattributed action item for the downstream indexer and silently
+            // flattening the hierarchy the model wrote. The nested marker is kept verbatim in the
+            // continuation text: `[String]`/`MeetingActionItem` cannot represent a tree, so the
+            // sub-item stays visible AS a sub-item inside its parent's text rather than being
+            // erased or promoted.
+            if indentWidth(rawLine) > openItemIndent, let target = openItem {
+                items[target] += " " + trimmed
+                atBlockStart = false
                 continue
             }
 
@@ -294,18 +349,14 @@ enum MeetingSummaryResponseParser {
                 }
                 items.append(body)
                 openItem = items.count - 1
-                continue
-            }
-
-            if isIndented(rawLine), let target = openItem {
-                items[target] += " " + trimmed
-                atBlockStart = false
+                openItemIndent = indentWidth(rawLine)
                 continue
             }
 
             if !usesBullets, atBlockStart {
                 items.append(trimmed)
                 openItem = items.count - 1
+                openItemIndent = indentWidth(rawLine)
                 atBlockStart = false
                 continue
             }
@@ -316,13 +367,15 @@ enum MeetingSummaryResponseParser {
         return items
     }
 
-    /// True when the raw (untrimmed) line begins with whitespace -- the wrapped-continuation
-    /// signal `parseList` keys on. Read off the raw line deliberately: every other check in this
-    /// parser works on the trimmed line, and this is the one place the leading whitespace itself
-    /// is the information.
-    private static func isIndented(_ rawLine: String) -> Bool {
-        guard let first = rawLine.first else { return false }
-        return first.isWhitespace
+    /// The number of leading whitespace characters on the raw (untrimmed) line -- the
+    /// continuation signal `parseList` keys on. Read off the raw line deliberately: every other
+    /// check in this parser works on the trimmed line, and this is the one place the leading
+    /// whitespace itself is the information. Counted in characters, so one tab counts as one
+    /// level: mixing tabs and spaces within a single list would make depths incomparable, but a
+    /// model emits one or the other consistently, and the failure mode of a mixed list is a
+    /// refusal, not a silent misattribution.
+    private static func indentWidth(_ rawLine: String) -> Int {
+        rawLine.prefix { $0.isWhitespace }.count
     }
 
     /// The text after a leading list marker, or `nil` if the (already trimmed) line does not

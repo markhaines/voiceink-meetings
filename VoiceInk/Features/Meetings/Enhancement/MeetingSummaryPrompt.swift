@@ -38,6 +38,19 @@ enum MeetingSummaryPrompt {
         headings, bold, or code fences. Do not add any other section, preamble, or closing
         remark.
 
+        These are hard requirements, not preferences. A response that breaks any of them is
+        rejected in full and the meeting gets no summary at all, so follow them literally:
+        - The very first line of your response is `PURPOSE:`. Write NOTHING before it: no
+          greeting, no "Sure", no restating the task, no summary of what you are about to do.
+        - Your response ENDS with the last line of the ACTION_ITEMS section. Write NOTHING after
+          it: no closing remark, no offer of further help, no note about what you did.
+        - In QUESTIONS, CONCLUSIONS and ACTION_ITEMS, every entry is ONE line that starts with
+          "- ". Never write an entry without its "- ". Never put two entries on one line.
+        - Never wrap an entry across two lines. A long entry stays on one long line, however
+          long that line becomes.
+        - Never indent a line, and never use sub-bullets or nested lists. Every entry is a single
+          top-level "- " line.
+
         PURPOSE:
         One to three sentences on why this meeting happened and what it was about, written from
         the transcript's own content. If the transcript gives no basis for this (for example it

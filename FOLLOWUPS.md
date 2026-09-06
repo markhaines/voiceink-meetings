@@ -4,6 +4,45 @@ Known gaps and limitations deliberately left open, with the reasoning, so they a
 decisions rather than accidents. Not a task tracker: a record so they are not
 rediscovered from scratch later. See each entry for the evidence.
 
+## Gate-running modes: the central list
+
+This project's real-model/real-audio smoke tests skip cleanly when their prerequisites (a
+downloaded model, real audio, network reachability) are absent -- correct, desired convenience
+for ordinary developer and CI runs. Each such test also has a GATE-RUNNING MODE: an opt-in that
+turns a missing prerequisite from "skip" into "fail loudly", so a passing run can only mean the
+real path actually executed. **This is the one place that lists every one of those flags, in the
+external form a caller actually sets, so the next one doesn't need rediscovering (or get its
+prefix wrong the way `RealModelSmokeTests.swift`'s own header comment once did -- see that file's
+GATE ITEM 1 entry below for the full story of that mistake).**
+
+Every flag here follows the SAME two-name shape, and the distinction is load-bearing, not
+cosmetic: the EXTERNAL name, `TEST_RUNNER_<GATE>_GATE_MODE`, is what you set as an environment
+variable on the `xcodebuild` command itself; `xcodebuild test` launches the actual test host
+through a LaunchServices-mediated path that does not inherit that shell's environment at all,
+except for `TEST_RUNNER_`-prefixed variables, which it forwards into the test host WITH THE
+PREFIX STRIPPED. The UNPREFIXED name, `<GATE>_GATE_MODE`, is what the already-launched test
+process reads back via `ProcessInfo.processInfo.environment` -- it is never something an external
+caller sets directly. Setting the unprefixed form on the outer `xcodebuild` invocation does
+nothing: it never crosses that boundary, the test process reads it as absent, and a missing
+prerequisite quietly skips and reports green.
+
+| Flag (external, `TEST_RUNNER_`-prefixed) | Test file | Status |
+|---|---|---|
+| `TEST_RUNNER_REALMODEL_SMOKE_GATE_MODE` | `Tests/VoiceInkTests/Features/Meetings/Transcription/RealModelSmokeTests.swift` | Live (2026-09-06) |
+| *(Transcripted real-indexer acceptance gate)* | in progress on PR #18 | Not yet landed -- add its row here, in this same `TEST_RUNNER_<GATE>_GATE_MODE` external form, once it does. Do not let a second one invent its own convention or rediscover this list from scratch. |
+
+**Canonical command, run every gate-running mode this repo has together** (harmless for any not
+yet defined -- an env var nothing reads is simply ignored):
+
+```
+TEST_RUNNER_REALMODEL_SMOKE_GATE_MODE=1 \
+  xcodebuild test -project VoiceInk.xcodeproj -scheme VoiceInk -destination 'platform=macOS' \
+  -only-testing:VoiceInkTests/RealModelSmokeTests
+```
+
+Add each new gate's `TEST_RUNNER_<GATE>_GATE_MODE=1` on its own line above as it lands, and widen
+`-only-testing:` (or drop it to run the whole suite) to cover it.
+
 ## `retainRecording` stays `false` on `meetings-ui-shell` -- turning it on today would be worse, not better
 
 Source: `VoiceInk/Features/Meetings/Views/MeetingRecordingController.swift`,
@@ -513,15 +552,33 @@ CLOSED" stays correctly bounded to the FluidAudio path; scope stays clean (zero 
    Parakeet model, no usable recording, or no diarizer model/network produced SKIPPED tests and a
    passing build — correct behavior for an ordinary run, but the file's own comment claimed this
    avoided "silently reporting green with nothing exercised", which is false: it is exactly that,
-   by design, for convenience. Fixed by adding an explicit GATE-RUNNING MODE
-   (`REALMODEL_SMOKE_GATE_MODE`, any non-empty value, forwarded into the test process the same
-   `TEST_RUNNER_`-prefix way `VOICEINK_CI` already is): with it set, a missing prerequisite is no
-   longer grounds to skip, and the test runs for real and fails loudly instead. The file's header
-   comment was rewritten to say exactly what ordinary mode and gate mode each guarantee, instead of
-   overclaiming. Separately, the diarizer test previously required network reachability
-   unconditionally; it now only requires it when the diarizer's model is not already cached under
-   FluidAudio's own Application Support directory (`RealModelAvailability.diarizerModelsPresent`),
-   so a machine with the model already downloaded runs offline.
+   by design, for convenience. Fixed by adding an explicit GATE-RUNNING MODE, engaged with
+   ```
+   TEST_RUNNER_REALMODEL_SMOKE_GATE_MODE=1 xcodebuild test -project VoiceInk.xcodeproj \
+     -scheme VoiceInk -destination 'platform=macOS' -only-testing:VoiceInkTests/RealModelSmokeTests
+   ```
+   (see the "Gate-running modes" section at the top of this file for the repo-wide canonical
+   list): with that set, a missing prerequisite is no longer grounds to skip, and the test runs
+   for real and fails loudly instead. **A ROUND-3 REVIEW FINDING, since fixed:** the file's header
+   comment and this very paragraph originally told the reader to "Set `REALMODEL_SMOKE_GATE_MODE`"
+   -- the UNPREFIXED name, which only the already-launched test process itself reads via
+   `ProcessInfo`. Setting that unprefixed form on the outer `xcodebuild` invocation does nothing:
+   `xcodebuild test` launches the test host through a LaunchServices-mediated path that does not
+   inherit the invoking shell's environment except for `TEST_RUNNER_`-prefixed variables (which it
+   forwards with the prefix stripped), so a caller who followed the original wording ran ordinary
+   skip-mode by another name, watched everything skip, and would have read the resulting green run
+   as proof the gate had executed -- the exact false assurance this mechanism exists to prevent,
+   reintroduced through its own documentation. Both the file's header and this paragraph now give
+   the correct `TEST_RUNNER_`-prefixed external command above, and the point where
+   `isGateRunningMode` is defined in the source carries its own one-sentence warning against the
+   unprefixed name, so a reader who only looks at the `ProcessInfo` line still cannot miss it.
+   Proof both ways (correct prefixed form fails on a genuinely missing prerequisite; the wrong
+   unprefixed form skips and reports green on the SAME missing prerequisite) is in this task's
+   report, "Round 3" section. Separately, the diarizer test previously required network
+   reachability unconditionally; it now only requires it when the diarizer's model is not already
+   cached under FluidAudio's own Application Support directory
+   (`RealModelAvailability.diarizerModelsPresent`), so a machine with the model already downloaded
+   runs offline.
 2. **The diarizer test PASSED when the production path timed out.** `loadTimedOut` was caught,
    recorded as a diagnostic, and swallowed — the test could pass having loaded no model, run no
    diarization, and produced no `DiarizationResult`, while its own name claimed otherwise. Fixed:

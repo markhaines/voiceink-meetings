@@ -26,18 +26,45 @@
 // exercised, same as any other disabled test. That is correct and desired for those ordinary
 // runs. It is NOT, by itself, a guarantee that the gate has actually run.
 //
-// GATE-RUNNING MODE closes that gap. Set `REALMODEL_SMOKE_GATE_MODE` (any non-empty value) to
-// turn every prerequisite check in this file from "skip" into "do not skip": the test then runs
-// for real and, if the prerequisite genuinely is not met, fails loudly (a thrown error from a
-// missing model/recording, or a real network/timeout failure from the diarizer) instead of
-// reporting a quiet pass. What this DOES guarantee: with `REALMODEL_SMOKE_GATE_MODE` set, this
-// suite passing means both tests actually executed their real model-load/inference path end to
-// end. What it does NOT guarantee: it does not change the `VOICEINK_CI` check, which always
-// disables both tests on CI regardless of gate mode -- CI has no models and no audio hardware, so
-// forcing these tests to run there would fail for an unrelated, uninteresting reason (no
-// environment), not prove anything about the gate. Gate mode is for a real Mac with the real
-// prerequisites available; run it there when the point is to prove nothing was skipped, not on
-// CI.
+// GATE-RUNNING MODE closes that gap. THE COMMAND TO RUN, copy it exactly -- this is the ONLY
+// form that actually engages gate mode from outside the test process:
+//
+//     TEST_RUNNER_REALMODEL_SMOKE_GATE_MODE=1 xcodebuild test \
+//       -project VoiceInk.xcodeproj -scheme VoiceInk -destination 'platform=macOS' \
+//       -only-testing:VoiceInkTests/RealModelSmokeTests
+//
+// TWO DIFFERENT NAMES, ON PURPOSE, and getting this wrong silently defeats the whole mechanism
+// (see below): `TEST_RUNNER_REALMODEL_SMOKE_GATE_MODE` is the EXTERNAL environment variable you
+// set on the `xcodebuild` invocation above. `xcodebuild test` launches the actual test host
+// through a LaunchServices-mediated path that does not inherit that shell's environment at all
+// -- except for variables prefixed `TEST_RUNNER_`, which it forwards into the test host process
+// WITH THE PREFIX STRIPPED (the same mechanism `VOICEINK_CI`/`TEST_RUNNER_VOICEINK_CI` already
+// uses; see that pair's own comment below and FORK-PATCHES.md's "phase-1-mic-route" section for
+// where this was first proven). `REALMODEL_SMOKE_GATE_MODE` (no `TEST_RUNNER_` prefix) is the
+// UNPREFIXED name `isGateRunningMode` below reads via `ProcessInfo.processInfo.environment`
+// INSIDE that already-launched test process -- it is not something an external caller sets
+// directly. Setting the unprefixed form on `xcodebuild`'s own invocation
+// (`REALMODEL_SMOKE_GATE_MODE=1 xcodebuild test ...`) does NOTHING: it never crosses the
+// LaunchServices boundary, `isGateRunningMode` reads `nil` inside the test host exactly as if
+// gate mode were never requested, a missing prerequisite quietly SKIPS, and the run reports
+// green -- the exact false assurance this mechanism exists to prevent, reintroduced by a reader
+// following an unprefixed instruction. `RealModelSmokeTests` is only one entry in a repo-wide
+// list of these flags; FOLLOWUPS.md's "Gate-running modes" section is the one place that lists
+// every `<GATE>_GATE_MODE` flag in its correct external, `TEST_RUNNER_`-prefixed form, with a
+// single copyable command that runs all of them together -- check there before adding another.
+//
+// What gate mode DOES guarantee, once engaged with the command above: with
+// `TEST_RUNNER_REALMODEL_SMOKE_GATE_MODE=1` set on the `xcodebuild` invocation, this suite
+// passing means both tests actually executed their real model-load/inference path end to end --
+// a missing prerequisite fails the run instead of skipping it. What it does NOT guarantee: it
+// does not change the `VOICEINK_CI` check, which always disables both tests on CI regardless of
+// gate mode -- CI has no models and no audio hardware, so forcing these tests to run there would
+// fail for an unrelated, uninteresting reason (no environment), not prove anything about the
+// gate. Gate mode is for a real Mac with the real prerequisites available; run it there when the
+// point is to prove nothing was skipped, not on CI. It also does not guarantee anything on an
+// ordinary run where gate mode is NOT engaged (including every CI run and every plain local
+// `xcodebuild test`): a missing prerequisite there still produces a quiet skip and a green
+// suite, which remains correct, desired convenience behavior, not a new guarantee.
 //
 // AUDIO PROVENANCE, stated plainly:
 //   - The transcription test uses ONE of Mark's own real dictation recordings, found under
@@ -76,9 +103,18 @@ private var isRunningInCI: Bool {
     ProcessInfo.processInfo.environment["VOICEINK_CI"] != nil
 }
 
-/// See this file's header, "GATE-RUNNING MODE". When set, a missing prerequisite is no longer
-/// grounds to skip -- the test runs anyway and fails for real if the prerequisite truly is not
-/// met. Does NOT affect `isRunningInCI`: CI is disabled unconditionally, gate mode or not.
+/// See this file's header, "GATE-RUNNING MODE", for the full mechanism and the canonical command.
+/// When set, a missing prerequisite is no longer grounds to skip -- the test runs anyway and
+/// fails for real if the prerequisite truly is not met. Does NOT affect `isRunningInCI`: CI is
+/// disabled unconditionally, gate mode or not.
+///
+/// READ THIS BEFORE SETTING ANYTHING: the string below, `REALMODEL_SMOKE_GATE_MODE`, is the
+/// UNPREFIXED name this already-launched test process reads its own environment for -- it is
+/// NOT what an external caller sets. Engaging this from outside requires the EXTERNAL,
+/// `TEST_RUNNER_`-prefixed form on the `xcodebuild` invocation instead:
+/// `TEST_RUNNER_REALMODEL_SMOKE_GATE_MODE=1 xcodebuild test ...` -- xcodebuild strips the
+/// `TEST_RUNNER_` prefix when it forwards a variable into the test host, which is the ONLY way
+/// anything set on the outer `xcodebuild` command reaches this `ProcessInfo` lookup at all.
 private var isGateRunningMode: Bool {
     ProcessInfo.processInfo.environment["REALMODEL_SMOKE_GATE_MODE"] != nil
 }

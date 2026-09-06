@@ -45,6 +45,39 @@ TEST_RUNNER_MEETING_SUMMARY_SMOKE_GATE_MODE=1 \
 Add each new gate's `TEST_RUNNER_<GATE>_GATE_MODE=1` on its own line above as it lands, and widen
 `-only-testing:` (or drop it to run the whole suite) to cover it.
 
+## `MeetingSummaryService`'s structured output has no join function into `Meeting.actionItems`/`Meeting.summary` yet
+
+Source: `VoiceInk/Features/Meetings/Enhancement/{MeetingSummaryService,MeetingSummaryTypes}.swift`;
+consumer: `TranscriptedMarkdownExporter.swift` (PR #18, `phase3-transcripted-export` branch, not on
+`main`).
+
+**OPEN, recorded rather than fixed, because it belongs to whichever PR does the actual wiring, not
+to the summarizer built in isolation from it.** `MeetingSummaryService.summarize` returns a
+`MeetingSummary` -- `purpose: String`, `questions: [String]`, `conclusions: [String]`,
+`actionItems: [MeetingActionItem]`, `participants: [String]`, `wasTruncated: Bool` -- entirely
+independent of `Meeting`'s own persisted, exporter-facing fields (`actionItems: [String]`,
+`summary: String?`). Reviewed and accepted on the understanding that the exporter can stay
+untouched ONLY once a future wiring step supplies two things neither this service nor the exporter
+currently has:
+
+1. **Action items: the join exists, but nothing calls it yet.** `MeetingActionItem.formatted`
+   ("Owner: text" or just "text") is exactly `Meeting.actionItems`' `[String]` element shape --
+   a future composition root should be able to write `Meeting.actionItems = summary.actionItems
+   .map(\.formatted)` and get `TranscriptedMarkdownExporter.actionItemsField`'s existing `"- item |
+   - item"` contract for free, unchanged. That call does not exist anywhere yet.
+2. **`Meeting.summary`: no formatter exists at all.** `Meeting.summary` is a single `String?`, but
+   `MeetingSummary` carries THREE separate prose/list fields (`purpose`, `questions`,
+   `conclusions`) with no defined function combining them into one string. Whoever wires this in
+   has to decide that shape (headed sections? just `purpose`? something the exporter's frontmatter
+   grows a field for instead of squeezing into the body?) -- it is a real, unresolved design
+   decision, not an oversight to fix mechanically.
+
+Also unresolved by the same wiring step: `MeetingSummary.participants` has no destination at all
+today -- `TranscriptedMarkdownExporter` (as it stands on PR #18) has no `auto_summary_participants`
+frontmatter key; only `auto_summary`, `auto_summary_action_items`, and `auto_summary_version`
+exist there. See that PR's own description, which calls the rest of the `auto_summary_*` family
+(participants included) a known, not-yet-built gap.
+
 ## `retainRecording` stays `false` on `meetings-ui-shell` -- turning it on today would be worse, not better
 
 Source: `VoiceInk/Features/Meetings/Views/MeetingRecordingController.swift`,

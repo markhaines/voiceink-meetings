@@ -43,23 +43,35 @@ enum MeetingSummaryResponseParser {
     /// impossible.
     private static let maxOwnerCandidateLength = 40
 
-    /// Returns `nil` when `raw` contains not one recognized section header -- i.e. the model
-    /// ignored the requested format entirely. `MeetingSummaryService` maps that to
-    /// `.unparseable(rawText:)`. A response with SOME but not all four headers still parses: the
-    /// missing sections come back empty, which is the honest reading of "the model didn't
-    /// produce this section" and not grounds to discard sections it did produce correctly.
+    /// Returns `nil` unless ALL FOUR required headers are present -- **not** "at least one", the
+    /// original (blocking-review-finding) behavior. That original leniency meant a response
+    /// carrying a single recognized header, with the other three sections silently defaulting to
+    /// empty, produced a `.summary` outcome INDISTINGUISHABLE from a genuine four-section parse:
+    /// nothing on `MeetingSummary` recorded that three quarters of the requested structure was
+    /// never actually seen. Requiring every header closes that gap at the one point that can
+    /// close it for every caller at once, rather than pushing a completeness check onto each
+    /// future consumer of `MeetingSummary` and trusting all of them to remember it.
+    ///
+    /// This is a real behavior change from "lenient": a response missing even one header --
+    /// including a well-formed three-header response -- is now `nil`, mapped by
+    /// `MeetingSummaryService` to `.unparseable(rawText:)`. That is the deliberately chosen
+    /// trade: `MeetingSummary` from `.summary` now carries a real, load-bearing invariant --
+    /// every section was genuinely found in the response, even when its content is legitimately
+    /// empty (the model wrote nothing, or literally "None", between a header and the next one) --
+    /// rather than a struct that looks the same whether the model followed the format or not.
+    /// Once all four headers are present, an EMPTY section (no content between it and the next
+    /// header) is still accepted as a real, honest empty answer -- it is a structural
+    /// completeness check, not a content-non-emptiness check.
     static func parse(_ raw: String) -> ParsedMeetingSummarySections? {
         let unfenced = stripWrappingCodeFence(raw)
         let lines = unfenced.components(separatedBy: "\n")
 
         var buffers: [Section: [String]] = [:]
         var current: Section?
-        var foundAnyHeader = false
 
         for line in lines {
             if let section = matchHeader(line) {
                 current = section
-                foundAnyHeader = true
                 buffers[section] = buffers[section] ?? []
                 continue
             }
@@ -67,7 +79,7 @@ enum MeetingSummaryResponseParser {
             buffers[current, default: []].append(line)
         }
 
-        guard foundAnyHeader else { return nil }
+        guard Section.allCases.allSatisfy({ buffers[$0] != nil }) else { return nil }
 
         return ParsedMeetingSummarySections(
             purpose: parseProse(buffers[.purpose] ?? []),
@@ -122,12 +134,29 @@ enum MeetingSummaryResponseParser {
         return nonEmpty.joined(separator: " ")
     }
 
+    /// Collects real list items out of one section's raw lines, tolerating a missing leading
+    /// "- " on the FIRST real content line only (`missingBulletIsStillAccepted`'s case: a whole
+    /// section that is just one un-bulleted sentence). Every line AFTER that first one must be
+    /// bulleted to be accepted as another item -- a later non-bulleted, non-empty line is not a
+    /// second missing-bullet item, it is trailing free-text noise (a model sign-off like "Let me
+    /// know if you have questions!" appended after real content, despite the prompt's explicit
+    /// "Do not add any other section, preamble, or closing remark"). Rather than silently
+    /// absorbing that noise as if it were one more real item -- corrupting the last genuine item
+    /// list with content nobody asked for and nothing downstream could tell apart from a real
+    /// entry -- collection stops at that line: nothing from it onward is added, but every item
+    /// already collected is kept.
     private static func parseList(_ lines: [String]) -> [String] {
         var items: [String] = []
+        var sawFirstContentLine = false
         for rawLine in lines {
             let trimmed = rawLine.trimmingCharacters(in: .whitespaces)
             guard !trimmed.isEmpty, !isNone(trimmed) else { continue }
-            let withoutBullet = trimmed.hasPrefix("-") ? String(trimmed.dropFirst()).trimmingCharacters(in: .whitespaces) : trimmed
+
+            let isBulleted = trimmed.hasPrefix("-")
+            guard isBulleted || !sawFirstContentLine else { break }
+            sawFirstContentLine = true
+
+            let withoutBullet = isBulleted ? String(trimmed.dropFirst()).trimmingCharacters(in: .whitespaces) : trimmed
             guard !withoutBullet.isEmpty else { continue }
             items.append(withoutBullet)
         }

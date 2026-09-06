@@ -26,6 +26,15 @@
 //   inserting an explicit "segments omitted" marker line keeps every included line a complete,
 //   real utterance and makes the gap visible in the prompt itself.
 //
+// STATED PLAINLY, because `wasTruncated` alone only says "something was cut," not what that
+// costs: the dropped middle can contain a real decision the meeting actually reached, or an
+// action item actually agreed, mid-meeting -- not just filler. Head+tail weighting (below) is
+// chosen specifically because CONCLUSIONS and ACTION_ITEMS tend to land near the end, but "tend
+// to" is not "always": a meeting that revisits and closes an earlier topic in its middle can lose
+// exactly that closure. A truncated summary is therefore not merely "possibly incomplete" in the
+// generic sense every summary already is -- it can specifically be missing a real decision, and
+// `wasTruncated` is the caller's only signal that this risk exists for a given summary.
+//
 // Character count, not a token count, is the budget unit. This project has no tokenizer
 // dependency for any provider (Gemini/Anthropic/OpenAI-compatible/Ollama/local CLI all reach
 // `AIEnhancementService` through plain string requests — see that file), and adding one just for
@@ -52,6 +61,36 @@ enum MeetingTranscriptBudget {
     struct Result: Equatable {
         let transcript: String
         let wasTruncated: Bool
+    }
+
+    /// A meeting title is ordinary UI-authored text -- a handful of words in every real case --
+    /// but nothing upstream of `MeetingSummaryService` enforces that (an imported or otherwise
+    /// pathological title could be arbitrarily large). This is capped SEPARATELY from
+    /// `characterBudget`/`defaultCharacterBudget` above, not folded into the segment-dropping
+    /// transcript budget: a title is not a transcript segment, there is nothing to "drop from the
+    /// middle" of one, and mixing the two kinds of content into one algorithm would make both
+    /// harder to reason about. 200 characters is generous for any real title and exists only to
+    /// bound the pathological case -- see `truncateTitle`, and `MeetingSummaryService`, which
+    /// used to append the title AFTER transcript budgeting with no cap of its own at all
+    /// (a review finding: the title bypassed the whole budget, and `wasTruncated` stayed `false`
+    /// regardless of the title's real size).
+    static let maxTitleLength = 200
+
+    struct TitleResult: Equatable {
+        let text: String
+        let wasTruncated: Bool
+    }
+
+    /// Trims and, only if necessary, hard-cuts `title` to `maxTitleLength`, reusing the same
+    /// visible-marker `hardTruncate` the pathological-segment case below uses -- one truncation
+    /// mechanism, not two. `wasTruncated` here means exactly what it means on `Result`: the
+    /// caller did not see the whole of what was asked to be summarized.
+    static func truncateTitle(_ title: String) -> TitleResult {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > maxTitleLength else {
+            return TitleResult(text: trimmed, wasTruncated: false)
+        }
+        return TitleResult(text: hardTruncate(trimmed, to: maxTitleLength), wasTruncated: true)
     }
 
     private static let omittedMarker = "[... earlier segments omitted to fit the context budget ...]"

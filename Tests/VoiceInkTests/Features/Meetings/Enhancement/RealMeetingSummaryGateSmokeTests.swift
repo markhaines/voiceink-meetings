@@ -12,7 +12,20 @@
 //
 // `isRunningInCI` is `RealModelSmokeTests.swift`'s/`AudioGraphExceptionBridgeTests.swift`'s exact
 // `VOICEINK_CI` idiom: CI has no configured provider and no business spending real API credits,
-// so this suite is disabled there unconditionally, gate mode or not.
+// so this suite is disabled there for an ORDINARY run -- but, unlike `RealModelSmokeTests.swift`
+// (which disables on CI unconditionally, gate mode or not, because CI genuinely cannot have a
+// downloaded model or audio hardware, full stop), an EXPLICIT `TEST_RUNNER_
+// MEETING_SUMMARY_SMOKE_GATE_MODE=1` request overrides the CI skip here. A provider IS something
+// CI could plausibly be given (a Keychain-backed key, unlike a GPU), so someone deliberately
+// engaging gate mode there should get the loud, real "no provider" failure `#require` produces,
+// not a silent, correctly-labeled-but-wrong-for-a-gate skip.
+//
+// THE MOST IMPORTANT PROPERTY OF THIS FILE, stated up front because getting it wrong once
+// already meant an ordinary `xcodebuild test` run on a machine with ANY provider configured
+// silently spent a real API call: **outside gate mode, this test is disabled UNCONDITIONALLY --
+// regardless of whether a real provider happens to be configured.** Whether a usable provider
+// exists is relevant ONLY inside the test body, ONLY once gate mode has already been confirmed,
+// where it decides pass vs. `#require`-fail, never skip vs. run.
 //
 // GATE-RUNNING MODE. THE COMMAND TO RUN, copy it exactly:
 //
@@ -38,10 +51,11 @@
 // PREREQUISITE: at least one AI enhancement provider other than VoiceInk Refine must already be
 // configured (an API key in Keychain via `APIKeyManager`, or a connected Ollama/Local CLI/Custom
 // setup) -- `AIService.connectedProviders` is read directly, the same source of truth the real
-// app's own settings UI uses, not a second check invented for this test. Outside gate mode, no
-// configured provider is a clean, correctly-labeled skip. In gate mode, that same missing
-// prerequisite is a hard, loud test failure (`#require`) instead -- see `RealModelSmokeTests
-// .swift`'s header for why that distinction is the entire point of a gate-running mode.
+// app's own settings UI uses, not a second check invented for this test. This check happens
+// ONLY inside the test body, ONLY once gate mode is already confirmed on (see above): in gate
+// mode, a missing provider is a hard, loud test failure (`#require`), never a skip -- see
+// `RealModelSmokeTests.swift`'s header for why that distinction is the entire point of a
+// gate-running mode.
 //
 // VoiceInk Refine is deliberately excluded from "a usable real provider" here, not merely
 // skipped over by chance: `MeetingSummaryService.summarize` refuses it unconditionally
@@ -79,25 +93,27 @@ private var isGateRunningMode: Bool {
     ProcessInfo.processInfo.environment["MEETING_SUMMARY_SMOKE_GATE_MODE"] != nil
 }
 
-/// `AIService` is not `@MainActor` (only `AIEnhancementService` is), so this reads
-/// `connectedProviders` -- the same computed property the real app's settings UI reads -- safely
-/// from a plain, non-isolated context for use directly inside a `.disabled(if:)` trait, which
-/// Swift Testing evaluates outside the test body at discovery time.
-private func hasUsableRealProvider() -> Bool {
-    AIService().connectedProviders.contains { $0 != .voiceInkRefine }
-}
-
 @Suite("Real-provider meeting summary smoke test (gate-running mode)")
 struct RealMeetingSummaryGateSmokeTests {
     @Test(
         "a real, already-configured AI provider actually summarizes a small real transcript end to end",
+        // CI skip, OVERRIDABLE by an explicit gate-mode request -- see this file's header,
+        // "THE MOST IMPORTANT PROPERTY OF THIS FILE" and the paragraph above it, for why this
+        // one trait differs from `RealModelSmokeTests.swift`'s unconditional CI disable.
         .disabled(
-            if: isRunningInCI,
-            "spends real provider credits -- see AudioGraphExceptionBridgeTests.swift for the same VOICEINK_CI idiom"
+            if: isRunningInCI && !isGateRunningMode,
+            "spends real provider credits -- CI has no configured provider (VOICEINK_CI idiom, see AudioGraphExceptionBridgeTests.swift); overridden by an explicit gate-mode request"
         ),
+        // THE BLOCKING FIX: this trait no longer depends on whether a provider happens to be
+        // configured. It used to (`!hasUsableRealProvider() && !isGateRunningMode`), which meant
+        // an ORDINARY `xcodebuild test` run on any machine with any provider already configured
+        // -- Mark's own daily machine included -- was NOT disabled and called the real provider.
+        // Outside gate mode this test is disabled full stop, regardless of what is configured;
+        // whether a provider exists is checked only inside the body, only once gate mode is
+        // already on, via `#require` below.
         .disabled(
-            if: !hasUsableRealProvider() && !isGateRunningMode,
-            "no AI enhancement provider (other than VoiceInk Refine) is configured on this machine"
+            if: !isGateRunningMode,
+            "spends real provider credits -- only runs in gate mode (TEST_RUNNER_MEETING_SUMMARY_SMOKE_GATE_MODE=1, see this file's header)"
         )
     )
     @MainActor

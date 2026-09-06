@@ -272,4 +272,31 @@ struct MeetingSummaryServiceTests {
         #expect(sentText.contains("segments omitted"))
         #expect(sentText.count <= MeetingTranscriptBudget.defaultCharacterBudget * 2)
     }
+
+    @Test("an absurdly long meeting title does not bypass the prompt budget, and wasTruncated says so")
+    func absurdTitleIsBoundedAndReportedTruncated() async throws {
+        let context = try makeContext()
+        // A pathological/imported title, not a real user-typed one: ~54,000 characters, bigger
+        // than `MeetingTranscriptBudget.defaultCharacterBudget` on its own. Before this fix, this
+        // was appended to the prompt AFTER transcript budgeting, verbatim and unbounded, with
+        // `wasTruncated` staying `false`.
+        let absurdTitle = String(repeating: "Quarterly Strategy Offsite ", count: 2_000)
+        let meeting = makeMeeting(title: absurdTitle, in: context)
+        let segments = [
+            makeSegment(start: 0, speaker: "You", text: "Quick sync.", channel: .mic, meeting: meeting, in: context)
+        ]
+        let provider = FakeMeetingEnhancementProvider(behavior: .success(wellFormedResponse))
+        let service = MeetingSummaryService(enhancementProvider: provider)
+
+        let outcome = try await service.summarize(
+            meeting: meeting, segments: segments, configuration: anthropicConfiguration)
+
+        guard case .summary(let summary) = outcome else {
+            Issue.record("expected .summary, got \(outcome)")
+            return
+        }
+        #expect(summary.wasTruncated == true)
+        let sentText = try #require(provider.receivedTexts.first)
+        #expect(sentText.count <= MeetingTranscriptBudget.maxTitleLength + MeetingTranscriptBudget.defaultCharacterBudget * 2)
+    }
 }

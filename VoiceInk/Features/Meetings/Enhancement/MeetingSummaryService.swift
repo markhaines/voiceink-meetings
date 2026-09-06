@@ -97,13 +97,16 @@ final class MeetingSummaryService {
         )
 
         // The meeting's own title is cheap, always-available grounding for `PURPOSE` (e.g. a
-        // title of "Sprint Planning" is a strong hint even before reading a word of transcript)
-        // -- included verbatim, never truncated, since it is a handful of characters next to a
-        // budget measured in tens of thousands.
-        let titleHeader = meeting.title.trimmingCharacters(in: .whitespacesAndNewlines)
-        let promptText = titleHeader.isEmpty
+        // title of "Sprint Planning" is a strong hint even before reading a word of transcript).
+        // Capped independently of the transcript budget via `MeetingTranscriptBudget
+        // .truncateTitle` -- a real title is a handful of characters, but nothing enforces that
+        // upstream, so an imported or pathological title is bounded too rather than appended
+        // verbatim and unbounded (a review finding: it used to bypass the whole budget with
+        // `wasTruncated` staying `false` regardless of the title's actual size).
+        let titleResult = MeetingTranscriptBudget.truncateTitle(meeting.title)
+        let promptText = titleResult.text.isEmpty
             ? budgetResult.transcript
-            : "Meeting title: \(titleHeader)\n\n\(budgetResult.transcript)"
+            : "Meeting title: \(titleResult.text)\n\n\(budgetResult.transcript)"
 
         let result: AIEnhancementResult
         do {
@@ -129,7 +132,7 @@ final class MeetingSummaryService {
                 conclusions: parsed.conclusions,
                 actionItems: parsed.actionItems,
                 participants: participants,
-                wasTruncated: budgetResult.wasTruncated
+                wasTruncated: budgetResult.wasTruncated || titleResult.wasTruncated
             )
         )
     }

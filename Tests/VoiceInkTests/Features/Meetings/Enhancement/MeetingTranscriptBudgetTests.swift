@@ -99,4 +99,19 @@ struct MeetingTranscriptBudgetTests {
         #expect(result.transcript.isEmpty)
         #expect(result.wasTruncated == false)
     }
+
+    @Test("an ordinary title is returned unchanged")
+    func ordinaryTitleIsUnchanged() {
+        let result = MeetingTranscriptBudget.truncateTitle("Sprint Planning")
+        #expect(result.text == "Sprint Planning")
+        #expect(result.wasTruncated == false)
+    }
+
+    @Test("an absurdly long title is hard-truncated to maxTitleLength, not sent unbounded")
+    func absurdTitleIsHardTruncated() {
+        let absurdTitle = String(repeating: "Quarterly Strategy Offsite ", count: 2_000)  // ~54,000 chars
+        let result = MeetingTranscriptBudget.truncateTitle(absurdTitle)
+        #expect(result.wasTruncated == true)
+        #expect(result.text.count <= MeetingTranscriptBudget.maxTitleLength)
+    }
 }

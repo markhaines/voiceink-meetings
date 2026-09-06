@@ -877,12 +877,21 @@ residual holes are stated there and accepted: passing a no-op canceller, and `un
 `.tandem/` dependency) handover document for the next stage, covering AEC/VAD wiring, rotation
 inputs/outputs, reconcile-before-format ordering, and diarizer preload/cancellation semantics,
 all cited against donor file/line references.
+
 ## phase-1-aec-dtln (Stage 1: Acoustic Echo Cancellation, DTLN path)
 
 Ports the donor's meeting AEC engine, DTLN path only (LocalVQE deferred; Apple Voice Processing
-I/O rejected — both settled by the Phase 1 AEC de-risk investigations at
-`.tandem/884f6ef6905c4e2aa4e2ca28c34ea629/{dtln-aec-viability,vpio-aec-spike}.md`, outside this
-repo): `Capture/MeetingNeuralAec.swift` (donor 796 lines, DTLN-only excision — 4 points: the
+I/O rejected — both settled by Phase 1 AEC de-risk investigations, whose findings are inlined
+here so they survive without any external report. **VPIO was rejected on the donor's own
+evidence**: Muesli shipped Apple VoiceProcessingIO in commit `75254c93` (2026-04-07) and
+reverted it in `01320aef` about 15 minutes later, with the revert message recording that VPIO's
+AEC "works but reduces speaker volume by 60-80% even at minimum ducking level. Users can't hear
+the meeting without headphones"; the very next donor commit adds the DTLN CoreML path. VPIO has
+no privileged reference for audio it does not itself render, so it compensates by ducking, and
+there is no public API to decouple cancellation from ducking. **LocalVQE was deferred** because
+its ggml dylibs are not in the donor repo and must be built from source
+(`scripts/build_localvqe.sh`); DTLN is the documented stopgap, with the LocalVQE follow-up
+recorded in `FOLLOWUPS.md`): `Capture/MeetingNeuralAec.swift` (donor 796 lines, DTLN-only excision — 4 points: the
 `preload()` LocalVQE-first branch removed, `MeetingAecProcessorSelection` trimmed 3→1 case, the
 `localvqe` special case in `referenceDelaySamples()` dropped, `LocalVQEProcessor.swift`/
 `LocalVQEBridge` never ported at all — delay estimator and buffer/trim machinery kept verbatim,
@@ -957,8 +966,10 @@ afterward resolved `DTLNAecCoreML` at `0.7.0` and left `Package.resolved` byte-i
 version already committed (the manual pin added ahead of this edit — see the AEC task report —
 matched exactly what a real Xcode resolution produces). `scripts/verify-package-trust.sh` passed
 unchanged. Debug build and the full local test run (`xcodebuild test`, CI's exact invocation)
-both succeeded afterward — see the AEC task report,
-`.tandem/884f6ef6905c4e2aa4e2ca28c34ea629/aec-dtln.md`, for the literal commands and output.
+both succeeded afterward. The literal commands were the same `xcodebuild` invocations CI runs
+(see `.github/workflows/ci.yml`); every hunk of the `project.pbxproj` diff was read back
+line by line and confirmed attributable to linking this one package (25 added lines, no
+reformatting, no `objectVersion` bump).
 
 ### 3. `dtln-aec-coreml` repinned from tag `0.7.0` to commit `ecb641d`, for a LICENSE fix
 
@@ -1053,7 +1064,10 @@ The instruction for this project caps ongoing upstream touchpoints (outside the 
 top of a clean base — it does not describe Phase 0 itself, whose entire job is editing
 upstream-owned files (identity, signing, Sparkle, delicensing) exactly once, up front, so later
 phases don't have to. This entry is long because Phase 0 is supposed to be long; Phase 1 onward
-should look nothing like this.
+should look nothing like this. Stage 1's own touchpoint count so far: 2 (Stage 0's bridging
+header, this stage's package link) — both one-time additions to a target's build graph, not
+recurring edits, and both logged with the same rationale: confirmed unavoidable, confirmed
+minimal, confirmed no live collision with a parallel agent.
 
 ## phase-1-capture-core (Stage 1: system audio capture core)
 
@@ -1097,10 +1111,6 @@ precedent by extracting `AudioSampleStats.swift` from the same donor file. It is
 the Stage 0 decision NOT to port `MeetingPromptStateMachine.swift`: that would have required
 inventing a placeholder for `MeetingCandidate`, a type belonging to a detection subsystem that
 has not been designed yet, which is a different act from lifting declarations verbatim.
-should look nothing like this. Stage 1's own touchpoint count so far: 2 (Stage 0's bridging
-header, this stage's package link) — both one-time additions to a target's build graph, not
-recurring edits, and both logged with the same rationale: confirmed unavoidable, confirmed
-minimal, confirmed no live collision with a parallel agent.
 
 ## meeting-recording-writer (Stage 1: retained mixed-recording writer)
 

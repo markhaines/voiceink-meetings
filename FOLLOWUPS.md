@@ -1,7 +1,8 @@
 # Follow-ups
 
-Known gaps deliberately left open, with the reasoning, so they are decisions rather than
-accidents. See each entry for the evidence.
+Known gaps and limitations deliberately left open, with the reasoning, so they are
+decisions rather than accidents. Not a task tracker: a record so they are not
+rediscovered from scratch later. See each entry for the evidence.
 
 ## `retainRecording` stays `false` on `meetings-ui-shell` -- turning it on today would be worse, not better
 
@@ -265,9 +266,6 @@ that specific failure is permanently lost. Worth fixing at the workflow level: a
 session results, code coverage, and logs:") so a future flaky-test investigation has the real
 bundle instead of reconstructing evidence from log text. Not done here — out of scope for this
 branch's immediate test-reliability fix.
-Known limitations and handover items surfaced during review, deliberately not fixed as part of
-the change that found them. Not a task tracker — just a record so they aren't rediscovered from
-scratch later.
 
 ## `pause()`/`resume()` can still leave a meeting row on the wrong `MeetingState`
 
@@ -659,4 +657,3 @@ audit above: extend the wait to cover the state actually being asserted, never a
 **Not fixed here:** the remaining 1s/2s deadlines in that file (lines ~211-258) gate on a single
 in-flight operation rather than N serialized ones, so their margins are far wider. If either ever
 flakes, apply the same reasoning rather than assuming a behavioural cause.
-

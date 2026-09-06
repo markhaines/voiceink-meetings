@@ -130,6 +130,47 @@
 //      There is no controller-only initializer: every way to build a mic stream supplies a
 //      canceller.
 //      (see `AttackA13` at the bottom of this file)
+//
+// ===========================================================================================
+// ATTACKS A14-A17 target a SEPARATE defeated shape: `MicVadStream.acceptFlushed(_ alreadyCleaned:
+// [Float])`, an internal method (not `AECCleanedMicSamples` itself) that took arbitrary floats
+// from ANY caller and minted a receipt for them -- "caller declares cleanliness" via a laundering
+// METHOD rather than via the receipt type's constructibility. It is DELETED outright and replaced
+// by `flushCanceller()`, which takes no floats at all and drains `echoCanceller` (this instance's
+// OWN canceller) itself. These attacks probe that the deletion is real and that the replacement
+// cannot be reopened into the same shape from outside this file.
+// ===========================================================================================
+//
+// A14. Calling the deleted method by its old name.
+//      `_ = micStream.acceptFlushed([Float](repeating: 0, count: 1))`
+//      -> error: value of type 'MicVadStream' has no member 'acceptFlushed'
+//      (see `AttackA14` at the bottom of this file)
+//
+// A15. Reintroducing the exact defeated shape from another file: an extension on `MicVadStream`
+//      adding a method that takes arbitrary floats and mints a receipt for them by calling
+//      `AECCleanedMicSamples`'s initializer directly. This is attack A1 wearing a different call
+//      site (a method body instead of a bare expression), and fails for the identical reason:
+//      the initializer is `fileprivate` to MeetingVadStreams.swift, so no other file -- an
+//      extension included -- can reach it, regardless of which type or method is doing the
+//      calling.
+//      `extension MicVadStream { func launder(_ f: [Float]) -> AECCleanedMicSamples { AECCleanedMicSamples(f) } }`
+//      -> error: 'AECCleanedMicSamples' initializer is inaccessible due to 'fileprivate'
+//         protection level
+//      (see `AttackA15` at the bottom of this file)
+//
+// A16. Reaching the canceller directly instead of through `flushCanceller()`, to drive it with
+//      caller-chosen timing/arguments from outside. `echoCanceller` is `private`, not merely
+//      unexposed by convention:
+//      `extension MicVadStream { func peek() -> MicEchoCanceller { echoCanceller } }`
+//      -> error: 'echoCanceller' is inaccessible due to 'private' protection level
+//      (see `AttackA16` at the bottom of this file)
+//
+// A17. Subclassing to override `flushCanceller()` with a version that accepts injected floats.
+//      `MicVadStream` is `final`:
+//      `private final class Sub: MicVadStream {}` reached via
+//      `class NotFinal: MicVadStream {}`
+//      -> error: inheritance from a final class 'MicVadStream'
+//      (see `AttackA17` at the bottom of this file)
 
 import FluidAudio
 import Foundation
@@ -145,17 +186,23 @@ private final class StubEchoCanceller: MicEchoCanceller, @unchecked Sendable {
 
     private let lock = NSLock()
     private var micCallCount = 0
+    private var flushCallCount = 0
     private var systemFedSamples: [[Float]] = []
     private let cleanedForMic: [Float]
     private let cleanedForDrain: [Float]
+    private let cleanedForFlush: [Float]
 
     /// - Parameters:
     ///   - cleanedForMic: what `processStreamingMic` returns for a non-empty input.
     ///   - cleanedForDrain: what it returns for the empty-input drain call that follows a
     ///     far-end reference feed.
-    init(cleanedForMic: [Float], cleanedForDrain: [Float] = []) {
+    ///   - cleanedForFlush: what `flushStreamingMic` returns -- the samples this canceller
+    ///     claims were still buffered internally. Distinct from the other two so a test can
+    ///     tell which path produced a given receipt.
+    init(cleanedForMic: [Float], cleanedForDrain: [Float] = [], cleanedForFlush: [Float] = []) {
         self.cleanedForMic = cleanedForMic
         self.cleanedForDrain = cleanedForDrain
+        self.cleanedForFlush = cleanedForFlush
     }
 
     func processStreamingMic(_ rawMicSamples: [Float]) -> [Float] {
@@ -167,7 +214,13 @@ private final class StubEchoCanceller: MicEchoCanceller, @unchecked Sendable {
         lock.withLock { systemFedSamples.append(systemSamples) }
     }
 
+    func flushStreamingMic() -> [Float] {
+        lock.withLock { flushCallCount += 1 }
+        return cleanedForFlush
+    }
+
     var micCalls: Int { lock.withLock { micCallCount } }
+    var flushCalls: Int { lock.withLock { flushCallCount } }
     var fedSystemBuffers: [[Float]] { lock.withLock { systemFedSamples } }
 }
 
@@ -283,6 +336,45 @@ struct MeetingVadStreamsTests {
         #expect(canceller.fedSystemBuffers == [systemAudio])
         #expect(await probe.recordedBuffers.first?.allSatisfy { $0 == StubEchoCanceller.marker } == true)
         #expect(receipt.samples == drained)
+    }
+
+    /// `flushCanceller()` replaces the deleted `acceptFlushed(_ alreadyCleaned: [Float])` --
+    /// see this file's header, attacks A14-A17. The property under test is the inversion itself:
+    /// `MicVadStream` calls `echoCanceller.flushStreamingMic()` ITSELF and mints the receipt from
+    /// that call's own result, so there is no floats parameter for a caller to have supplied
+    /// anything through in the first place. Matches `acceptFlushed`'s old, still-correct
+    /// contract otherwise: does not drive the wrapped VAD controller (donor
+    /// `appendCleanedMicSamplesOnQueue` never does, for any flushed/cleaned buffer).
+    @Test("MicVadStream.flushCanceller drains its OWN canceller and does not drive the VAD")
+    func micStreamFlushesOwnCancellerWithoutDrivingVad() async throws {
+        let flushed = [Float](repeating: StubEchoCanceller.marker, count: VadManager.chunkSize)
+        let canceller = StubEchoCanceller(cleanedForMic: [], cleanedForFlush: flushed)
+        let probe = VadStreamProbe()
+        let controller = StreamingVadController(
+            minChunkDuration: 0,
+            maxChunkDuration: 3600,
+            makeInitialState: { VadStreamState.initial() },
+            processStreamChunk: { samples, state in
+                await probe.record(samples: samples)
+                return VadStreamResult(state: state, event: nil, probability: 0.0)
+            }
+        )
+        let micStream = MicVadStream(controller: controller, echoCanceller: canceller)
+
+        micStream.start()
+        let receipt = micStream.flushCanceller()
+        try? await Task.sleep(for: .milliseconds(200))
+        micStream.stop()
+
+        // The receipt carries exactly what the CANCELLER produced from its own internal
+        // buffer -- there is no caller-supplied buffer in this call at all.
+        #expect(receipt.samples == flushed)
+        #expect(canceller.flushCalls == 1)
+        // Matches acceptFlushed's old contract: this call never touches the wrapped controller.
+        #expect(await probe.recordedBuffers.isEmpty)
+
+        // Attack A14 (see file header): the deleted method name must no longer resolve.
+        // _ = micStream.acceptFlushed([Float](repeating: 0, count: 1))
     }
 
     @Test("SystemVadStream forwards RawSystemSamples to the wrapped controller")
@@ -509,6 +601,49 @@ struct MeetingVadStreamsTests {
 //
 // private func attackA13(controller: StreamingVadController) -> MicVadStream {
 //     MicVadStream(controller: controller)
+// }
+
+// Attack A14 -- calling the deleted `acceptFlushed` by its old name. Left inline in
+// `micStreamFlushesOwnCancellerWithoutDrivingVad` above (needs a live `micStream` value) rather
+// than at top level here:
+//   error: value of type 'MicVadStream' has no member 'acceptFlushed'
+
+// Attack A15 -- reintroducing the defeated "caller supplies floats" shape via an extension on
+// MicVadStream (rather than a bare top-level expression, unlike A1) that constructs the receipt
+// directly. Fails for the same reason as A1: the initializer is fileprivate to
+// MeetingVadStreams.swift, and that does not change depending on which type's extension is
+// doing the calling.
+//   error: 'AECCleanedMicSamples' initializer is inaccessible due to 'fileprivate' protection
+//          level
+//
+// extension MicVadStream {
+//     func attackA15Launder(_ floats: [Float]) -> AECCleanedMicSamples {
+//         AECCleanedMicSamples(floats)
+//     }
+// }
+
+// Attack A16 -- reaching the canceller directly from another file, to drive it with
+// caller-chosen arguments/timing outside `flushCanceller()`'s own call:
+//   error: 'echoCanceller' is inaccessible due to 'private' protection level
+//
+// extension MicVadStream {
+//     func attackA16PeekCanceller() -> MicEchoCanceller {
+//         echoCanceller
+//     }
+// }
+
+// Attack A17 -- subclassing to override `flushCanceller()` with a version that accepts injected
+// floats. `MicVadStream` is `final`. This one is doubly blocked: the class declaration itself
+// fails, AND (Swift still typechecks the body) the injected-floats construction inside it hits
+// the same fileprivate wall as A1/A15:
+//   error: inheritance from a final class 'MicVadStream'
+//   error: 'AECCleanedMicSamples' initializer is inaccessible due to 'fileprivate' protection
+//          level
+//
+// private class AttackA17Sub: MicVadStream {
+//     func attackFlush() -> AECCleanedMicSamples {
+//         AECCleanedMicSamples([Float](repeating: 0, count: 1))
+//     }
 // }
 
 private actor VadStreamProbe {

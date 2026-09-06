@@ -146,6 +146,12 @@ protocol MicEchoCanceller: AnyObject {
     /// Supplies system (far-end) audio as the reference signal AEC cancels against. Returns
     /// nothing: cleaned mic output is collected via `processStreamingMic`.
     func feedSystemSamples(_ systemSamples: [Float])
+
+    /// Flushes any samples still buffered inside the canceller (zero-padded to a frame
+    /// boundary), already AEC-cleaned by definition -- they came out of an earlier
+    /// `processStreamingMic` call and were held back only because cleaned output can lag the
+    /// far-end reference. `MicVadStream.flushCanceller()` is the only caller; see that method.
+    func flushStreamingMic() -> [Float]
 }
 
 /// Raw mic samples straight off the capture callback, before any AEC. Freely constructible on
@@ -263,6 +269,30 @@ final class MicVadStream: @unchecked Sendable {
             controller.processAudio(drained)
         }
         return AECCleanedMicSamples(drained)
+    }
+
+    /// Flushes any samples still buffered inside the owned canceller and wraps them in the same
+    /// unforgeable receipt type, without driving the wrapped VAD controller. For pause/stop
+    /// (donor `appendFlushedStreamingMicOnQueue`, `MeetingSession.swift:1264-1266`): samples
+    /// already produced by `MicEchoCanceller.processStreamingMic` on an earlier call, buffered
+    /// inside the canceller, and only now drained. Re-running `process(_:)` on them would put
+    /// them through AEC a second time; that is what this entry point exists to avoid.
+    ///
+    /// Deliberately calls `echoCanceller.flushStreamingMic()` itself rather than accepting a
+    /// caller-supplied `[Float]` — see this file's header, "WHAT THE PREVIOUS TWO ATTEMPTS DID,
+    /// AND WHY EACH FAILED": a method that takes arbitrary floats and returns the receipt is
+    /// exactly the "caller declares cleanliness" shape that keeps losing. Minting only from a
+    /// call this file itself makes keeps minting genuinely file-local.
+    ///
+    /// Matches the donor precisely: `appendCleanedMicSamplesOnQueue`
+    /// (`MeetingSession.swift:1267-1278`), the function every flushed/cleaned buffer funnels
+    /// through, never calls `vadController.processAudio` itself — only the two real-time
+    /// callback sites do. So this method intentionally does not touch `controller` either; it
+    /// exists solely to let already-cleaned samples re-enter the typed funnel so the mic
+    /// `PCMChunkRecorder` equivalent never diverges from what the VAD saw. See
+    /// `meeting-session-port-plan.md` section 3's AEC bullet, which flagged this exact gap.
+    func flushCanceller() -> AECCleanedMicSamples {
+        AECCleanedMicSamples(echoCanceller.flushStreamingMic())
     }
 }
 

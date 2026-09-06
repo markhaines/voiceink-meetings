@@ -33,6 +33,8 @@ make local LOCAL_CODESIGN_IDENTITY=-
 
 Local builds do not include iCloud dictionary sync or automatic updates. Ad-hoc builds may require macOS permissions again after rebuilding.
 
+`LOCAL_XCODEBUILD_FLAGS` defaults to `-skipPackagePluginValidation -onlyUsePackageVersionsFromResolvedFile` (the same flags CI passes), so a bare `make local` builds on a Mac with no GUI trust dialog to click through. Override it if you need something different, e.g. `LOCAL_XCODEBUILD_FLAGS="" make local` to get the interactive Xcode trust prompts instead.
+
 ## Other Commands
 
 - `make check` — verify required tools

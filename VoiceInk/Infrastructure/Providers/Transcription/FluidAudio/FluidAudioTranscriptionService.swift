@@ -121,6 +121,63 @@ class FluidAudioTranscriptionService: TranscriptionService {
         }
     }
 
+    // Fork-owned accessor (FORK-PATCHES.md touchpoint 4, "meeting-transcription-coordinator
+    // fix round 3"): lets the meeting transcription seam reuse the SAME loaded `AsrManager`
+    // dictation uses, instead of loading an independent second copy of the Parakeet models.
+    // Authorised specifically to avoid that duplication on Mark's 16GB M2 Pro.
+    //
+    // SAFETY -- what this accessor guarantees, and how, stated as what the code cannot do
+    // rather than as a convention:
+    //
+    // This class has no actor isolation of its own. `ensureModelsLoaded(for:)`,
+    // `cleanupLoadedManagers()` and `transcribe(audioURL:model:context:)` all suspend, so
+    // initiating a call on `@MainActor` does NOT serialize the operations against each other --
+    // a second call can and does interleave at any `await` inside a first. Round 2 of this
+    // accessor took `version` and called `ensureModelsLoaded(for:)`, so a meeting asking for a
+    // version dictation did not have loaded ran `cleanupLoadedManagers()` -- including
+    // `asrManager.cleanup()`, which nils out the CoreML models -- underneath a dictation that
+    // was suspended inside `AsrManager.transcribe`. That is a live-dictation failure, and
+    // "callers initiate on `@MainActor`" does not prevent it.
+    //
+    // This version removes the ability rather than documenting the hazard:
+    //   * It is NOT `async` and NOT `throws`. Its whole body is two stored-property reads and a
+    //     tuple construction, so it contains no suspension point at which anything can
+    //     interleave. It runs to completion between two of the caller's own instructions.
+    //   * It takes NO parameter. There is no argument by which a caller could name a model
+    //     version other than the one already loaded, so "the meeting requested a version
+    //     switch" is not an expressible call.
+    //   * It calls nothing. Not `ensureModelsLoaded`, not `getOrLoadModels`, not
+    //     `cleanupLoadedManagers`. Those are `private` to this file, and
+    //     `scripts/negative-controls/FluidAudioServicePrivateEvictionAttack.swift` is compiled
+    //     into the app target on every CI run and MUST NOT COMPILE, which is what keeps that
+    //     true rather than conventional.
+    //
+    // WHAT THIS ACCESSOR DOES NOT DO, corrected in fix round 5 because the previous wording of
+    // this very comment was the mistake: it does NOT stop a holder of THIS CLASS from calling
+    // `cleanup()`. That method is `internal`, not `private`, and rounds 3 and 4 both wrote a
+    // parenthetical here -- "is called from no meeting file" -- which is a convention sitting
+    // inside a paragraph claiming enforcement. Review defeated that twice. The actual defence
+    // lives on the other side of the seam and is not a property of this accessor at all: the
+    // meeting adapter is handed a `MeetingAsrRuntimeAccess` value (two closures, see
+    // `MeetingAsrSharing.swift`) and never the concrete service, so it cannot name `cleanup()`
+    // and cannot recover a reference that could -- not by member lookup, not by coercion, and
+    // not by `as?`, which is what defeated round 4's protocol-existential version.
+    //
+    // Consequence, deliberately accepted: the meeting seam is PINNED to whatever version
+    // dictation already has loaded, and returns nil when nothing is loaded (the caller then
+    // degrades to the coordinator's flat-fallback path). Getting a model loaded stays entirely
+    // dictation's job, through the existing `loadModel(for:)` API that `VoiceInkEngine` already
+    // calls at recording start. See FOLLOWUPS.md for what a composition root must therefore do.
+    //
+    // The reverse direction is NOT closed and is not claimed to be: dictation switching models
+    // still evicts a manager a meeting is mid-way through using. That asymmetry is the point --
+    // protecting the daily dictation flow outranks a meeting chunk, and a failed meeting chunk
+    // degrades to the flat-fallback transcript rather than losing the recording.
+    func borrowedAsrManager() -> (manager: AsrManager, version: AsrModelVersion)? {
+        guard let asrManager, let activeVersion else { return nil }
+        return (asrManager, activeVersion)
+    }
+
     func loadModel(for model: FluidAudioModel) async throws {
         if FluidAudioModelManager.isNemotronModel(named: model.name) {
             // Realtime Nemotron uses a dedicated streaming manager; batch loads lazily in transcribe().

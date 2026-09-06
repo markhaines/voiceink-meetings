@@ -873,3 +873,10 @@ struct MeetingAecDelayEstimator {
         return weighted.last?.delaySamples ?? 0
     }
 }
+
+// MeetingEngine (Workflows/) needs an object satisfying MicVadStream's MicEchoCanceller
+// requirement to drive the mic VAD from AEC-cleaned samples only (ADAPTER-HANDOVER.md
+// section 1). MeetingNeuralAec already implements both required methods with matching
+// signatures; this is the conformance declaration MeetingVadStreams.swift's own header
+// flagged as "not yet retrofitted onto MeetingNeuralAec" -- no behavior change here.
+extension MeetingNeuralAec: MicEchoCanceller {}

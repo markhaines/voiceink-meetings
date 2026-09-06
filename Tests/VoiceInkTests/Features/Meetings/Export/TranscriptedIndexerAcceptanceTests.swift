@@ -33,11 +33,23 @@
 // reports as passing, indistinguishable in `xcodebuild`'s summary from a real pass. A green CI
 // run therefore proved NOTHING about whether the real indexer ever actually ran.
 //
-// ROUND 5 — CLOSED, by adopting PR #19's (`phase2-realmodel-smoke`, merged to `main`) exact
-// gate-running-mode idiom rather than inventing a second one: same shape
-// (`.disabled(if: <prerequisite missing> && !isGateRunningMode, "...")`), same two-name split,
-// same failure behavior. See `RealModelSmokeTests.swift` for the sibling this was copied from,
-// and FOLLOWUPS.md's "Gate-running modes" central list for the repo-wide registry of these flags.
+// ROUND 5 — CLOSED the required-gate gap by adopting PR #19's (`phase2-realmodel-smoke`,
+// merged to `main`) TWO-NAME CONVENTION and its prerequisite-plus-gate-mode expression
+// (`.disabled(if: <prerequisite missing> && !isGateRunningMode, "...")`) rather than inventing
+// a second one. See `RealModelSmokeTests.swift` for the sibling this was modeled on, and
+// FOLLOWUPS.md's "Gate-running modes" central list for the repo-wide registry of these flags.
+//
+// ROUND 6 CORRECTION — this does NOT copy that sibling's idiom end to end, and Round 5 claiming
+// "same failure behavior" was itself a defect. `RealModelSmokeTests` also carries an
+// INDEPENDENT, UNCONDITIONAL `.disabled(if: isRunningInCI, ...)` trait that no gate-mode flag
+// can override — on `main`, explicit gate mode there still skips under CI detection. This file
+// DELIBERATELY OMITS an equivalent CI-disable trait, so
+// `TEST_RUNNER_TRANSCRIPTED_ACCEPTANCE_GATE_MODE=1` overrides CI (or any other environment)
+// here. That is Mark's explicit ruling, not an oversight: gate mode exists so an explicitly
+// requested proof fails loudly when the environment cannot satisfy it — letting an unrelated
+// CI-detection flag silently downgrade a requested gate back into a skip would be the exact
+// false assurance this mechanism exists to eliminate. `RealModelSmokeTests` itself is expected
+// to be realigned to this same rule in a separate change — not this file's to make.
 //
 // THE COMMAND TO RUN, copy it exactly — this is the ONLY form that actually engages gate mode
 // from outside the test process:
@@ -67,13 +79,16 @@
 // `TEST_RUNNER_TRANSCRIPTED_ACCEPTANCE_GATE_MODE=1` set on the `xcodebuild` invocation, this
 // test passing means the real `transcripted-mcp` binary actually ran against a file this
 // exporter wrote and produced real counts — a missing binary fails the run instead of skipping
-// it. What it does NOT guarantee: it does not change ordinary runs where gate mode is NOT
-// engaged (every CI run, every plain local `xcodebuild test`) — a machine without Mark's
-// Transcripted app installed still skips cleanly there, which remains correct, desired
-// convenience behavior for a fresh clone or CI runner, not a new guarantee. CI has never had the
-// binary and is not expected to gain it, so CI never sets this flag — gate mode is for a real
-// Mac with the binary present (the mini, so far), run by hand when the point is to prove nothing
-// was skipped.
+// it, IN EVERY ENVIRONMENT INCLUDING CI, because this file (unlike `RealModelSmokeTests`) has
+// no CI-disable trait for gate mode to be overridden by. What it does NOT guarantee: it does not
+// change an ORDINARY run where gate mode is NOT engaged — a machine without Mark's Transcripted
+// app installed (a fresh clone, or a CI runner) still skips cleanly there, which remains
+// correct, desired convenience behavior, not a new guarantee. The current default CI
+// configuration does not set this flag, so an ordinary CI run skips as just described — but
+// nothing here stops a CI-style run from setting it and demanding proof instead (see
+// `TRANSCRIPTED_ACCEPTANCE.md`'s note that a CI-style run CAN demand this proof). Gate mode is
+// for whoever wants to prove nothing was skipped, on a machine with the binary present (the
+// mini, so far), by hand or in CI.
 
 import Foundation
 import Testing

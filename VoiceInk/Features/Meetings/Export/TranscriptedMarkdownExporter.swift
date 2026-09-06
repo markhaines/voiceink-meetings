@@ -394,13 +394,29 @@ enum TranscriptSanitizer {
     ///
     /// - Losslessly representable AS FAR AS THE ASTERISK PASS IS CONCERNED: no asterisk at all
     ///   (`"Jane Doe"`, `"D'Angelo"`), and any lone asterisk (`"a*b"`, `"*Mark*"`, `"* *"`). Each
-    ///   of these round-trips byte-identically through the real rule ONCE whitespace has been
-    ///   collapsed and control characters dropped — the normalization above always runs first
-    ///   and can change these inputs (`" Jane  Doe "` loses its extra spacing; a NUL byte is
-    ///   removed), so the guarantee is byte-identical to that already-normalized value, not to
-    ///   the raw input. Transforming the normalized value further would corrupt input that was
-    ///   never at risk, so the asterisk pass makes no additional change to it — enforced by the
-    ///   early return below, not merely intended.
+    ///   of these round-trips byte-identically through the real rule ONCE the normalization
+    ///   above has run — named exactly, not just described, so the claim is falsifiable: (1)
+    ///   every Unicode scalar for which `CharacterSet.whitespacesAndNewlines.contains(scalar)`
+    ///   is true becomes a single ASCII space (U+0020); this check runs BEFORE the
+    ///   control-character check, so a scalar in both sets (TAB, LF, CR, NEL U+0085 are in
+    ///   both `whitespacesAndNewlines` and `controlCharacters`) is normalized to a space here,
+    ///   never dropped by step (2); `whitespacesAndNewlines` also covers non-ASCII space
+    ///   separators (verified directly, not assumed from documentation: NO-BREAK SPACE U+00A0,
+    ///   LINE SEPARATOR U+2028, and IDEOGRAPHIC SPACE U+3000 all test `true` and are each
+    ///   normalized to a plain space exactly like ASCII whitespace — see
+    ///   `nonASCIIUnicodeWhitespaceNormalizesLikeASCIIWhitespace` for the pinned cases). (2) any
+    ///   scalar step (1) did not already consume for which
+    ///   `CharacterSet.controlCharacters.contains(scalar)` is true — genuinely non-whitespace
+    ///   controls such as NUL — is dropped outright. (3) the result of (1)+(2), which now
+    ///   contains only U+0020 as whitespace, is split on `CharacterSet.whitespaces`, empty
+    ///   components are filtered out, and the parts are rejoined with a single `" "` — this
+    ///   collapses any run (including one step (1) just created) and strips leading/trailing
+    ///   whitespace. Each of `" Jane  Doe "`, `"*\u{0000}a"`, `"Jane\u{00A0}Doe"`, `"*\u{2028}*"`
+    ///   and `"*\u{3000}*"` is changed by steps (1)-(3) and is NOT returned byte-identical to
+    ///   what was typed — the guarantee is byte-identical to the value steps (1)-(3) produce,
+    ///   never to the raw input. Transforming that already-normalized value further would
+    ///   corrupt input that was never at risk, so the asterisk pass (4) makes no additional
+    ///   change to it — enforced by the early return below, not merely intended.
     /// - Not representable at all: a run of 2+ asterisks. Whatever is written, the indexer
     ///   deletes pairs from it, so no run of 2+ can survive. There is no encoding that fixes
     ///   this, because the indexer performs NO unescaping of any kind — not Markdown, not

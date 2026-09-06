@@ -701,6 +701,44 @@ struct TranscriptedMarkdownExporterTests {
         )
     }
 
+    // MARK: - Round 6: the whitespace predicate must be named, not just "whitespace"
+
+    /// ROUND 6 FIX. Round 5's "normalizes whitespace" claim named an effect, not a predicate — a
+    /// reader could not tell whether NO-BREAK SPACE (U+00A0) or LINE SEPARATOR (U+2028) count as
+    /// "whitespace" here without reading the source. The doc comment on `speakerLabel` and
+    /// `TRANSCRIPTED_ACCEPTANCE.md` now both name the exact predicate:
+    /// `CharacterSet.whitespacesAndNewlines.contains(scalar)`, checked before
+    /// `CharacterSet.controlCharacters`. This test verifies, rather than assumes, that three
+    /// representative NON-ASCII members of that set — U+00A0 (Zs, the most common non-ASCII
+    /// space), U+2028 (Zl, LINE SEPARATOR — a different Unicode general category from the
+    /// others, included only via the explicit "newlines" half of the set's name), and U+3000
+    /// (Zs, IDEOGRAPHIC SPACE, the common CJK full-width space) — all normalize identically to
+    /// ASCII whitespace: replaced with a single U+0020 by step (1), then collapsed/trimmed by
+    /// step (3), exactly like `" "`, `"\t"`, or `"\n"`. No divergence was found; the exact output
+    /// for each case is pinned below rather than left to prose.
+    @Test(
+        "non-ASCII Unicode whitespace (NO-BREAK SPACE, LINE SEPARATOR, IDEOGRAPHIC SPACE) normalizes exactly like ASCII whitespace, not left as an unpredictable pass-through",
+        arguments: [
+            ("Jane\u{00A0}Doe", "Jane Doe"),          // U+00A0 NO-BREAK SPACE, mid-label
+            ("*\u{00A0}*", "* *"),                    // U+00A0 as the sole separator
+            ("*\u{2028}*", "* *"),                    // U+2028 LINE SEPARATOR (Zl, not Zs)
+            ("*\u{3000}*", "* *"),                    // U+3000 IDEOGRAPHIC SPACE (CJK full-width)
+            ("\u{00A0}Mark\u{00A0}", "Mark"),         // leading/trailing NBSP is trimmed, not kept
+        ]
+    )
+    func nonASCIIUnicodeWhitespaceNormalizesLikeASCIIWhitespace(rawLabel: String, normalizedValue: String) {
+        let scalarNames = rawLabel.unicodeScalars.map { String(format: "U+%04X", $0.value) }
+        let actual = TranscriptSanitizer.speakerLabel(rawLabel)
+        #expect(
+            actual == normalizedValue,
+            "expected non-ASCII whitespace in \(scalarNames) to normalize to \(normalizedValue.debugDescription), got \(actual.debugDescription)"
+        )
+        #expect(
+            TranscriptSanitizer.speakerLabel(rawLabel) != rawLabel,
+            "non-ASCII whitespace must not round-trip byte-identically to raw input, same as ASCII whitespace"
+        )
+    }
+
     /// The documented policy itself, at unit level: runs of 2+ collapse to exactly one `*`,
     /// lone asterisks survive, and the collapse runs AFTER control-character removal so a
     /// control character sitting between two asterisks cannot smuggle a new `**` run past it.

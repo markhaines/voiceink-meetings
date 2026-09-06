@@ -29,7 +29,7 @@ prerequisite quietly skips and reports green.
 | Flag (external, `TEST_RUNNER_`-prefixed) | Test file | Status |
 |---|---|---|
 | `TEST_RUNNER_REALMODEL_SMOKE_GATE_MODE` | `Tests/VoiceInkTests/Features/Meetings/Transcription/RealModelSmokeTests.swift` | Live (2026-09-06) |
-| `TEST_RUNNER_TRANSCRIPTED_ACCEPTANCE_GATE_MODE` | `Tests/VoiceInkTests/Features/Meetings/Export/TranscriptedIndexerAcceptanceTests.swift` | Live (2026-09-06) -- adopted this exact idiom from PR #19 once it merged to `main`; see `TRANSCRIPTED_ACCEPTANCE.md` and that test file's header for the real-binary prerequisite this one gates on. |
+| `TEST_RUNNER_TRANSCRIPTED_ACCEPTANCE_GATE_MODE` | `Tests/VoiceInkTests/Features/Meetings/Export/TranscriptedIndexerAcceptanceTests.swift` | Live (2026-09-06) -- adopted this sibling's two-name convention once PR #19 merged to `main`, but DELIBERATELY WITHOUT its independent CI-disable trait, so gate mode overrides CI here (Mark's ruling; `RealModelSmokeTests` is expected to be realigned to this rule separately). See `TRANSCRIPTED_ACCEPTANCE.md` and that test file's header for the real-binary prerequisite this one gates on, and for the full reasoning. |
 
 **Canonical command, run every gate-running mode this repo has together** (harmless for any not
 yet defined -- an env var nothing reads is simply ignored):

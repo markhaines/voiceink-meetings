@@ -21,13 +21,26 @@ and `parseFrontmatterSpeakers`, both read from source). So a run of two or more 
 asterisks in a speaker label CANNOT be represented: whatever the file stores is what a reader
 sees, and any `**` in it is silently deleted on the way into the index.
 
-`TranscriptSanitizer.speakerLabel` first normalizes whitespace (collapsing runs, converting
-newlines to spaces) and drops control characters, THEN collapses each run of 2+ asterisks to a
-single `*` in that already-normalized value. For everything else — a lone `*` included — the
-asterisk pass makes no additional change: the result is byte-identical to the
-whitespace/control-normalized value, not to the raw input (`" Jane  Doe "` and `"*\u{0}a"` are
-not returned byte-identical to what was typed; only the final asterisk step is a no-op for
-them). That asterisk pass is deterministic and idempotent, and it is deliberately, visibly
+`TranscriptSanitizer.speakerLabel` runs THREE steps, named exactly so the claim below is
+falsifiable rather than descriptive: (1) every Unicode scalar for which
+`CharacterSet.whitespacesAndNewlines.contains(scalar)` is true becomes a single ASCII space
+(U+0020) — checked BEFORE the control-character check, so TAB/LF/CR/NEL (U+0085), which are in
+BOTH `whitespacesAndNewlines` and `controlCharacters`, are normalized to a space here and never
+reach step (2); `whitespacesAndNewlines` also covers non-ASCII space separators, verified
+directly rather than assumed: NO-BREAK SPACE U+00A0, LINE SEPARATOR U+2028, and IDEOGRAPHIC
+SPACE U+3000 all test `true` and are each normalized to a plain space exactly like ASCII
+whitespace, with no divergence found. (2) any remaining scalar for which
+`CharacterSet.controlCharacters.contains(scalar)` is true — genuinely non-whitespace controls
+such as NUL, which step (1) does not touch — is dropped outright. (3) the result, which now
+contains only U+0020 as whitespace, is split on `CharacterSet.whitespaces`, empty components
+are filtered out, and the parts are rejoined with one `" "` — collapsing any run (including one
+step (1) just created) and stripping leading/trailing whitespace. THEN, and only then, each run
+of 2+ asterisks in that already-normalized value is collapsed to a single `*`. For everything
+else — a lone `*` included — that asterisk pass makes no additional change: the result is
+byte-identical to the value steps (1)-(3) produce, not to the raw input. None of `" Jane  Doe "`,
+`"*\u{0}a"`, `"Jane\u{00A0}Doe"`, `"*\u{2028}*"`, or `"*\u{3000}*"` is returned byte-identical to
+what was typed — only the value steps (1)-(3) produce is what the final asterisk step is a no-op
+against. That asterisk pass is deterministic and idempotent, and it is deliberately, visibly
 lossy: `**Mark**` is exported and indexed as
 `*Mark*`, and `**` and `****` alike become `*`. Run length is not recoverable. Two earlier
 designs failed here — preserving `**` let the indexer silently rename the speaker; escaping
@@ -51,20 +64,33 @@ suite that can catch a defect the conformance tests, by construction, cannot: a 
 between the real binary's actual behavior and the `ReferenceIndexerParser` port of it (a stale
 port, a build the port doesn't match, a bug specific to the real binary).
 
-**On an ORDINARY run — every CI run, every plain local `xcodebuild test` — this still SKIPS on
-any machine without Mark's Transcripted app installed, including CI.** A skipped test reports as
-passing in `xcodebuild`'s summary, indistinguishable from a real pass. That remains correct,
-desired convenience behavior: CI has never had the binary and is not expected to gain it. **A
-reader must not conclude, from an ordinary green CI run, that the real-indexer check executed.**
+**On an ORDINARY run — gate mode NOT set, which is what the current default CI configuration
+does, and what every plain local `xcodebuild test` does — this still SKIPS on any machine
+without Mark's Transcripted app installed.** A skipped test reports as passing in `xcodebuild`'s
+summary, indistinguishable from a real pass. That remains correct, desired convenience behavior:
+the binary has never been on CI and is not expected to be. **A reader must not conclude, from an
+ordinary green CI run (one that did not set the gate-mode flag below), that the real-indexer
+check executed.**
 
 **ROUND 5: this test now has a required GATE-RUNNING MODE, closing that gap for anyone who
-deliberately wants proof.** It adopts the exact idiom `RealModelSmokeTests.swift`
-(`Tests/VoiceInkTests/Features/Meetings/Transcription/RealModelSmokeTests.swift`) built for this
-same shape of problem in PR #19 (`phase2-realmodel-smoke`, merged to `main`) — the same
-`.disabled(if: <prerequisite missing> && !isGateRunningMode, "...")` trait shape, the same
-two-name split, the same failure behavior — rather than growing a second, competing mechanism.
-See FOLLOWUPS.md's "Gate-running modes" central list for the repo-wide registry of every one of
-these flags.
+deliberately wants proof.** It adopts `RealModelSmokeTests.swift`'s
+(`Tests/VoiceInkTests/Features/Meetings/Transcription/RealModelSmokeTests.swift`, from PR #19
+`phase2-realmodel-smoke`, merged to `main`) TWO-NAME CONVENTION and its
+prerequisite-plus-gate-mode expression (`.disabled(if: <prerequisite missing> &&
+!isGateRunningMode, "...")`) rather than growing a second, competing mechanism.
+
+**ROUND 6 CORRECTION: this is NOT that sibling's exact idiom, and Round 5 saying "the same
+failure behavior" was itself imprecise, corrected here.** `RealModelSmokeTests` also carries an
+INDEPENDENT, UNCONDITIONAL CI-disable trait (`.disabled(if: isRunningInCI, ...)`) that no
+gate-mode flag can override — on `main`, explicit gate mode there still skips under CI
+detection. This test DELIBERATELY OMITS an equivalent CI-disable trait, so
+`TEST_RUNNER_TRANSCRIPTED_ACCEPTANCE_GATE_MODE=1` overrides CI (or any other environment) here —
+Mark's explicit ruling: gate mode exists so an explicitly requested proof fails loudly when the
+environment cannot satisfy it, because otherwise an environment variable the caller may not even
+know about could silently downgrade a requested gate into a skip, which is the exact false
+assurance this mechanism exists to eliminate. `RealModelSmokeTests` is expected to be realigned
+to this same rule in a separate change, not this file's to make. See FOLLOWUPS.md's
+"Gate-running modes" central list for the repo-wide registry of every one of these flags.
 
 **Set the EXTERNAL, `TEST_RUNNER_`-prefixed form on the `xcodebuild` invocation — this is the
 thing to copy:**
@@ -96,8 +122,10 @@ instead of trusting prose.
 The conformance tests prove this exporter's output matches a *reference copy* of the real
 regex/chunking rule. They cannot prove the real binary agrees, because that reference copy
 could itself be stale, wrong, or drift from a real binary rebuild. Only actually running the
-real binary against real output closes that gap — which is exactly why it matters that this
-check currently has no required mode: without one, that gap stays open on every CI run.
+real binary against real output closes that gap — which is exactly why the required gate mode
+above matters: on an ordinary run where gate mode is not set (the current default CI
+configuration's own runs included), that gap stays open, same as it would for any other
+prerequisite-gated real-hardware/real-binary check.
 
 ## Recipe (safe to re-run by hand)
 

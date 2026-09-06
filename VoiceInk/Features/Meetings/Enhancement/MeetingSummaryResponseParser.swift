@@ -44,10 +44,12 @@
 //       line can be ambiguous about. Item boundaries come from exactly two unambiguous signals:
 //       a bullet marker, and a blank line. See `parseList` for the three cases and which one
 //       refuses.
-//   * INDENTATION STYLE MUST BE CONSISTENT WITHIN A LIST SECTION. Depth is compared in
-//     characters, so a section mixing tabs and spaces can compare a visually outdented line as
-//     deeper than the item above it -- silently changing which item a line belongs to, and with
-//     it who owns an action. Such a section is refused rather than measured.
+//   * INDENTATION IS ALLOWLISTED, THEN REQUIRED TO BE CONSISTENT, WITHIN A LIST SECTION. Depth
+//     is compared in characters, and depth decides which item a line belongs to -- in
+//     ACTION_ITEMS, who owns an action. So a leading indent run may contain ONLY ASCII space or
+//     ASCII tab (anything else refuses: a single U+3000 counts as depth 1 against two ASCII
+//     spaces' depth 2, while rendering the same width), and a section mixing even those two
+//     refuses as well. Such a section is refused rather than measured.
 //   * WHEN A LINE'S ATTRIBUTION IS GENUINELY AMBIGUOUS, THIS PARSER REFUSES: `parse` returns
 //     `nil`, which `MeetingSummaryService` maps to `.unparseable(rawText:)`, keeping the model's
 //     full response for diagnostics. It does not guess, and it does not return a shortened
@@ -102,6 +104,10 @@ enum MeetingSummaryParseRefusal: String, Equatable, Sendable {
 
     /// One list section mixed tab and space indentation. See `parseList`.
     case mixedIndentation
+
+    /// A leading indent run contained a character outside the allowlist (anything that is not an
+    /// ASCII space or an ASCII tab). See `parseList`'s indentation guard.
+    case unsupportedIndentCharacter
 }
 
 /// `parse`'s outcome with its reason attached. `parse` itself keeps its original
@@ -304,10 +310,17 @@ enum MeetingSummaryResponseParser {
     /// the whole response -- rather than ever returning a list that is missing, truncated, or
     /// silently padded with content from one of the model's lines.
     ///
-    /// Before any of that, a section that mixes tab and space indentation is refused outright
-    /// (`.mixedIndentation`): depth is compared in characters, and mixing the two styles can
-    /// reverse it, which here means reversing ownership. See the guard in the body for why
-    /// converting tabs to columns is not an option.
+    /// Before any of that, the section's indentation is checked in two steps, both of which run
+    /// over every non-blank line BEFORE a single depth is compared:
+    ///   * ALLOWLIST: a leading indent run may contain only ASCII space and ASCII tab. Anything
+    ///     else refuses (`.unsupportedIndentCharacter`) -- see `allowedIndentCharacters` for why
+    ///     this is an allowlist and must not become a list of rejected characters.
+    ///   * UNION: even within those two, a section that mixes them refuses (`.mixedIndentation`),
+    ///     because depth is compared in characters and a tab is one character while an indent
+    ///     level of spaces is several. See that guard for why converting tabs to visual columns
+    ///     is not an option.
+    /// Together these make "count the characters" a sound depth comparison rather than an
+    /// assumption about what the model happened to emit.
     ///
     /// Item boundaries come from exactly two unambiguous signals, and nothing else:
     ///   * A BULLET MARKER starts a new item (`-`, `*`, `•`, or `1.`/`1)`; see `bulletBody`).
@@ -373,8 +386,17 @@ enum MeetingSummaryResponseParser {
         // that is neither (a non-breaking space, say) counts as space-like, matching
         // `indentWidth`'s own per-character counting. Blank lines are excluded, so a stray
         // tab on an otherwise empty line cannot trigger this.
+        // The guard is an ALLOWLIST FIRST, then the tab-vs-space union. Both run over the
+        // section's non-blank lines before a single depth is compared.
         var stylesSeen: Set<IndentStyle> = []
-        for line in contentLines { stylesSeen.formUnion(indentStyles(line)) }
+        for line in contentLines {
+            for character in leadingIndent(line) {
+                guard allowedIndentCharacters.contains(character) else {
+                    return .refused(.unsupportedIndentCharacter)
+                }
+                stylesSeen.insert(character == "\t" ? .tab : .space)
+            }
+        }
         guard stylesSeen.count <= 1 else { return .refused(.mixedIndentation) }
 
         let usesBullets = nonBlank.contains { bulletBody($0) != nil }
@@ -448,18 +470,47 @@ enum MeetingSummaryResponseParser {
         case refused(MeetingSummaryParseRefusal)
     }
 
-    /// Which kinds of whitespace a line's leading indent run is built from. Only tabs are
-    /// distinguished; every other whitespace character counts as space-like, because `indentWidth`
-    /// counts them all as one character each and they therefore compare consistently with one
-    /// another. A line with no indentation contributes no style.
+    /// Which of the two permitted indent characters a leading run is built from. A line with no
+    /// indentation contributes no style.
     private enum IndentStyle { case tab, space }
 
-    private static func indentStyles(_ rawLine: String) -> Set<IndentStyle> {
-        var styles: Set<IndentStyle> = []
-        for character in rawLine.prefix(while: { $0.isWhitespace }) {
-            styles.insert(character == "\t" ? .tab : .space)
-        }
-        return styles
+    /// THE ONLY CHARACTERS A LEADING INDENT RUN MAY CONTAIN: ASCII space (U+0020) and ASCII tab
+    /// (U+0009). Anything else in that run refuses the response (`.unsupportedIndentCharacter`).
+    ///
+    /// THIS IS AN ALLOWLIST ON PURPOSE, AND IT MUST STAY ONE. DO NOT "helpfully" turn it into a
+    /// list of rejected characters, and do not add a character to it to make one response parse.
+    /// The reason is the whole history of this file. Depth here is counted in CHARACTERS
+    /// (`indentWidth`), and depth decides which item a line belongs to, which in ACTION_ITEMS
+    /// decides who owns an action. Character counting is only sound when every character in the
+    /// comparison carries the same weight. That property is FALSE for the general class of
+    /// whitespace: one IDEOGRAPHIC SPACE (U+3000) counts as depth 1 while two ASCII spaces count
+    /// as depth 2, even though the two lines commonly render at the same depth -- so a line that
+    /// looks like a peer gets absorbed into the item above it, silently changing its owner. Every
+    /// width-bearing Unicode space (EM SPACE, EN SPACE, FIGURE SPACE, the whole U+2000 block,
+    /// NBSP, ...) has exactly that problem, and new ones can be added to Unicode after this code
+    /// is written.
+    ///
+    /// A blocklist would have to name each of them, and would silently mis-attribute ownership
+    /// for every one it had not thought of yet -- which is precisely how the previous five
+    /// versions of this rule each closed one case and left the class open. An allowlist inverts
+    /// the default: an unanticipated character is refused, not measured. The cost is that a
+    /// response indented with something exotic is rejected even when it happens to be internally
+    /// consistent; that cost is bounded and loud, and the prompt already tells the model never to
+    /// indent at all.
+    private static let allowedIndentCharacters: Set<Character> = [" ", "\t"]
+
+    /// The leading whitespace run of a raw (untrimmed) line: the ONE definition of "indentation"
+    /// in this parser, used both by the allowlist guard and by `indentWidth`, so the characters
+    /// that get measured are exactly the characters that were vetted.
+    ///
+    /// The run is delimited by `Character.isWhitespace`, which is deliberately WIDER than the
+    /// allowlist: a stray Unicode space at the start of a line is therefore part of the run and
+    /// is refused by the guard, rather than ending the run and being silently treated as the
+    /// first character of the line's content. Characters that are not whitespace at all (a BOM,
+    /// a zero-width joiner) do not start a run; they reach ordinary parsing, where they are not a
+    /// bullet marker and not a continuation, and refuse there instead.
+    private static func leadingIndent(_ rawLine: String) -> Substring {
+        rawLine.prefix { $0.isWhitespace }
     }
 
     /// The number of leading whitespace characters on the raw (untrimmed) line -- the
@@ -467,16 +518,22 @@ enum MeetingSummaryResponseParser {
     /// check in this parser works on the trimmed line, and this is the one place the leading
     /// whitespace itself is the information.
     ///
-    /// Counted in CHARACTERS, so one tab counts as one level. That is only sound within a single
-    /// indentation style, which is why `parseList` refuses a section that mixes tabs and spaces
-    /// BEFORE any depth is compared -- see the `.mixedIndentation` guard there. An earlier version
-    /// of this comment claimed a mixed list "fails as a refusal, not a silent misattribution".
-    /// That was WRONG: nothing checked for mixing, so a tab-indented line (width 1) compared as
-    /// shallower than a two-space-indented one (width 2), reversing relative depth and therefore
-    /// attribution, with no refusal anywhere. The guard is what makes the claim true; the claim
-    /// was not true on its own.
+    /// Counted in CHARACTERS, so one tab counts as one level. Character counting is only sound
+    /// when every character being counted carries comparable weight, which is exactly what
+    /// `parseList`'s two-part indentation guard establishes BEFORE this is ever called: the
+    /// allowlist (`allowedIndentCharacters`) restricts a leading run to ASCII space and ASCII tab,
+    /// and the union check then refuses a section that mixes even those two. By the time a width
+    /// is compared, every indent run in the section is built from one repeated character.
+    ///
+    /// Two earlier versions of this comment claimed guarantees the code did not have -- first
+    /// that mixed tabs and spaces "fail as a refusal, not a silent misattribution" when nothing
+    /// checked for mixing at all, then, once that was fixed, that grouping every non-tab
+    /// whitespace as space-like was safe because such characters "compare consistently with one
+    /// another", which is false for any width-bearing Unicode space. Both were assumptions
+    /// written as properties. The guard is what makes this comment true; the comment has never
+    /// been true on its own.
     private static func indentWidth(_ rawLine: String) -> Int {
-        rawLine.prefix { $0.isWhitespace }.count
+        leadingIndent(rawLine).count
     }
 
     /// The text after a leading list marker, or `nil` if the (already trimmed) line does not

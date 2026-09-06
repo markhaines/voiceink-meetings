@@ -769,6 +769,141 @@ struct MeetingSummaryResponseParserTests {
         #expect(MeetingSummaryResponseParser.parseDetailed(strayLine) == .refused(.unattributableLine))
     }
 
+    // ROUND 6. Grouping every non-tab whitespace character as "space-like" recreated the round-5
+    // ownership bug in Unicode: one IDEOGRAPHIC SPACE (U+3000) counts as depth 1, two ASCII spaces
+    // count as depth 2, the tab/space union sees "all spaces" and passes, and the line that
+    // RENDERS as a peer is absorbed into the item above it. A leading indent run may now contain
+    // only ASCII space and ASCII tab; anything else refuses with `.unsupportedIndentCharacter`
+    // before any depth is compared. Named owners again, so the misattribution is in the assertion.
+    @Test("an ideographic-space indent against ASCII spaces refuses: Bob's action would be absorbed into Alice's")
+    func ideographicSpaceIndentRefuses() {
+        // U+3000 before Alice is ONE character (depth 1); the two ASCII spaces before Bob are two
+        // (depth 2), so Bob compares as nested under Alice and is joined into Alice's action text
+        // -- despite the two lines rendering at roughly the same depth.
+        let raw = """
+            PURPOSE:
+            Launch prep.
+
+            QUESTIONS:
+            None
+
+            CONCLUSIONS:
+            None
+
+            ACTION_ITEMS:
+            \u{3000}- Alice: Prepare the launch plan
+              - Bob: Book the review room
+            """
+        #expect(MeetingSummaryResponseParser.parse(raw) == nil)
+        #expect(MeetingSummaryResponseParser.parseDetailed(raw) == .refused(.unsupportedIndentCharacter))
+    }
+
+    @Test("an em-space indent against ASCII spaces refuses: Alice's sub-item would become ownerless")
+    func emSpaceIndentRefuses() {
+        // The other ownership direction. The EM SPACE (U+2003) line renders as nested under Alice
+        // but counts as depth 1 against her depth 2, so it is promoted to a peer action owned by
+        // nobody.
+        let raw = """
+            PURPOSE:
+            Launch prep.
+
+            QUESTIONS:
+            None
+
+            CONCLUSIONS:
+            None
+
+            ACTION_ITEMS:
+              - Alice: Prepare the launch plan
+            \u{2003}- include the rollback owners
+            """
+        #expect(MeetingSummaryResponseParser.parse(raw) == nil)
+        #expect(MeetingSummaryResponseParser.parseDetailed(raw) == .refused(.unsupportedIndentCharacter))
+    }
+
+    @Test("a non-breaking-space indent refuses too: the rule is an allowlist, not a list of known-bad characters")
+    func nonBreakingSpaceIndentRefuses() {
+        // NBSP (U+00A0) is whitespace, renders like a space, and counts as one character. It is
+        // refused for the same reason as U+3000 -- not because anyone enumerated it, but because
+        // it is not on the allowlist. This test exists to pin that the rule is closed by
+        // construction: adding a character to `allowedIndentCharacters` to make this parse would
+        // reopen the class.
+        let raw = """
+            PURPOSE:
+            Launch prep.
+
+            QUESTIONS:
+            None
+
+            CONCLUSIONS:
+            - Ship on Friday
+            \u{00A0}- after the security review
+
+            ACTION_ITEMS:
+            None
+            """
+        #expect(MeetingSummaryResponseParser.parseDetailed(raw) == .refused(.unsupportedIndentCharacter))
+    }
+
+    @Test("an ideographic space INSIDE an item's text is untouched: the allowlist only ever sees leading indentation")
+    func unicodeSpaceInsideItemTextStillParses() {
+        // The false-refusal direction for the allowlist. The guard reads only the LEADING
+        // whitespace run of each line, so a legitimate ideographic space between words -- or one
+        // inside an owner's name -- is ordinary content and is preserved byte for byte.
+        let raw = """
+            PURPOSE:
+            Launch\u{3000}prep for the Tokyo office.
+
+            QUESTIONS:
+            None
+
+            CONCLUSIONS:
+            - Ship\u{3000}on Friday
+
+            ACTION_ITEMS:
+            - Alice: Prepare the\u{3000}launch plan
+              - include the rollback owners
+            """
+        let result = try! #require(MeetingSummaryResponseParser.parse(raw))
+        #expect(result.purpose == "Launch\u{3000}prep for the Tokyo office.")
+        #expect(result.conclusions == ["Ship\u{3000}on Friday"])
+        #expect(
+            result.actionItems == [
+                MeetingActionItem(owner: "Alice", text: "Prepare the\u{3000}launch plan - include the rollback owners")
+            ])
+    }
+
+    // NEGATIVE CONTROL, and a guard rather than a proof: it passes both before and after the
+    // allowlist. It exists so the rule cannot be "fixed" by refusing indentation generally, which
+    // would be a much larger behaviour change wearing the same name. ASCII-space indentation still
+    // nests, and the owner still owns the whole action.
+    @Test("ASCII-space-only indentation still parses, with the nested line kept inside its owner's action")
+    func asciiSpaceIndentationStillParses() {
+        let raw = """
+            PURPOSE:
+            Launch prep.
+
+            QUESTIONS:
+            None
+
+            CONCLUSIONS:
+            - Ship on Friday
+              - subject to the security review passing
+
+            ACTION_ITEMS:
+            - Alice: Prepare the launch plan
+              - include the rollback owners
+            - Bob: Book the review room
+            """
+        let result = try! #require(MeetingSummaryResponseParser.parse(raw))
+        #expect(result.conclusions == ["Ship on Friday - subject to the security review passing"])
+        #expect(
+            result.actionItems == [
+                MeetingActionItem(owner: "Alice", text: "Prepare the launch plan - include the rollback owners"),
+                MeetingActionItem(owner: "Bob", text: "Book the review room"),
+            ])
+    }
+
     @Test("punctuated spellings of None are the same empty answer, not literal content")
     func punctuatedNoneSpellingsAreEmpty() {
         let raw = """

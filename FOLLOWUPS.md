@@ -26,6 +26,23 @@ caller sets directly. Setting the unprefixed form on the outer `xcodebuild` invo
 nothing: it never crosses that boundary, the test process reads it as absent, and a missing
 prerequisite quietly skips and reports green.
 
+**Gate mode overrides the CI skip, in EVERY gate in this repo, with no exception.** Every gate
+here also disables itself on CI (the `isRunningInCI` / `VOICEINK_CI` idiom
+`AudioGraphExceptionBridgeTests.swift` established), as a convenience for ordinary CI runs that
+have neither downloaded models nor real audio hardware. That CI disable is written
+`.disabled(if: isRunningInCI && !isGateRunningMode, ...)` -- gate mode ANDed against the CI check,
+never a bare `.disabled(if: isRunningInCI, ...)` that gate mode cannot reach. The reasoning is the
+same one that justifies gate mode existing at all: the whole point is that a pass means the real
+path ran and a missing prerequisite fails loudly, so an environment variable a caller may not know
+about -- CI or otherwise -- must never be able to silently downgrade an explicitly requested gate
+into a skip. A gate-mode failure on a runner with no models is not an unrelated failure; it is
+exactly the information an operator who set that flag asked for, which is why every such gate's
+skip/failure message names the missing prerequisite AND the environment, so the failure reads as
+self-explanatory rather than as a defect in the product. `RealModelSmokeTests.swift` briefly did
+this wrong (an earlier version applied its CI disable unconditionally, with a header arguing that
+was deliberate) -- fixed 2026-09-06; see that file's header for the corrected reasoning in full.
+Any new gate that lands here must use the ANDed form from the start.
+
 | Flag (external, `TEST_RUNNER_`-prefixed) | Test file | Status |
 |---|---|---|
 | `TEST_RUNNER_REALMODEL_SMOKE_GATE_MODE` | `Tests/VoiceInkTests/Features/Meetings/Transcription/RealModelSmokeTests.swift` | Live (2026-09-06) |

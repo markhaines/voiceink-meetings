@@ -1,13 +1,14 @@
 // Fork-only file, no upstream equivalent.
 //
-// This is Phase 3's acceptance gate: it drives the REAL `transcripted-mcp` binary — Mark's
-// own separate "Transcripted" app's indexer, not a reimplementation or a mock — against a
-// meeting file this fork's OWN `TranscriptedMarkdownExporter` actually wrote, and checks the
-// real numbers the real indexer produced (word_count, speaker_count, action items with
-// owners). A fork-produced file that scores `word_count: 0` here is a genuine defect in this
-// exporter's output; a file that scores real numbers is the only proof that matters that this
-// exporter's format isn't just self-consistent but actually legible to the tool it exists to
-// feed.
+// This is the REAL-INDEXER ACCEPTANCE CHECK, not yet a proven gate — read
+// `TRANSCRIPTED_ACCEPTANCE.md` for the distinction before trusting a green CI run to mean
+// anything about this file. It drives the REAL `transcripted-mcp` binary — Mark's own
+// separate "Transcripted" app's indexer, not a reimplementation or a mock — against a meeting
+// file this fork's OWN `TranscriptedMarkdownExporter` actually wrote, and checks the real
+// numbers the real indexer produced (word_count, speaker_count, action items with owners). A
+// fork-produced file that scores `word_count: 0` here is a genuine defect in this exporter's
+// output; a file that scores real numbers is the only proof that matters that this exporter's
+// format isn't just self-consistent but actually legible to the tool it exists to feed.
 //
 // SAFETY, matching the investigation this test is built from
 // (`transcripted-indexer-acceptance.md`, read via `~/code/transcripted`'s own source — see
@@ -27,11 +28,21 @@
 //     directories, builds the scratch SQLite index, prints one JSON summary line, and exits —
 //     no long-lived process, no MCP stdio protocol to drive.
 //
-// Guarded, not required: this test only runs on a Mac that actually has Mark's Transcripted
-// app installed at its default location (`.enabled(if:)` below). On CI, or any other clone of
-// this fork, the binary doesn't exist, so the test is reported as skipped, not failed or
-// silently green — this is the honest state for a real cross-project dependency this fork
-// cannot vendor or fake.
+// ROUND 3, BLOCKING 2 — READ THIS BEFORE CHANGING THE GATING BELOW. `.enabled(if:)` means CI
+// (and any machine without the real Transcripted app installed) SKIPS this test — a skip
+// reports as passing, indistinguishable in `xcodebuild`'s summary from a real pass. A green CI
+// run therefore proves NOTHING about whether the real indexer ever actually ran. That is a
+// real, open gap, not a resolved one. A sibling PR (#19, `phase2-realmodel-smoke`, NOT yet
+// merged to `main` as of this round) is independently building an explicit gate-running-mode
+// idiom for exactly this shape of problem (an env var that turns "skip if absent" into "fail
+// loudly if absent"). This file deliberately does NOT invent a second, rival mechanism ahead
+// of that one landing — see `TRANSCRIPTED_ACCEPTANCE.md` and this task's report for why, and
+// converge onto PR #19's mechanism once it lands rather than let two idioms coexist.
+//
+// Until that convergence: `.enabled(if:)` stays as the ordinary-developer-convenience skip it
+// always was (correct for a fresh clone or a CI runner with neither the binary nor a use for
+// it), and this file's honest status is "an opportunistic real-indexer check with no required
+// mode" — not "the acceptance gate". Do not read a green CI run as evidence this test executed.
 
 import Foundation
 import Testing
@@ -42,6 +53,14 @@ import Testing
 struct TranscriptedIndexerAcceptanceTests {
     private static let binaryPath = "/Users/mark/Library/Application Support/Transcripted/mcp/transcripted-mcp"
     private static let sqlite3Path = "/usr/bin/sqlite3"
+
+    /// Durable artefact path this test writes its actual measured output to, every time it
+    /// runs (overwritten, not appended — this is "the last real result", not a log).
+    /// `NSTemporaryDirectory()`-scoped scratch state (`scratchRoot` below) is deleted in
+    /// `defer` before the test returns, so without this a reader has only the prose in
+    /// `TRANSCRIPTED_ACCEPTANCE.md` to trust. Named in that file so a future reader can check
+    /// the numbers directly instead.
+    static let lastResultArtifactPath = "/tmp/voiceink-transcripted-acceptance-last-result.txt"
 
     private static var binaryIsAvailable: Bool {
         FileManager.default.fileExists(atPath: binaryPath) && FileManager.default.fileExists(atPath: sqlite3Path)
@@ -84,7 +103,18 @@ struct TranscriptedIndexerAcceptanceTests {
         #expect(selfTest.meetingFileCount == 1)
 
         let row = try Self.queryMeetingRow(indexDir: indexDir, filenameLike: "Acceptance Test Meeting")
+        let actionItems = try Self.queryActionItems(indexDir: indexDir, filenameLike: "Acceptance Test Meeting")
         let expectedWordCount = segments.reduce(0) { $0 + $1.text.split(separator: " ").count }
+
+        // Persisted BEFORE the assertions below, not after: if an assertion fails, the
+        // artifact still reflects what was actually measured, not a result the test never
+        // reached. `scratchRoot` (containing the real .md file and the real SQLite db this
+        // ran against) is deleted in `defer` above regardless of pass/fail, so this plain-text
+        // summary is the only durable record of the real query output.
+        Self.persistResult(
+            selfTest: selfTest, row: row, actionItems: actionItems,
+            expectedWordCount: expectedWordCount, exportedFile: destination
+        )
 
         // THE central assertion: a fork-produced file must not score zero. `word_count` from
         // the real SQLite index must reflect the real transcript, not come back empty because
@@ -93,10 +123,28 @@ struct TranscriptedIndexerAcceptanceTests {
         #expect(row.wordCount == expectedWordCount)
         #expect(row.speakerCount == 3)  // You, Jane Doe, Sam Lee
 
-        let actionItems = try Self.queryActionItems(indexDir: indexDir, filenameLike: "Acceptance Test Meeting")
         #expect(actionItems.count == 2)
         #expect(actionItems.contains { $0.owner == "Mark" && $0.text.contains("vendor on pricing") })
         #expect(actionItems.contains { $0.owner == nil && $0.text.contains("revised proposal") })
+    }
+
+    private static func persistResult(
+        selfTest: SelfTestResult, row: MeetingRow, actionItems: [ActionItemRow],
+        expectedWordCount: Int, exportedFile: URL
+    ) {
+        var lines = [
+            "TranscriptedIndexerAcceptanceTests.exportedMeetingIndexesWithRealCounts()",
+            "run at: \(ISO8601DateFormatter().string(from: Date()))",
+            "exported file: \(exportedFile.path)",
+            "--self-test: ok=\(selfTest.ok) meeting_file_count=\(selfTest.meetingFileCount)",
+            "meetings row: word_count=\(row.wordCount) (independently-counted expected=\(expectedWordCount)) speaker_count=\(row.speakerCount)",
+            "action items (\(actionItems.count)):",
+        ]
+        for item in actionItems {
+            lines.append("  owner=\(item.owner ?? "<none>") text=\(item.text)")
+        }
+        let content = lines.joined(separator: "\n") + "\n"
+        try? content.write(toFile: lastResultArtifactPath, atomically: true, encoding: .utf8)
     }
 
     // MARK: - Harness plumbing

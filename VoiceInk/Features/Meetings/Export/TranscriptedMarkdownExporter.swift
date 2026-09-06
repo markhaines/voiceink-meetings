@@ -351,9 +351,20 @@ private struct SanitizedSegment {
 ///   against a bracket that always starts with a slash-free `Mic`/`System` constant) and do
 ///   NOT trigger this failure — they are deliberately left untouched here rather than
 ///   sanitized away, so a legitimate name (`"D'Angelo"`, a label someone chose to bracket)
-///   isn't mangled for a risk that isn't real. Only newlines and other control characters are
+///   isn't mangled for a risk that isn't real. Newlines and other control characters are
 ///   removed/collapsed, because those are the only inputs that can put a line break inside a
 ///   single-line header.
+///   `*` is a DIFFERENT, SILENT failure, not a dropped-utterance one: before the header regex
+///   ever runs, `parseStyledTranscriptEntry` does
+///   `header.replacingOccurrences(of: "**", with: "")` on the WHOLE header line — the
+///   timestamp's own `**MM:SS**` markup relies on exactly this to get stripped away. That
+///   same call strips ANY `**` inside the label too: `"Jo**hn"` resolves to `"John"`,
+///   `"**Mark**"` resolves to `"Mark"`, a label that is just `"**"` resolves to an EMPTY
+///   string. The utterance survives (the regex still matches), but the resolved identity
+///   silently differs from what this exporter wrote — which is worse than dropping the
+///   utterance, because there is no signal anywhere that anything changed. See
+///   `speakerLabel(_:)`'s own doc comment for the fix: every `*` is escaped so no `**`
+///   substring can ever reach the indexer's strip step.
 /// - `text` is transcription output. A literal blank line inside it (`\n\n`) IS the exact
 ///   chunk boundary above — it silently truncates the utterance: everything up to the blank
 ///   line survives as one dropped-looking-fine chunk, everything after becomes an orphaned
@@ -366,8 +377,24 @@ enum TranscriptSanitizer {
     /// single space — never removes the label's content entirely, a two-line label becomes
     /// one line, not nothing — drops genuinely non-whitespace control characters (NUL and
     /// friends) outright, and collapses runs of whitespace so the result reads the same as
-    /// the original to a person. Everything else in the label — including `[`, `]`, `/`, `*`
-    /// — passes through untouched; see this type's doc comment for why those are safe.
+    /// the original to a person. `[`, `]`, `/` pass through untouched; see this type's doc
+    /// comment for why those are safe.
+    ///
+    /// `*` does NOT pass through untouched. THE INVARIANT: the label this exporter writes and
+    /// the label the real indexer resolves must be the same string. The indexer strips every
+    /// literal `**` from the whole header line unconditionally (see this type's doc comment) —
+    /// that is not a bug to route around, it is the mechanism that removes the timestamp's own
+    /// bold markup, and this exporter cannot change it. The only way to guarantee identity is
+    /// to make sure the label never CONTAINS the substring `**` (in any run — `"a***b"` strips
+    /// to `"a*b"` under the real rule, not just an exact pair) by the time it leaves this
+    /// exporter. Backslash-escaping every `*` — the same convention Markdown itself uses for a
+    /// literal asterisk, and consistent with this file's existing `yamlQuoted` escaping — does
+    /// exactly that: `"Jo**hn"` becomes `"Jo\*\*hn"`, which contains no `**` substring anywhere
+    /// (a backslash always sits between any two escaped asterisks), so the indexer's strip step
+    /// has nothing to remove from it. The resolved label is therefore always byte-identical to
+    /// what this exporter exported — never a silently different, shorter string. A bare `"**"`
+    /// label becomes `"\*\*"`, not `""`: the fix preserves that the source contained two
+    /// asterisks rather than erasing them, the same way it would for any other character.
     static func speakerLabel(_ raw: String) -> String {
         var scalars = String.UnicodeScalarView()
         for scalar in raw.unicodeScalars {
@@ -380,10 +407,12 @@ enum TranscriptSanitizer {
             }
         }
 
-        return String(scalars)
+        let whitespaceCollapsed = String(scalars)
             .components(separatedBy: .whitespaces)
             .filter { !$0.isEmpty }
             .joined(separator: " ")
+
+        return whitespaceCollapsed.replacingOccurrences(of: "*", with: "\\*")
     }
 
     /// Collapses every blank line (any line that is empty after trimming) out of the text —

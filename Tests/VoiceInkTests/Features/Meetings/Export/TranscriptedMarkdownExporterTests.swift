@@ -515,4 +515,50 @@ struct TranscriptedMarkdownExporterTests {
         #expect(TranscriptSanitizer.utteranceText("Trailing blank\n\n") == "Trailing blank")
         #expect(TranscriptSanitizer.utteranceText("No blank lines here.") == "No blank lines here.")
     }
+
+    // MARK: - Round 3, BLOCKING 1: `**` in speakerLabel must not silently change identity
+
+    /// THE PROOF for the fix, not just a format check. The real indexer's
+    /// `parseStyledTranscriptEntry` strips EVERY literal `**` from the WHOLE header line
+    /// (`ReferenceIndexerParser`'s `normalizedHeader`, a verbatim port) before ever extracting
+    /// the label — that isn't a bug, it's how the timestamp's own `**MM:SS**` markup gets
+    /// removed, and this exporter cannot change it. Left unescaped, a label containing `**`
+    /// therefore indexes as a DIFFERENT, shorter string than what this exporter wrote: the
+    /// utterance survives (the regex still matches), but the resolved SPEAKER IDENTITY
+    /// silently changes with no error, no warning, and no visible sign in the file that
+    /// anything happened. This test asserts the actual invariant: the label this exporter
+    /// WROTE (independently recomputed via `TranscriptSanitizer.speakerLabel`, not re-derived
+    /// from the render under test) and the label the reference indexer parser RESOLVES from
+    /// the rendered file must be the same string, for every case in the brief plus the
+    /// pathological "***"/"****" runs the real strip rule handles unevenly.
+    @Test(
+        "the exported speakerLabel and the label the real indexer resolves are always the same string",
+        arguments: [
+            "Jo**hn",
+            "**Mark**",
+            "**",
+            "*",
+            "***",
+            "****",
+            "a***b",
+            "Team [Lead]",
+            "D'Angelo",
+        ]
+    )
+    func exportedLabelMatchesIndexerResolvedLabel(rawLabel: String) throws {
+        let meeting = Meeting(title: "Asterisk attack", audioDirectoryPath: "/tmp/x")
+        let segments = [
+            MeetingSegment(startOffset: 0, endOffset: 0, speakerLabel: rawLabel, text: "Hello.", sourceChannel: .system, orderIndex: 0)
+        ]
+        let rendered = TranscriptedMarkdownExporter.render(meeting: meeting, segments: segments)
+
+        let exportedLabel = TranscriptSanitizer.speakerLabel(rawLabel)
+        let entries = ReferenceIndexerParser.parseTranscriptEntries(fromMarkdown: rendered.markdown)
+
+        #expect(entries.count == 1, "the utterance must survive at all for this comparison to mean anything")
+        #expect(
+            entries.first?.label == exportedLabel,
+            "resolved label \(String(describing: entries.first?.label)) != exported label \(exportedLabel) for raw input \(rawLabel)"
+        )
+    }
 }

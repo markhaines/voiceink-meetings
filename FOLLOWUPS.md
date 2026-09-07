@@ -936,3 +936,146 @@ audit above: extend the wait to cover the state actually being asserted, never a
 **Not fixed here:** the remaining 1s/2s deadlines in that file (lines ~211-258) gate on a single
 in-flight operation rather than N serialized ones, so their margins are far wider. If either ever
 flakes, apply the same reasoning rather than assuming a behavioural cause.
+
+## `TranscriptedAudioExporter` can only ever populate `playback.m4a`, until this fork retains isolated channels
+
+Source: `VoiceInk/Features/Meetings/Export/TranscriptedAudioExporter.swift` (that file's own
+header carries the full evidence trail); `VoiceInk/Features/Meetings/Capture/
+MeetingRecordingWriter.swift`; `~/code/transcripted`'s `RecordingAudioArchiver.swift` and
+`MeetingAudioStorageManager.swift` (Mark's real, separate Transcripted app).
+
+Real Transcripted's audio directory (`meetings/audio/<stem>_audio/`) holds up to three files:
+`microphone.m4a` (isolated mic capture), `system_audio.m4a` (isolated system-audio-tap
+capture), and `playback.m4a` (a derived, voice-activity-gated mix of the first two, produced by
+an async maintenance pass, never at capture time, and only when BOTH are present and usable —
+confirmed by reading `createPlaybackMixIfNeeded`). This fork's `MeetingRecordingWriter` has no
+equivalent to the first two: it mixes mic and system PCM together AS THEY ARRIVE into one mono
+16kHz file and never retains either channel in isolation. So `TranscriptedAudioExporter`, fed
+this fork's only real capture output, can honestly write only `playback.m4a` — writing the same
+combined bytes under `microphone.m4a` or `system_audio.m4a` would claim an isolated capture
+that was never made, which is worse than the gap.
+
+**This produces a shape never observed in any real Transcripted directory**: in all 33 real
+examples that have `playback.m4a` at all, it is accompanied by both its sources. A
+fork-produced directory with `playback.m4a` alone is a combination Mark's existing tooling has
+never had to parse before. Nothing here proves that tooling handles it gracefully — this task
+verified the WRITER's honesty, not every READER's tolerance for a Transcripted-shaped directory
+that only ever has one file in it.
+
+**Would need revisiting**, together, if this fork ever wants full parity: (a) retaining mic and
+system in isolation somewhere in the capture pipeline (a `MeetingRecordingWriter` redesign, or
+a second writer alongside it — out of scope for that file today), (b) re-deriving a real
+`playback.m4a` from those two rather than reusing the already-mixed file for that slot, and (c)
+confirming Mark's Transcripted MCP / Anytype sync / other tooling actually reads a
+`playback`-only directory without assuming the other two exist. None of that is this file's
+job: it is Phase 3's *export* leg, additive and unwired (see the `retainRecording stays false`
+entry above for why wiring an actual caller is separately out of scope too), not a capture
+redesign.
+
+## Stale `TranscriptedAudioExporter` staging and backup directories are never swept
+
+`TranscriptedAudioExporter.export` stages a re-export in a sibling directory and commits it by
+renaming, which is what stops a failed re-export destroying a good prior export of audio nobody
+can re-record (see that file's header, "ATOMICITY, AND ITS EXACT LIMITS"). The cost of that
+shape is that a failure can leave a dot-prefixed scratch directory behind next to the
+destination:
+
+- `.TranscriptedAudioExporter-staging-<uuid>/` — a complete or partial staged export, when
+  removing it after a failure itself failed, or when it was deliberately KEPT because the
+  commit ended in `ExportError.rollbackFailed` and a human is recovering by hand.
+- `.TranscriptedAudioExporter-backup-<uuid>/` — the previous good export, when the process was
+  killed in the window between `old -> backup` and `staging -> final`, or when the restoring
+  rename failed. In the second case the path is carried out in the thrown error, with the
+  recovery `mv` spelled out in `errorDescription`; in the first case nothing survives to report
+  it, because a SIGKILL runs no code.
+
+**This is debris, not data loss, and the distinction is the reason nothing is built here.** The
+directories are dot-prefixed, uniquely suffixed, carry the type's own name, and are never at a
+destination path, so nothing reading Transcripted's layout sees them. The audio inside a
+`-backup-` one is complete and unmodified: it is in the wrong place, not gone.
+
+**Deliberately NOT built in this PR**, per the review ruling on it: a debris-reaping subsystem
+is a different piece of work from the data-loss fix, and bolting one on unreviewed to a change
+whose whole point is not deleting things carelessly would be the wrong trade. What was done
+instead is narrower and matches what the code actually delivers: the header's old unconditional
+claim that no partial output remained "anywhere, ever" was corrected to name this residue, and
+every best-effort cleanup now LOGS the path it failed to remove
+(`Logger(subsystem: "com.hainesy.voiceinkmeetings", category: "TranscriptedAudioExporter")`)
+instead of discarding the result with `try?`, so residue is observable rather than invisible.
+
+**What a sweep would have to get right**, if one is ever wanted: it must not delete a `-backup-`
+directory it cannot prove is orphaned, since that is a real recording; it needs an age threshold
+well clear of the longest legitimate export; and it has to run somewhere with a view of the
+destination root, which today is nowhere, because this exporter still has no caller at all (see
+the `retainRecording stays false` entry).
+
+**A related, separate limit worth recording next to this one:** the commit is two renames, and
+two renames are not one atomic unit. Darwin's `renameatx_np` with `RENAME_SWAP` would collapse
+them into one atomic syscall and close the kill window entirely. It was NOT adopted, on purpose:
+the real destination is under `~/Library/CloudStorage/OneDrive-ATEME/`, a File Provider volume
+whose `RENAME_SWAP` support cannot be verified from this fork's test environment, and an
+unsupported filesystem returns `ENOTSUP`. Shipping it would mean shipping it AND the two-rename
+fallback, leaving the window in place on precisely the volume that matters, in exchange for a
+second untested code path. Worth revisiting only with a real measurement on that volume.
+
+## `FaultInjection`'s data-only invariant: the barrier covers directly stored closures only
+
+`TranscriptedAudioExporter.FaultInjection` is the value `export` accepts to force the recovery
+branches in `commit` to fail. It carries NO CODE on purpose: an earlier design was a struct of
+`@Sendable` closures, and review defeated it in one line three ways, each letting `export` report
+SUCCESS with the previous export destroyed. `scripts/negative-controls/TranscriptedAudioExportSeamAttacks.swift`
+pins six exact expressions that must not compile.
+
+**Six expressions are not the invariant, and review said so.** Someone adding a differently-named
+closure-bearing field -- `operationOverride`, say -- leaves all six diagnostics intact and the
+control runner passes. That gap was investigated rather than accepted, and the investigation found
+the invariant is already enforced for free:
+
+- `FaultInjection` declares `Equatable`, and Swift only SYNTHESISES `Equatable` when every stored
+  property is itself `Equatable`. A closure is not.
+- Verified empirically, not reasoned about: planting `var operationOverride: (() -> Void)?` on the
+  type and running a full `xcodebuild` (not `-typecheck`) gives
+  `error: type 'TranscriptedAudioExporter.FaultInjection' does not conform to protocol 'Equatable'`.
+- So a DIRECTLY STORED closure-typed property fails to build today, under any name.
+
+Two controls pin the conformances: `TranscriptedAudioExportSeamEquatableBarrierAttack.swift`
+(must-not-compile) and `TranscriptedAudioExportSeamSendableBarrierAttack.swift` (must-warn).
+
+**THE GAP THAT REMAINS, in full, because an earlier version of this entry recorded only the last of
+these four and read as though the barrier held for the whole class.** It does not. Each of these
+re-introduces an executable seam while leaving synthesised `Equatable` intact AND both barrier
+controls green, so nothing goes red:
+
+1. **An `Equatable`, `@unchecked Sendable` wrapper type containing a closure**, stored as a field.
+   The stored property is `Equatable`, so synthesis is untroubled.
+2. **A property wrapper** whose stored backing type is `Equatable` while its `wrappedValue` is a
+   closure. The same, one level of indirection further.
+3. **A computed closure property, or a method** -- including one added from an extension. No stored
+   property is involved, so synthesis never looks at it.
+4. **A hand-written `static func ==`**, which suppresses synthesis outright, after which even a
+   plainly stored closure field compiles again.
+
+(1) and (2) restore a fully executable `operationOverride`-equivalent. So the accurate summary is
+that synthesised `Equatable` blocks the OBVIOUS re-introduction and nothing here blocks a determined
+one.
+
+**A separate correction in the same area:** `Sendable` is NOT a second barrier in this build. The
+project compiles at `SWIFT_VERSION 5.0` with no strict concurrency, so a non-`Sendable` stored
+closure only warns. Its control is sound and does bite, but what it pins is a barrier that becomes
+real under the Swift 6 language mode, not one that enforces anything today.
+
+**Deliberately NOT closed, and the reasoning is the ruling made on the summary parser's
+computed-member gap, kept consistent with it:** closing any of (1)-(4) needs bespoke
+source-signature or AST guard infrastructure -- a negative control in another file cannot see a
+wrapper's internals, a property wrapper's `wrappedValue`, a computed member, or a user-defined `==`,
+none of which emit a diagnostic of their own. Such machinery would itself need verifying, and it
+rots silently when the source layout changes. It would be built to defend a seam whose worst
+residual is already bounded: a caller can make an export FAIL, and cannot lose audio.
+
+**What is claimed, precisely**, in the code as well as here: the six expression controls enforce
+today's declared surface; synthesised `Equatable` enforces the no-closure property for directly
+stored closure-typed properties only; the `Sendable` control enforces nothing until Swift 6; and
+nothing enforces (1)-(4). Anyone adding a wrapper field, a property wrapper, a computed closure
+member, or a custom `==` to `FaultInjection` is removing a load-bearing barrier and should read this
+entry first -- which is why the type's own doc comment spells out the same four rather than leaving
+`Equatable` to look like boilerplate.

@@ -281,6 +281,25 @@ run_case MeetingCapabilityReturnValueEvictionAttack.swift 2 must-not-compile
 run_case MeetingReceiptMutatingApiAttack.swift 5 must-not-compile
 run_case MeetingSeamCannotNameAsrManagerAttack.swift 9 must-not-compile
 
+# Round 7 (PR #22, TranscriptedAudioExporter): the exporter's fault-injection seam. Its previous
+# design was a struct of @Sendable closures, and review defeated it in one line three ways, each
+# letting `export` report SUCCESS with the previous export destroyed. `FaultInjection` now carries
+# no code at all, so those three substitutions have nowhere to go. Same lesson as every control
+# above it: a seam defended by convention gets defeated, so the compiler defends this one.
+run_case TranscriptedAudioExportSeamAttacks.swift 6 must-not-compile
+# Round 8: the six controls above fail closed for six exact EXPRESSIONS, but review noted they would
+# not catch a differently-named closure-bearing field -- all six diagnostics stay intact and the
+# runner passes. Testing that empirically found a partial, free win: synthesised `Equatable` rejects
+# a DIRECTLY STORED closure-typed property, under any name. It does NOT reject an `Equatable`
+# wrapper carrying a closure, a property wrapper, a computed member, or a hand-written `==`, so this
+# is one shape of re-introduction rather than the class -- see the Equatable control's header and
+# FOLLOWUPS.md. `Sendable` is not a barrier at all in this build (SWIFT_VERSION 5.0, no strict
+# concurrency: it only warns); its control pins a barrier that is real under Swift 6. These two pin
+# the conformances so what IS covered cannot be dropped without CI noticing.
+run_case TranscriptedAudioExportSeamEquatableBarrierAttack.swift 1 must-not-compile
+
+run_case TranscriptedAudioExportSeamSendableBarrierAttack.swift 1 must-warn
+
 run_case MeetingCapabilityConditionalDowncastAttack.swift 1 must-warn
 run_case MeetingCapabilityForcedDowncastAttack.swift 1 must-warn
 run_case MeetingCapabilityBorrowClosureDowncastAttack.swift 1 must-warn
